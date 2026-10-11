@@ -106,7 +106,9 @@ routes every endpoint below, with unimplemented ones answering
    optionals, `[]` empties), add the projection in
    `crates/coppice-api/src/http/project.rs`, and swap its stub handler
    in `crates/coppice-api/src/http/routes.rs` for a real one backed by
-   the coordinator.
+   the coordinator. Every route also needs an entry in
+   `crates/coppice-api/src/catalog.rs`, which declares its auth and
+   consistency and is what the router is built from.
 2. Add the method to `src/api/real-client.ts` (`createRealClient()`),
    which implements `CoppiceApi` with `fetch` against `/api/v1/...`. The
    real client owns the wire mapping: snake_case keys and enum strings ↔

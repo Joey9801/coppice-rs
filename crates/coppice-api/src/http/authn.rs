@@ -134,7 +134,7 @@ impl<S: Send + Sync> FromRequestParts<S> for RequestDeadline {
 /// `unauthenticated_routes_are_matched_on_the_prefix_stripped_path` test pins
 /// this down so the table cannot silently stop matching.
 ///
-/// Exactly two entries, each for a reason that is about the credential itself:
+/// Exactly three entries, each for a reason that is about the credential itself:
 ///
 /// - `POST /enroll` is a machine's certless first contact, authenticated by
 ///   its own role-scoped enrollment token (ADR 0037 §4). An enrollee has no
@@ -143,13 +143,19 @@ impl<S: Send + Sync> FromRequestParts<S> for RequestDeadline {
 /// - `GET /auth/config` is how a client discovers *how to authenticate*.
 ///   Requiring a credential to learn which credential to obtain would be a
 ///   loop with no entry point.
+/// - `GET /openapi.json` is the API's own description, generated from the
+///   route catalogue. It carries nothing a binary of the same version does
+///   not, and a client generator should not need a token to read it.
 ///
 /// The method is part of the key on purpose: `POST /auth/config` and
 /// `GET /enroll` are not these endpoints, so they are authenticated like any
 /// other request and answer 401 — a caller learns that a method is wrong only
 /// after it has proved who it is.
-pub const UNAUTHENTICATED_ROUTES: &[(Method, &str)] =
-    &[(Method::GET, "/auth/config"), (Method::POST, "/enroll")];
+pub const UNAUTHENTICATED_ROUTES: &[(Method, &str)] = &[
+    (Method::GET, "/auth/config"),
+    (Method::POST, "/enroll"),
+    (Method::GET, "/openapi.json"),
+];
 
 /// Whether this request is one of the [`UNAUTHENTICATED_ROUTES`].
 fn is_unauthenticated_route(method: &Method, path: &str) -> bool {

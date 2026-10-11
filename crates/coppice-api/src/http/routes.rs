@@ -301,6 +301,12 @@ fn credential_free_table<S: Clone + Send + Sync + 'static>(
                 async move { Json(auth_config(authn.mode())) }
             }),
         ),
+        // This API, described by the same catalogue the router is built
+        // from. Rendered once, on first request.
+        (
+            catalog::op("get_openapi"),
+            get(|| async { Json(catalog::openapi_document()) }),
+        ),
     ]
 }
 
@@ -5018,7 +5024,11 @@ mod tests {
                 .iter()
                 .map(|(m, p)| (m.as_str(), *p))
                 .collect::<Vec<_>>(),
-            vec![("GET", "/auth/config"), ("POST", "/enroll")],
+            vec![
+                ("GET", "/auth/config"),
+                ("POST", "/enroll"),
+                ("GET", "/openapi.json")
+            ],
         );
 
         let idp = coppice_testkit::oidc::FakeIdp::start().await;
@@ -5047,6 +5057,18 @@ mod tests {
         let (status, body) = refusal_parts(response).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert_eq!(body, crate::http::REFUSED_BODY.as_bytes());
+
+        // `GET /openapi.json`: the API's own description.
+        let response = router_with_authn(stub_plane(Default::default()), chain)
+            .oneshot(
+                Request::get("/api/v1/openapi.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await["openapi"], "3.1.0");
 
         idp.shutdown().await;
     }

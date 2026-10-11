@@ -291,6 +291,23 @@ pub enum EventFrame {
     Gap(dto::EventGapFrame),
 }
 
+/// The OpenAPI document served at `GET /api/v1/openapi.json`. Schema-only.
+pub struct OpenApiDocument;
+
+impl JsonSchema for OpenApiDocument {
+    fn schema_name() -> Cow<'static, str> {
+        "OpenApiDocument".into()
+    }
+
+    fn json_schema(_: &mut SchemaGenerator) -> Schema {
+        schemars::json_schema!({
+            "type": "object",
+            "description": "An OpenAPI 3.1 document describing this API, generated from the catalogue.",
+            "required": ["openapi", "info", "paths"]
+        })
+    }
+}
+
 /// The closed error vocabulary, documented. An exhaustive `match`, so a new
 /// [`ErrorCode`] variant does not compile until it is described here.
 pub fn error_codes() -> Vec<ErrorCodeDoc> {
@@ -378,6 +395,11 @@ static GROUPS: &[Group] = &[
         id: "events",
         title: "Events",
         description: "The filtered server-sent event stream of job transitions (ADR 0043).",
+    },
+    Group {
+        id: "meta",
+        title: "API description",
+        description: "This API, described by itself.",
     },
     Group {
         id: OPERATIONAL,
@@ -1443,6 +1465,20 @@ fn build_operations() -> Vec<Operation> {
             adr: Some("0043"),
             ..base.clone()
         },
+        // ---- Meta -------------------------------------------------------
+        Operation {
+            id: "get_openapi",
+            group: "meta",
+            path: "/openapi.json",
+            summary: "This API as OpenAPI 3.1",
+            description: "The OpenAPI document generated from the same catalogue the router \
+                          is built from. Served without a credential.",
+            auth: Auth::Public,
+            response: json_response::<OpenApiDocument>(),
+            errors: &[],
+            adr: None,
+            ..base.clone()
+        },
         // ---- Operational ------------------------------------------------
         Operation {
             id: "healthz",
@@ -1965,4 +2001,10 @@ pub fn render_openapi() -> Value {
             },
         },
     })
+}
+
+/// [`render_openapi`], computed once, for the live `GET /api/v1/openapi.json`.
+pub fn openapi_document() -> &'static Value {
+    static DOC: OnceLock<Value> = OnceLock::new();
+    DOC.get_or_init(render_openapi)
 }

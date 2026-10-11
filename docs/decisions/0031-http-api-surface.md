@@ -188,6 +188,25 @@ because role bindings are one small policy object, not a sharded
 collection — and is gated to unscoped admin only, since it can grant itself
 broader access than any binding it replaces.)*
 
+*(Route map superseded 2026-10-11 by `coppice_api::catalog`: the table
+above is now history, and the catalogue is the source of truth for what the
+API serves. It is one plain-data description of every operation (method,
+path, auth, default consistency class, parameters, request and response
+DTOs, error codes, worked examples) and the router is built from it, so a
+route cannot exist undeclared; tests pin the catalogue to the router and to
+`UNAUTHENTICATED_ROUTES`, and replay its examples against the real handlers.
+Adding a route means adding its catalogue entry. One row is added:
+`GET /api/v1/openapi.json`, credential-free, serves the OpenAPI 3.1 document
+rendered live from the catalogue by the binary answering, so a client
+generator needs no token and cannot read a document that disagrees with the
+server. Where the table had drifted the catalogue follows the code:
+`GET /api/v1/events` is the live SSE stream of ADR 0043, no longer reserved;
+`GET /api/v1/session` defaults to `eventual`, not `local`
+(`GET /api/v1/coordinators` stays `local`); the node drain, undrain and
+remove routes of ADR 0041 are present; and the operational and
+credential-free routes (`/healthz`, `/readyz`, `/metrics`, `/auth/config`,
+`/enroll`) are listed alongside the state routes.)*
+
 ### Consistency plumbing (ADR 0007 made concrete)
 
 - Every read accepts `?consistency=strong|bounded|eventual`, overriding
