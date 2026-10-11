@@ -35,7 +35,9 @@ use coppice_state::Command;
 use crate::leadership;
 use crate::liveness::NodeLiveness;
 use crate::tasks::agent_gateway::{InboundReport, RouteCommand, RouterHandle};
-use crate::tasks::dispatch::{register_accepted_command, stop_job_command};
+use crate::tasks::dispatch::{
+    attempt_has_pending_abort, register_accepted_command, stop_job_command,
+};
 use crate::usage::NodeUsage;
 
 use coppice_proto::pb::agent::v1::agent_report::Body;
@@ -623,9 +625,15 @@ fn observed_set_diff(
             .filter(|a| a.allocation.state != AllocationState::Released)
             .and_then(|a| view.state().attempts.get(&a.allocation.attempt))
             .filter(|att| !att.attempt.state.is_terminal())
-            .map(|att| (att.attempt.id, att.attempt.state.clone()));
+            .map(|att| {
+                (
+                    att.attempt.id,
+                    att.attempt.state.clone(),
+                    attempt_has_pending_abort(view.state(), att),
+                )
+            });
 
-        let Some((attempt_id, attempt_state)) = live else {
+        let Some((attempt_id, attempt_state, abort_pending)) = live else {
             // No live intent: a running container is orphaned → stop; an
             // exited one is already settled → ignore.
             if obs.running {
@@ -633,6 +641,17 @@ fn observed_set_diff(
             }
             continue;
         };
+
+        // A pending abort's StopJob was routed once, when AbortJob applied,
+        // and is dropped if this node had no session then. Re-derive it from
+        // state on every session open. Like the orphan stop it depends only on
+        // current state, so it survives a stale epoch. The ObservedSet follows
+        // RegisterAccepted on the same ordered report path, so the session is
+        // live when this routes. A Dispatching attempt is still adopted below;
+        // the agent then reports Aborted after the stop.
+        if obs.running && abort_pending {
+            out.stops.push(alloc_id);
+        }
 
         if stale {
             // Demoted: stops (handled above) are the only safe verdict.
@@ -723,7 +742,9 @@ mod tests {
     };
     use coppice_proto::pb::core::v1::{HostFacts, Label};
 
-    use crate::test_support::{allocation_record, attempt_record, node_record, view_of};
+    use crate::test_support::{
+        allocation_record, attempt_record, job_record, node_record, view_of,
+    };
 
     /// The fixture "now", one second past the epoch. A function rather than
     /// a const because `Timestamp`'s range check is a runtime one.
@@ -1288,6 +1309,101 @@ mod tests {
             out.commands.is_empty(),
             "stale ObservedSet emits no commands"
         );
+    }
+
+    /// Fixture: one attempt in `state` on a node at epoch 5, its job
+    /// `Attempting` it, with `abort_requested` set iff `abort`.
+    fn abort_fixture(
+        state: AttemptState,
+        abort: bool,
+    ) -> (StateMachine, NodeId, AttemptId, AllocationId) {
+        use coppice_core::job::{AbortRequest, JobState};
+        let (node, job, att, alloc) = (
+            NodeId::new(),
+            JobId::new(),
+            AttemptId::new(),
+            AllocationId::new(),
+        );
+        let mut sm = StateMachine::default();
+        sm.nodes.insert(node, node_record(node, 5, true));
+        let mut record = job_record(job, "img", requested(), None);
+        record.state = JobState::Attempting(att);
+        if abort {
+            record.spec.abort_requested = Some(AbortRequest {
+                reason: None,
+                requested_at: now(),
+            });
+        }
+        sm.jobs.insert(job, record);
+        sm.attempts
+            .insert(att, attempt_record(att, job, alloc, node, state, None));
+        sm.allocations.insert(
+            alloc,
+            allocation_record(alloc, job, att, node, requested(), AllocationState::Active),
+        );
+        (sm, node, att, alloc)
+    }
+
+    /// ObservedSet for the fixture's single allocation, sent at `epoch`.
+    fn abort_diff(
+        sm: StateMachine,
+        node: NodeId,
+        att: AttemptId,
+        alloc: AllocationId,
+        running: bool,
+        epoch: u64,
+    ) -> Normalized {
+        let outcome = (!running).then_some(AttemptOutcome::Exited { code: 0 });
+        let set = Body::ObservedSet(ObservedSet {
+            allocations: vec![observed(alloc, att, running, outcome.as_ref(), 0)],
+        });
+        normalize(&view_of(sm), &report(node, epoch, set), now())
+    }
+
+    /// The StopJob for a pending abort is dropped when the node has no
+    /// session; the reconnect ObservedSet re-derives it (issue #167).
+    #[test]
+    fn observed_set_resends_pending_abort_stop() {
+        for state in [AttemptState::Running, AttemptState::Dispatching] {
+            let dispatching = state == AttemptState::Dispatching;
+            let (sm, node, att, alloc) = abort_fixture(state, true);
+            let out = abort_diff(sm, node, att, alloc, true, 5);
+            assert_eq!(out.stops, vec![alloc]);
+            // A Dispatching attempt is still adopted alongside the stop.
+            let adopted = out.commands.iter().find_map(|c| match c {
+                Command::ReconcileNode(rn) => Some(rn.adopted.clone()),
+                _ => None,
+            });
+            if dispatching {
+                assert_eq!(adopted, Some(vec![att]));
+            } else {
+                assert_eq!(adopted, None);
+            }
+        }
+    }
+
+    #[test]
+    fn observed_set_no_stop_without_abort_requested() {
+        let (sm, node, att, alloc) = abort_fixture(AttemptState::Running, false);
+        let out = abort_diff(sm, node, att, alloc, true, 5);
+        assert!(out.stops.is_empty());
+    }
+
+    /// Like the orphan stop, the verdict depends on current state alone, so
+    /// it survives a stale epoch (while commands stay suppressed).
+    #[test]
+    fn observed_set_pending_abort_stop_survives_stale_epoch() {
+        let (sm, node, att, alloc) = abort_fixture(AttemptState::Dispatching, true);
+        let out = abort_diff(sm, node, att, alloc, true, 4);
+        assert_eq!(out.stops, vec![alloc]);
+        assert!(out.commands.is_empty());
+    }
+
+    #[test]
+    fn observed_set_exited_allocation_with_pending_abort_not_stopped() {
+        let (sm, node, att, alloc) = abort_fixture(AttemptState::Running, true);
+        let out = abort_diff(sm, node, att, alloc, false, 5);
+        assert!(out.stops.is_empty());
     }
 
     #[test]

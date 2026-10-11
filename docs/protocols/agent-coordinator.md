@@ -167,7 +167,12 @@ The leader diffs the set against replicated intent and commits
 `ReconcileNode` verdicts: *adopt* (intended and running), *lost* (intended
 but absent — the carried outcome runs the full terminal path, retry policy
 applies). *Stop* verdicts never enter the log: a running container with no
-live intent gets `StopJob` sent directly. Reports carrying a stale
+live intent gets `StopJob` sent directly. So does a running container
+whose live attempt (`Dispatching | Running`, the job's current one) has a
+pending `abort_requested`: the abort's `StopJob` is routed once when it
+applies and is dropped if the node had no session then, so every
+ObservedSet re-derives it from replicated state (a `Dispatching`
+attempt is still adopted alongside). Reports carrying a stale
 `node_epoch` are demoted to exactly that stop-only reconciliation input —
 they never become attempt-progress commands. The same diff runs
 continuously against heartbeat running-sets, with one asymmetry: an

@@ -134,7 +134,11 @@ into state.
 The "stop" verdict of the ObservedSet diff never appears in a command: a
 running container with no replicated intent has, by definition, nothing in
 state to mutate. The leader sends `StopJob` directly (the agent journals a
-tombstone); replicated state is untouched.
+tombstone); replicated state is untouched. The same direct route re-sends
+a pending abort's `StopJob` when a session opens: the live send at
+`StopRequested` is dropped for a node with no session, so the ObservedSet
+diff stops any running allocation whose attempt is the job's current one and
+whose job has `abort_requested` set.
 
 ### The funding algorithm
 

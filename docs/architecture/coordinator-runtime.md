@@ -204,7 +204,10 @@ followers, which is what lets followers serve reads and event streams.
    container. On a `StopRequested` event it routes a `StopJob`. After any
    event gap it resyncs by scanning the latest view for `Ready` attempts and
    pending aborts; at-least-once delivery plus idempotent commands make the
-   rescan safe.
+   rescan safe. The live `StopJob` is dropped when the node has no session, so
+   the ingestion ObservedSet diff re-derives pending-abort stops on every
+   session open, using the same predicate as the resync scan
+   (`dispatch::attempt_has_pending_abort`).
 
 10. **Scheduler driver** (leader-only). A loop of: take `views.latest()`, run
    the CPU-heavy `Scheduler::schedule` pass in `spawn_blocking` (the trait
