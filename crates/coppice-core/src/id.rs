@@ -71,6 +71,25 @@ macro_rules! typed_id {
             }
         }
 
+        impl schemars::JsonSchema for $name {
+            fn schema_name() -> std::borrow::Cow<'static, str> {
+                stringify!($name).into()
+            }
+
+            fn schema_id() -> std::borrow::Cow<'static, str> {
+                concat!("coppice_core::id::", stringify!($name)).into()
+            }
+
+            fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+                schemars::json_schema!({
+                    "type": "string",
+                    "pattern": concat!("^", $prefix, "-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"),
+                    "description": concat!("A typed ", stringify!($name), ": `", $prefix, "-<uuid>` (ADR 0024)."),
+                    "examples": [concat!($prefix, "-0192f0c4-6d1e-7a3b-9c4d-5e6f7a8b9c0d")]
+                })
+            }
+        }
+
         impl serde::Serialize for $name {
             fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
                 serializer.collect_str(self)

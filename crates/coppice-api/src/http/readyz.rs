@@ -35,7 +35,7 @@ use serde_json::json;
 ///
 /// Serialized in the ADR's kebab-case spelling; automation matches on these
 /// strings, so they are as much a contract as the HTTP status.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ReadyzPhase {
     /// No manifest and no cluster found: serving the admin socket and this
@@ -64,7 +64,7 @@ pub enum ReadyzPhase {
 }
 
 /// One voter in a [`ReadyzReport`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Debug, Clone, Serialize, Deserialize)]
 pub struct ReadyzVoter {
     pub node_id: u64,
     pub address: String,
@@ -75,7 +75,7 @@ pub struct ReadyzVoter {
 /// Every field is present in every phase where it is knowable; the ones a
 /// parked or failed daemon cannot know are omitted rather than zero-filled,
 /// so automation can tell "no identity yet" from "identity 0".
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Debug, Clone, Serialize, Deserialize)]
 pub struct ReadyzReport {
     /// The operator-chosen logical cluster name from config (ADR 0020).
     pub cluster_id: String,

@@ -171,6 +171,20 @@ impl FromStr for QuotaEntityPath {
     }
 }
 
+impl schemars::JsonSchema for QuotaEntityPath {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "QuotaEntityPath".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "string",
+            "description": "A quota entity path: `/`-separated names from the root (ADR 0045).",
+            "examples": ["acme/eng"]
+        })
+    }
+}
+
 impl serde::Serialize for QuotaEntityPath {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(&self.0)
@@ -242,6 +256,20 @@ impl FromStr for QuotaEntityRef {
             return Ok(QuotaEntityRef::Id(id));
         }
         s.parse().map(QuotaEntityRef::Path)
+    }
+}
+
+impl schemars::JsonSchema for QuotaEntityRef {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "QuotaEntityRef".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "string",
+            "description": "A quota entity named by id (`quota-<uuid>`) or by path (`acme/eng`) (ADR 0045).",
+            "examples": ["acme/eng"]
+        })
     }
 }
 

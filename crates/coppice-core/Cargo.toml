@@ -11,6 +11,7 @@ authors.workspace = true
 [dependencies]
 byte-unit.workspace = true
 chrono.workspace = true
+schemars.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 uuid.workspace = true

@@ -28,6 +28,7 @@
 
 use std::collections::BTreeMap;
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use coppice_core::attempt;
@@ -43,7 +44,7 @@ use coppice_core::time::Timestamp;
 /// versioning; carries no readiness, phase, or cluster information on
 /// purpose (`/readyz` is where a verdict lives). Serialize-only: nothing
 /// ever parses this body back into Rust.
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, Serialize)]
 pub struct HealthzResponse {
     /// Always `"ok"`: the process answered.
     pub status: &'static str,
@@ -53,7 +54,7 @@ pub struct HealthzResponse {
 ///
 /// `deny_unknown_fields` because this nests inside write requests: a typo
 /// (`"cpu_milis"`) must be `INVALID_ARGUMENT`, not a silent zero.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Resources {
     pub cpu_millis: u64,
@@ -80,7 +81,7 @@ impl From<&coppice_core::resource::Resources> for Resources {
 /// leader-local, like `used`), a leader no agent has reported to yet, or a
 /// node inside the grace window a new leader granted it — never a
 /// fabricated `healthy`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeHealth {
     Unknown,
@@ -90,7 +91,7 @@ pub enum NodeHealth {
 
 /// `coppice_core::attempt::AttemptState`, flattened for display (the
 /// `Terminal` outcome payload travels separately as [`AttemptView::outcome`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AttemptState {
     Accruing,
@@ -116,7 +117,7 @@ impl From<&attempt::AttemptState> for AttemptState {
 
 /// Why an attempt reached `Terminal` (mirrors
 /// `coppice_core::attempt::AttemptOutcome`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AttemptOutcomeKind {
     Exited,
@@ -132,7 +133,7 @@ pub enum AttemptOutcomeKind {
 }
 
 /// Who "owns" an outcome (drives retry policy).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OutcomeClass {
     Success,
@@ -141,7 +142,7 @@ pub enum OutcomeClass {
     Platform,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttemptOutcome {
     pub kind: AttemptOutcomeKind,
     /// Present when `kind` is `Exited`.
@@ -180,7 +181,7 @@ impl From<&attempt::AttemptOutcome> for AttemptOutcome {
 }
 
 /// `coppice_core::allocation::AllocationState` as its display union.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AllocationState {
     Accruing,
@@ -202,7 +203,7 @@ impl From<coppice_core::allocation::AllocationState> for AllocationState {
 }
 
 /// Read-model projection of an attempt with its charge metadata.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Serialize, Deserialize)]
 pub struct AttemptView {
     pub id: AttemptId,
     pub job: JobId,
@@ -220,7 +221,7 @@ pub struct AttemptView {
 }
 
 /// Read-model projection of an allocation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Serialize, Deserialize)]
 pub struct AllocationView {
     pub id: AllocationId,
     pub job: JobId,
@@ -234,7 +235,7 @@ pub struct AllocationView {
 }
 
 /// Per-dimension funding progress, 0..1.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct FundedFraction {
     pub cpu: f64,
     pub memory: f64,
@@ -242,7 +243,7 @@ pub struct FundedFraction {
 }
 
 /// An accruing allocation with funding progress.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Serialize, Deserialize)]
 pub struct AccrualView {
     pub allocation: AllocationView,
     pub funded_fraction: FundedFraction,
@@ -251,7 +252,7 @@ pub struct AccrualView {
 }
 
 /// Summary of a compute node's current state for the list view.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Serialize, Deserialize)]
 pub struct NodeSummary {
     pub id: NodeId,
     pub capacity: Resources,
@@ -291,13 +292,13 @@ pub struct NodeSummary {
 
 /// `GET /api/v1/nodes` — an envelope, never a bare array, so fields can
 /// be added later.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Serialize, Deserialize)]
 pub struct ListNodesResponse {
     pub nodes: Vec<NodeSummary>,
 }
 
 /// `GET /api/v1/nodes/{node}` (mirrors `NodeDetail` in `types.ts`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Serialize, Deserialize)]
 pub struct GetNodeResponse {
     pub summary: NodeSummary,
     /// What the node's machine is, as its agent reported at registration.
@@ -321,7 +322,7 @@ pub struct GetNodeResponse {
 /// could not read this", never a claim about the hardware. Nothing here is
 /// authoritative — `NodeSummary.capacity` is what the node advertises, and
 /// these facts only explain where that number came from.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Serialize, Deserialize)]
 pub struct HostFacts {
     /// Operating system family, e.g. `linux`, `macos`.
     pub os: String,
@@ -394,7 +395,9 @@ impl From<&coppice_core::node::HostFacts> for HostFacts {
 ///   resolution completes in the same apply, so this shows a beat longer).
 /// - `Submitted`/`Accepted` — pre-admission, and `Succeeded`/`Failed`/
 ///   `Aborted` — terminal, all as named.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    JsonSchema, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum JobPhase {
     Submitted,
@@ -433,7 +436,7 @@ impl JobPhase {
 /// A missing instant is a missing *sample* — buckets that predate the
 /// process or an event-stream gap are absent from the list (their `t`
 /// simply never appears), never rendered as zeros.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct QueueSample {
     pub t: Timestamp,
     /// The depth sampled when the bucket closed, on the same
@@ -449,7 +452,7 @@ pub struct QueueSample {
 /// replicated state; the rates and `history` are **derived** fields
 /// (ADR 0032's per-field re-class of ADR 0031): served from this replica's
 /// in-memory bucket window, coverage-annotated, replica-local.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Serialize, Deserialize)]
 pub struct QueueStats {
     /// Jobs waiting for capacity: those in `Queued` plus those whose current
     /// attempt is still `Accruing`. An accruing job has a node and a partial
@@ -487,7 +490,7 @@ pub struct QueueStats {
 }
 
 /// Node counts behind the cluster's capacity totals.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeCounts {
     pub total: u32,
     /// Accepts placements: neither cordoned nor agent-draining, and not
@@ -500,7 +503,7 @@ pub struct NodeCounts {
 }
 
 /// Cluster-wide capacity, summed over the nodes in [`NodeCounts`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClusterCapacity {
     pub nodes: NodeCounts,
     /// Registered capacity, excluding lost nodes.
@@ -527,7 +530,7 @@ pub struct ClusterCapacity {
 }
 
 /// One closed bucket of the cluster's capacity history.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapacitySample {
     /// Bucket start.
     pub t: Timestamp,
@@ -545,7 +548,7 @@ pub struct CapacitySample {
 
 /// `GET /api/v1/nodes/{node}/utilization` — one node's rolling
 /// allocated-vs-used history against its capacity (ADR 0039).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Serialize, Deserialize)]
 pub struct GetNodeUtilizationResponse {
     /// The node's registered capacity now (not per-sample: capacity only
     /// changes on re-registration).
@@ -556,7 +559,7 @@ pub struct GetNodeUtilizationResponse {
 }
 
 /// One closed bucket of a node's utilization history.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UtilizationSample {
     /// Bucket start.
     pub t: Timestamp,
@@ -571,7 +574,7 @@ pub struct UtilizationSample {
 /// `coppice_core::job::JobState` union with `Attempting`'s attempt id
 /// flattened away (the id travels on attempt-scoped events, not on a job
 /// transition's `from`/`to`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobStateKind {
     Submitted,
@@ -605,7 +608,7 @@ impl From<coppice_core::job::JobState> for JobStateKind {
 /// deduplication key everywhere. `at` is the advisory proposer stamp —
 /// it may run backwards across proposers as the index advances, and no
 /// consumer may reorder or "correct" by it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Serialize, Deserialize)]
 pub struct TimelineEvent {
     /// The producing command's Raft log index.
     pub index: u64,
@@ -621,7 +624,7 @@ pub struct TimelineEvent {
 
 /// The event payload: kind plus the scope keys stamped during apply
 /// (mirrors `coppice_state::Event` arm for arm).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TimelineEventBody {
     JobSubmitted {
@@ -738,7 +741,7 @@ impl From<&coppice_state::Event> for TimelineEventBody {
 /// The events are the same ADR 0032 wire shape `GetJobTimeline` serves: thin,
 /// identified by `(index, ordinal)`, with no job snapshot attached. A client
 /// that needs the job's current state re-reads it with `?min_index=<index>`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Serialize, Deserialize)]
 pub struct EventBatchFrame {
     pub index: u64,
     /// The producing command's advisory proposer stamp (ADR 0032). It may run
@@ -759,7 +762,7 @@ pub struct EventBatchFrame {
 /// bookmark on a stream where nothing it cares about has happened — the whole
 /// reason it exists, since without one such a client would resume from an
 /// ever-staler cursor and re-read history it has already seen.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Serialize, Deserialize)]
 pub struct EventProgressFrame {
     pub index: u64,
 }
@@ -774,7 +777,7 @@ pub struct EventProgressFrame {
 /// leaves that query also accepts), take the `Coppice-Applied-Index` of that
 /// read, and resubscribe from it. The stream stays open and continues live
 /// meanwhile.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Serialize, Deserialize)]
 pub struct EventGapFrame {
     /// The oldest index this replica could still have served — everything
     /// below it is gone from the reconnection ring (ADR 0008).
@@ -793,7 +796,7 @@ pub struct EventGapFrame {
 /// is a truncated (aged-out) job, not a nonexistent one. `next_cursor` is the
 /// opaque continuation token: non-null means "more may exist, continue from
 /// it", null means "you have everything this replica currently holds".
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Serialize, Deserialize)]
 pub struct GetJobTimelineResponse {
     pub events: Vec<TimelineEvent>,
     pub floor_index: u64,
@@ -847,7 +850,7 @@ impl TimelineCursor {
 /// `by_state`, and `capacity` are bounded reads of replicated state, while
 /// the queue rates/history (derived buckets) are derived, replica-local, and
 /// coverage-annotated.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Serialize, Deserialize)]
 pub struct GetClusterOverviewResponse {
     /// The cluster this replica belongs to (node config, ADR 0020).
     pub cluster_id: ClusterId,
@@ -862,7 +865,7 @@ pub struct GetClusterOverviewResponse {
 /// A job's summary row for the list view (mirrors `JobSummary` in
 /// `types.ts`), the read-time join of a job with the attempt it carries
 /// (ADR 0030).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Serialize, Deserialize)]
 pub struct JobSummary {
     pub id: JobId,
     pub state: JobStateKind,
@@ -902,7 +905,7 @@ pub struct JobSummary {
 
 /// `GET /api/v1/jobs` — an envelope with the keyset-pagination cursor
 /// (ADR 0031 as amended: JSON filter AST, no `total`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Serialize, Deserialize)]
 pub struct ListJobsResponse {
     pub jobs: Vec<JobSummary>,
     /// Opaque continuation token ([`JobCursor`]); `null` iff the scan
@@ -952,7 +955,7 @@ pub const MAX_FILTER_NODES: usize = 64;
 /// at-least-one bound, ordered bounds, the metadata leaf's operand rules —
 /// are checked in [`JobFilter::validate`].
 ///
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobFilter {
     /// AND over a non-empty list.
@@ -982,7 +985,7 @@ pub enum JobFilter {
 /// `{"metadata": {"key": "…"}}` — presence; plus `"equals"` for exact
 /// string equality (ADR 0042). Nothing else: a pattern match is a further
 /// leaf for a future ADR, not a shape this one carries.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MetadataFilter {
     /// The metadata key, under the same charset and length rules as a stored
@@ -998,7 +1001,7 @@ pub struct MetadataFilter {
 }
 
 /// `{"phase": {"in": [...]}}` — matches the derived [`JobPhase`].
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PhaseFilter {
     /// Non-empty (checked in [`JobFilter::validate`]).
@@ -1011,7 +1014,7 @@ pub struct PhaseFilter {
 /// A path is resolved against the read view before the filter runs
 /// ([`JobFilter::resolve_entity_refs`]); an unresolvable path is
 /// `INVALID_ARGUMENT`, while an unknown *id* matches nothing.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EntityFilter {
     #[serde(rename = "ref")]
@@ -1030,7 +1033,7 @@ impl EntityFilter {
 
 /// Entity match breadth. `Subtree` (the default) matches the entity and all
 /// its descendants; `Exact` matches only the entity itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EntityScope {
     #[default]
@@ -1040,7 +1043,7 @@ pub enum EntityScope {
 
 /// `{"image": {"contains": "…"}}` or `{"equals": "…"}` — exactly one op
 /// (the single-key object enforces it).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ImageFilter {
     Contains(String),
@@ -1048,7 +1051,7 @@ pub enum ImageFilter {
 }
 
 /// `{"id": {"in": ["job-…", …]}}` — a malformed id fails to deserialize.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IdFilter {
     /// Non-empty (checked in [`JobFilter::validate`]).
@@ -1057,7 +1060,7 @@ pub struct IdFilter {
 
 /// `{"submitted": {"after": ISO8601, "before": ISO8601}}` — at least one
 /// bound; `after` inclusive `≥`, `before` exclusive `<`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SubmittedFilter {
     #[serde(default)]
@@ -1068,7 +1071,7 @@ pub struct SubmittedFilter {
 
 /// `{"requests": {"resource": …, "min": n, "max": n}}` — at least one
 /// bound, both inclusive.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RequestsFilter {
     pub resource: RequestsResource,
@@ -1079,7 +1082,7 @@ pub struct RequestsFilter {
 }
 
 /// The requested-resource dimension a [`RequestsFilter`] bounds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestsResource {
     CpuMillis,
@@ -1256,7 +1259,7 @@ where
 /// minted the first time the coordinator sees an OIDC principal). No such
 /// minting path exists yet, so today every entity is `Configured`; the
 /// variant is declared so the wire vocabulary is stable when it lands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QuotaEntityOrigin {
     Configured,
@@ -1274,7 +1277,7 @@ pub enum QuotaEntityOrigin {
 /// `usage_ucu`, `over_quota_ratio`, and
 /// `penalty` are decayed to read time (the same lazy decay `score.rs`
 /// applies), so they are read-time figures, not the stored accumulator.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Serialize, Deserialize)]
 pub struct QuotaEntityNode {
     pub id: QuotaEntityId,
     pub name: String,
@@ -1290,10 +1293,12 @@ pub struct QuotaEntityNode {
     /// How far over quota, as a ratio. Serializes as `null` when infinite
     /// (zero quota, nonzero usage) — JSON has no infinity, and serde renders
     /// non-finite floats as null; [`null_as_infinity`] reads that back.
+    #[schemars(with = "Option<f64>")]
     #[serde(deserialize_with = "null_as_infinity")]
     pub over_quota_ratio: f64,
     /// Multiplicative scheduling penalty ≥ 1 derived from the ratio (so also
     /// infinite, and `null` on the wire, when the ratio is).
+    #[schemars(with = "Option<f64>")]
     #[serde(deserialize_with = "null_as_infinity")]
     pub penalty: f64,
     pub created_at: Timestamp,
@@ -1309,7 +1314,7 @@ pub struct QuotaEntityNode {
 /// ancestry chains: a job's `entity_chain` and the entity detail's `chain`
 /// (mirrors `QuotaEntityView` in `types.ts`), with usage decayed to read
 /// time.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Serialize, Deserialize)]
 pub struct QuotaEntityView {
     pub id: QuotaEntityId,
     pub name: String,
@@ -1320,10 +1325,13 @@ pub struct QuotaEntityView {
     /// Decayed usage as of the read's `now` (ADR 0019 integer decay).
     pub usage_ucu: u64,
     /// `null` on the wire when infinite; see [`null_as_infinity`].
+    #[schemars(with = "Option<f64>")]
     #[serde(deserialize_with = "null_as_infinity")]
     pub over_quota_ratio: f64,
     /// Multiplicative scheduling penalty ≥ 1 derived from the ratio (`null`
     /// on the wire when infinite).
+    /// `null` means unlimited.
+    #[schemars(with = "Option<f64>")]
     #[serde(deserialize_with = "null_as_infinity")]
     pub penalty: f64,
 }
@@ -1335,7 +1343,7 @@ pub struct QuotaEntityView {
 /// later" rule wins over the mirror (an explicit deviation the 2026-07-16
 /// amendment allows); the web client unwraps `entities` at its boundary,
 /// the same as every other list endpoint.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Serialize, Deserialize)]
 pub struct ListQuotaEntitiesResponse {
     pub entities: Vec<QuotaEntityNode>,
 }
@@ -1343,7 +1351,7 @@ pub struct ListQuotaEntitiesResponse {
 /// One decayed-usage sample for an entity's sparkline (mirrors the anonymous
 /// element of `QuotaEntityStats.usageHistory`). Unused today — no usage-series
 /// sampler exists — so the list is always empty (see [`QuotaEntityStats`]).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct UsageSample {
     pub t: Timestamp,
     pub usage_ucu: u64,
@@ -1351,7 +1359,7 @@ pub struct UsageSample {
 
 /// Subtree-inclusive stats for one quota entity (mirrors `QuotaEntityStats`
 /// in `types.ts`), tallied over the entity and all its descendants.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Serialize, Deserialize)]
 pub struct QuotaEntityStats {
     /// Subtree job counts by displayed phase — every [`JobPhase`], zeros
     /// included.
@@ -1375,7 +1383,7 @@ pub struct QuotaEntityStats {
 /// `GET /api/v1/quota-entities/{entity}` (mirrors `QuotaEntityDetail` in
 /// `types.ts`): the entity node, its ancestry, its direct children, and its
 /// subtree stats.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Serialize, Deserialize)]
 pub struct GetQuotaEntityResponse {
     pub entity: QuotaEntityNode,
     /// Ancestry, root first, this entity last.
@@ -1390,7 +1398,7 @@ pub struct GetQuotaEntityResponse {
 // ---------------------------------------------------------------------------
 
 /// The immutable submitted spec (mirrors `JobSpec` in `types.ts`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Serialize, Deserialize)]
 pub struct JobSpecView {
     pub image: String,
     pub command: Vec<String>,
@@ -1416,7 +1424,7 @@ pub struct JobSpecView {
 
 /// A committed abort request on a job (mirrors the `abortRequested` field of
 /// `JobDetail`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Serialize, Deserialize)]
 pub struct AbortRequestedView {
     pub reason: Option<String>,
     pub requested_at: Timestamp,
@@ -1424,7 +1432,7 @@ pub struct AbortRequestedView {
 
 /// One entity's contribution to a queued job's penalty product (mirrors an
 /// entry of `QueuePositionExplainer.penaltyChain` in `types.ts`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Serialize, Deserialize)]
 pub struct PenaltyLink {
     pub entity: QuotaEntityId,
     pub name: String,
@@ -1433,9 +1441,11 @@ pub struct PenaltyLink {
     pub usage_ucu: u64,
     pub quota_ucu: u64,
     /// `null` on the wire when infinite; see [`null_as_infinity`].
+    #[schemars(with = "Option<f64>")]
     #[serde(deserialize_with = "null_as_infinity")]
     pub over_quota_ratio: f64,
     /// `null` on the wire when infinite; see [`null_as_infinity`].
+    #[schemars(with = "Option<f64>")]
     #[serde(deserialize_with = "null_as_infinity")]
     pub penalty: f64,
 }
@@ -1450,7 +1460,7 @@ pub struct PenaltyLink {
 /// intended source is a scheduler-published structure recording how the last
 /// scheduling invocation's unplaced jobs fared against each other, read here
 /// — never recomputed per request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Serialize, Deserialize)]
 pub struct QueuePositionExplainer {
     /// The job's priority multiplier `m(j)` as a real number.
     pub multiplier: f64,
@@ -1460,6 +1470,8 @@ pub struct QueuePositionExplainer {
     /// wire, see [`null_as_infinity`] — whenever any link in the chain is: the
     /// product is taken over the per-link penalties, and each is ≥ 1, so one
     /// infinite ancestor carries through (there is no `0 × ∞` NaN case).
+    /// `null` means unlimited.
+    #[schemars(with = "Option<f64>")]
     #[serde(deserialize_with = "null_as_infinity")]
     pub penalty_product: f64,
     pub age_seconds: i64,
@@ -1467,7 +1479,7 @@ pub struct QueuePositionExplainer {
 
 /// Per-dimension split of the base cost rate (µCU/second), summing to
 /// `CostReport::rate_ucu_per_second`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RateBreakdown {
     pub cpu: u64,
     pub memory: u64,
@@ -1476,13 +1488,13 @@ pub struct RateBreakdown {
 
 /// A true-up adjustment applied at finalization (mirrors the `trueUp` field of
 /// `CostReport`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrueUpView {
     pub kind: TrueUpKind,
     pub amount_ucu: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TrueUpKind {
     Refund,
@@ -1507,7 +1519,7 @@ impl From<TrueUp> for TrueUpView {
 /// A job's cost breakdown (mirrors `CostReport` in `types.ts`), computed from
 /// replicated policy and the job's charge records with the ADR 0019 quota
 /// arithmetic — never re-derived here.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Serialize, Deserialize)]
 pub struct CostReport {
     /// Base µCU/second from cost weights × requested resources, before any
     /// multiplier. `rate_breakdown` sums to this.
@@ -1545,7 +1557,7 @@ pub struct CostReport {
 }
 
 /// `GET /api/v1/jobs/{job}` (mirrors `JobDetail` in `types.ts`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Serialize, Deserialize)]
 pub struct JobDetail {
     pub id: JobId,
     pub state: JobStateKind,
@@ -1580,7 +1592,7 @@ pub struct JobDetail {
 // ---------------------------------------------------------------------------
 
 /// Per-job retry policy (mirrors `coppice_core::job::RetryPolicy`).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RetryPolicy {
     pub max_retries: u32,
@@ -1627,7 +1639,7 @@ impl From<Resources> for coppice_core::resource::Resources {
 /// unresolved, and the leader resolves it as part of the write path it runs
 /// for direct and forwarded requests alike (ADR 0038 — a follower forwards
 /// the request, never a resolution of it).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SubmitJobRequest {
     /// Client-minted job identity (`job-<uuid>`, ADR 0024) — required.
@@ -1670,7 +1682,7 @@ pub struct SubmitJobRequest {
     pub metadata: JobMetadata,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct SubmitJobResponse {
     /// Echo of the client-minted id from the request.
     pub job: JobId,
@@ -1683,7 +1695,7 @@ pub struct SubmitJobResponse {
 
 /// `POST /api/v1/jobs/{job}/abort` — commits a desired-state transition;
 /// it does not synchronously stop the container.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AbortJobRequest {
     /// The path segment is authoritative; the body's `job`, when present,
@@ -1695,7 +1707,7 @@ pub struct AbortJobRequest {
     pub reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct AbortJobResponse {}
 
 /// `PUT /api/v1/jobs/{job}/metadata` (ADR 0042) — the whole map, replacing
@@ -1705,7 +1717,7 @@ pub struct AbortJobResponse {}
 /// full-replacement shape as `PUT /api/v1/authorization`, and a body that
 /// forgot the field would otherwise clear the map silently. Sending `{}`
 /// explicitly still clears it, which is the point of the verb.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReplaceJobMetadataRequest {
     pub metadata: JobMetadata,
@@ -1719,7 +1731,7 @@ pub struct ReplaceJobMetadataRequest {
 /// a duplicate in `unset`, is `INVALID_ARGUMENT` ([`Self::validate`]) — the
 /// request is ambiguous about intent, and guessing an order would make the
 /// answer depend on a rule nobody wrote down.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateJobMetadataRequest {
     #[serde(default)]
@@ -1761,7 +1773,7 @@ impl UpdateJobMetadataRequest {
 
 /// The answer to either metadata write: the job, and the index its command
 /// applied at, for a read-your-writes `?min_index=` (ADR 0007).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplaceJobMetadataResponse {
     pub job: JobId,
     pub log_index: u64,
@@ -1771,7 +1783,7 @@ pub struct ReplaceJobMetadataResponse {
 /// [`ReplaceJobMetadataResponse`] and deliberately a separate type: the two
 /// routes are two message pairs in ADR 0031's table, and a client generating
 /// from that table gets the name it expects.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpdateJobMetadataResponse {
     pub job: JobId,
     pub log_index: u64,
@@ -1784,7 +1796,7 @@ pub struct UpdateJobMetadataResponse {
 /// **Not a request body.** Both routes take no body; this is the argument
 /// type of the [`ControlPlane`](crate::ControlPlane) seam the two handlers
 /// share, serde-derived only so a test can build and compare one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SetNodeSchedulableRequest {
     pub node: NodeId,
@@ -1800,7 +1812,7 @@ pub struct SetNodeSchedulableRequest {
 /// than echoed here — a write that resolved is a write that applied, and
 /// anything this body claimed about the node would already be a snapshot of
 /// the past.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct DrainNodeResponse {}
 
 /// `POST /api/v1/nodes/{node}/remove` (ADR 0041) — the decommission verb,
@@ -1809,13 +1821,13 @@ pub struct DrainNodeResponse {}
 /// Bodyless like the two above, and the same seam-argument type rather than a
 /// wire body. Singular where the `EvictNodes` command is plural: the
 /// retention GC proposes batches, an operator removes the node they named.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvictNodeRequest {
     pub node: NodeId,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct RemoveNodeResponse {}
 
 /// `POST /api/v1/quota-entities` — the create-or-update upsert of the
@@ -1836,7 +1848,7 @@ pub struct RemoveNodeResponse {}
 ///
 /// `deny_unknown_fields`: like every write body, a typo must be
 /// `INVALID_ARGUMENT`, not a silently defaulted field.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigureQuotaEntityRequest {
     /// Client-minted entity id (`quota-<uuid>`, ADR 0024) — required. The
@@ -1867,7 +1879,7 @@ pub struct ConfigureQuotaEntityRequest {
 /// projected view; echoing the id + `log_index` lets the caller pair the
 /// write with a strong `GET /api/v1/quota-entities/{entity}?min_index=…`
 /// for read-your-writes (ADR 0007), the same pattern `SubmitJob` uses.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigureQuotaEntityResponse {
     /// Echo of the client-minted id from the request.
     pub entity: QuotaEntityId,
@@ -1894,7 +1906,7 @@ pub struct ConfigureQuotaEntityResponse {
 /// Read locally off the consensus metrics and a replica-local state snapshot,
 /// so every figure is "as this replica sees it" — a follower answers from its
 /// own applied position, not the leader's.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Serialize, Deserialize)]
 pub struct GetCoordinatorStatusResponse {
     /// The cluster this replica belongs to (node config, ADR 0020).
     pub cluster_id: ClusterId,
@@ -1928,7 +1940,7 @@ pub struct GetCoordinatorStatusResponse {
 
 /// The serving replica's last snapshot, as far as it is knowable from
 /// openraft metrics. Only the covered log index is real today.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct CoordinatorSnapshot {
     /// Snapshot size on disk. Always `null`: `SnapshotMeta` carries no size,
     /// and computing one would mean stat-ing snapshot files on a read path.
@@ -1943,7 +1955,7 @@ pub struct CoordinatorSnapshot {
 }
 
 /// Object counts in the replicated state machine (`StateMachine` map lengths).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct CoordinatorStateCounts {
     pub jobs: u64,
     pub attempts: u64,
@@ -1955,7 +1967,7 @@ pub struct CoordinatorStateCounts {
 /// A coordinator's role in the raft cluster, derived from the leader id and
 /// its voter flag (ADR 0031): leader if it is the current leader, learner if
 /// it is a non-voter, follower otherwise.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CoordinatorRole {
     Leader,
@@ -1964,7 +1976,7 @@ pub enum CoordinatorRole {
 }
 
 /// One cluster member in a [`GetCoordinatorStatusResponse`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Serialize, Deserialize)]
 pub struct CoordinatorMember {
     /// The member's raft id. A decimal string — see [`
     /// GetCoordinatorStatusResponse::leader`] for why it is not a JSON number.
@@ -1996,7 +2008,7 @@ pub struct CoordinatorMember {
 
 /// The scan direction, shared by the `order=` parameter and the cursor.
 /// `Desc` (the default) is newest-first.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LogOrder {
     Asc,
@@ -2030,7 +2042,7 @@ impl LogOrder {
 
 /// One of an attempt's two output streams, on both an entry and the `stream=`
 /// filter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LogStreamName {
     Stdout,
@@ -2053,7 +2065,7 @@ impl LogStreamName {
 /// The availability verdict for one attempt — the join of replicated state
 /// (which attempts exist and where they ran) with the agent's answer (what
 /// data still exists), per ADR 0034's honesty semantics.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LogAvailability {
     /// Chunks returned (possibly zero within the range). See `truncated`.
@@ -2071,7 +2083,7 @@ pub enum LogAvailability {
 
 /// One captured log chunk for the client. Bytes are decoded UTF-8-lossily
 /// into `text`; raw bytes are not recoverable through this API.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Serialize, Deserialize)]
 pub struct LogEntry {
     /// Stable identity; distinct repeated writes remain distinct entries.
     pub id: String,
@@ -2089,7 +2101,7 @@ pub struct LogEntry {
 
 /// One per attempt this page covered, in page order — the per-attempt
 /// availability accounting that makes a best-effort answer honest.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Serialize, Deserialize)]
 pub struct LogSourceRecord {
     pub attempt: AttemptId,
     /// The node the attempt ran on; `null` only when the attempt record
@@ -2117,7 +2129,7 @@ where
 }
 
 /// `GET /api/v1/jobs/{job}/logs` — the never-bare-array envelope (ADR 0031).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Serialize, Deserialize)]
 pub struct GetJobLogsResponse {
     /// Ascending high-water mark, valid even when this page exhausts current output.
     #[serde(deserialize_with = "required_option")]
@@ -2256,7 +2268,7 @@ impl LogCursor {
 
 /// The availability verdict for one attempt's samples — the metrics twin of
 /// [`LogAvailability`], with the identical four verdicts and semantics.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UsageAvailability {
     /// Samples returned (possibly zero within the range). See `truncated`.
@@ -2283,7 +2295,7 @@ pub enum UsageAvailability {
 /// whole-second quantisation would erase sub-second deltas between adjacent
 /// samples. They are integers, not instants, so the string-instant rule does
 /// not apply.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct UsagePoint {
     pub attempt: AttemptId,
     pub at: Timestamp,
@@ -2311,7 +2323,7 @@ pub struct UsagePoint {
 
 /// One per attempt this page covered, in page order — the metrics twin of
 /// [`LogSourceRecord`], with identical fields and semantics.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Serialize, Deserialize)]
 pub struct UsageSourceRecord {
     pub attempt: AttemptId,
     /// The node the attempt ran on; `null` only when the attempt record itself
@@ -2331,7 +2343,7 @@ pub struct UsageSourceRecord {
 
 /// `GET /api/v1/jobs/{job}/usage` — the never-bare-array envelope (ADR 0031),
 /// the metrics twin of [`GetJobLogsResponse`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Serialize, Deserialize)]
 pub struct GetJobUsageResponse {
     pub samples: Vec<UsagePoint>,
     pub sources: Vec<UsageSourceRecord>,
@@ -2462,7 +2474,7 @@ impl UsageCursor {
 /// deliberately: `{"mode":"open"}` says there is no OIDC configuration, where
 /// three nulls would invite a client to render an empty login form. Nothing
 /// secret is exposed either way; every field here is public IdP metadata.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Serialize, Deserialize)]
 pub struct GetAuthConfigResponse {
     /// `"oidc"` or `"open"`.
     pub mode: String,
@@ -2490,7 +2502,7 @@ pub struct GetAuthConfigResponse {
 /// per matching binding). The server does not collapse them into a single
 /// effective role — union semantics belong to `authz::evaluate`, and a
 /// client that wants a headline can derive one.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Serialize, Deserialize)]
 pub struct GetSessionResponse {
     /// The principal: an OIDC `sub`, `cert:<CN>` for an operator certificate,
     /// or `anonymous` in open mode. Opaque — there is no user table behind it.
@@ -2517,7 +2529,7 @@ pub struct GetSessionResponse {
 }
 
 /// One matching binding in the session's resolved-authority summary.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Serialize, Deserialize)]
 pub struct SessionBinding {
     pub role: BindingRole,
     /// Subtree root the role is scoped to; `null` = cluster-wide.
@@ -2528,7 +2540,7 @@ pub struct SessionBinding {
 }
 
 /// The closed ADR 0023 role set, in wire form.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BindingRole {
     Submitter,
@@ -2551,7 +2563,7 @@ pub enum BindingRole {
 /// unresolved to the leader, which resolves it into a
 /// `BindingDto<QuotaEntityId>` before proposing. Reads answer with
 /// [`BindingView`], which adds the scope's path.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BindingDto<S = QuotaEntityRef> {
     /// Group-claim subject; exactly one of `group`/`principal`.
@@ -2563,7 +2575,7 @@ pub struct BindingDto<S = QuotaEntityRef> {
     pub role: BindingRole,
     /// Subtree root the role is scoped to, by id or path; absent = unscoped
     /// (cluster-wide).
-    #[serde(default = "no_scope", skip_serializing_if = "Option::is_none")]
+    #[serde(default = "no_scope::<S>", skip_serializing_if = "Option::is_none")]
     pub scope: Option<S>,
 }
 
@@ -2586,7 +2598,7 @@ impl<S> BindingDto<S> {
 
 /// One binding as `GET /api/v1/authorization` reports it: the stored id
 /// scope plus its path as of the read (ADR 0045).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BindingView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
@@ -2625,7 +2637,7 @@ impl BindingView {
 /// policy: the full bindings list plus the groups-claim name (which lives in
 /// `PolicyConfig`, not the bindings list, but travels here because the two
 /// are edited as one document by `coppice-cli policy authz`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Serialize, Deserialize)]
 pub struct GetAuthorizationResponse {
     /// The token claim group names are read from (replicated policy,
     /// ADR 0022).
@@ -2639,7 +2651,7 @@ pub struct GetAuthorizationResponse {
 /// installed by the same apply, so a rename and a binding swap can never be
 /// half-applied; last-writer-wins against `UpdatePolicy` like every policy
 /// edit.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateAuthorizationRequest {
     /// Absent = leave the current groups-claim name unchanged.
@@ -2649,7 +2661,7 @@ pub struct UpdateAuthorizationRequest {
 }
 
 /// `PUT /api/v1/authorization` response.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct UpdateAuthorizationResponse {
     /// Raft log index at which the `UpdateAuthorization` applied — bindings
     /// and any `groups_claim` rename together, since one command carries

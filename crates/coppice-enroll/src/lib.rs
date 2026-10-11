@@ -27,7 +27,7 @@ pub const ENROLL_PATH: &str = "/api/v1/enroll";
 /// `token` body field is the redacted-body alternative ADR 0037 §4 allows.
 /// It must never appear in a query parameter, a log line, or a `Debug`
 /// rendering — `Debug` is hand-written below to enforce the last of those.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EnrollRequest {
     /// PEM-encoded certificate signing request. Contributes only its public
@@ -65,7 +65,7 @@ impl std::fmt::Debug for EnrollRequest {
 
 /// Success body for `POST /api/v1/enroll`: the issued leaf and the CA bundle
 /// that anchors it. From this moment the machine speaks cluster-CA mTLS.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EnrollResponse {
     /// PEM-encoded issued leaf certificate.

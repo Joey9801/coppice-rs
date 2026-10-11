@@ -262,6 +262,21 @@ impl Sub<Timestamp> for Timestamp {
     }
 }
 
+impl schemars::JsonSchema for Timestamp {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Timestamp".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "string",
+            "description": "An RFC 3339 instant, always UTC, microsecond precision.",
+            "format": "date-time",
+            "examples": ["2026-07-16T09:30:00.000000Z"]
+        })
+    }
+}
+
 impl Serialize for Timestamp {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(&self.to_rfc3339())
