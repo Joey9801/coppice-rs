@@ -35,7 +35,7 @@ pub enum ErrorCode {
     /// The request did not resolve: timeout, overload, shutdown, or a
     /// follower that cannot bound its staleness. Retryable.
     Unavailable,
-    /// A provisional or reserved route (ADR 0031's table) with no backing
+    /// A provisional or reserved route (see the catalogue) with no backing
     /// implementation yet.
     Unimplemented,
     /// A bug. Details are logged server-side, never leaked to the body.

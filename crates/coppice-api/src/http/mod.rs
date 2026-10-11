@@ -1,18 +1,18 @@
 //! The HTTP client edge (ADR 0031): axum router, JSON DTO bodies, and
 //! the wire error/consistency contracts.
 //!
-//! This module owns everything transport: the `/api/v1` route map
-//! ([`router`]), the JSON error contract ([`HttpError`]/[`ErrorCode`]),
+//! This module owns everything transport: the `/api/v1` router
+//! ([`router`], built from [`crate::catalog`]), the JSON error contract ([`HttpError`]/[`ErrorCode`]),
 //! and the ADR 0007 read parameters ([`ReadParams`]). The coordinator
 //! binds the router on `listen.client_addr` and injects its
 //! [`crate::ControlPlane`]. Every request and response body is a
 //! handwritten serde DTO in [`dto`] (ADR 0031, "Wire format") —
 //! protobuf idioms never leak into them.
 //!
-//! Most read routes are `UNIMPLEMENTED` stubs today — the ADR 0031 route
-//! table is authoritative for their consistency class and message names,
-//! and `web/src/api/types.ts` for their response shapes until each DTO
-//! lands.
+//! Three read routes (node history, node logs, coordinator logs) are still
+//! `UNIMPLEMENTED` stubs — the [`crate::catalog`] is authoritative for their
+//! consistency class and names, and `web/src/api/types.ts` for their response
+//! shapes until each DTO lands.
 
 mod authn;
 mod authorize;

@@ -1,8 +1,10 @@
-//! The `/api/v1` route map (ADR 0031) and its implemented handlers.
+//! The `/api/v1` router and its implemented handlers.
 //!
-//! One route per `CoppiceApi` method in `web/src/api/client.ts`, plus the
-//! two writes `ControlPlane` already serves. Reads are stubbed with
-//! [`unimplemented`] until their endpoint lands; implementing one means:
+//! The router is built from [`catalog`]: each table below pairs a catalogue
+//! operation (method, path, auth, consistency, docs; ADR 0031 set the original
+//! surface) with the handler that serves it, so a route cannot be added
+//! without declaring them. Reads are stubbed with [`unimplemented`] until
+//! their endpoint lands; implementing one means:
 //! response DTOs in [`super::dto`] (shape mirrors `web/src/api/types.ts`),
 //! a projection in [`super::project`], and swapping the stub for a real
 //! handler here — routing, errors, and consistency parameters are already
@@ -14,7 +16,7 @@ use std::sync::Arc;
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{Query, State};
 use axum::response::IntoResponse;
-use axum::routing::{get, post, put};
+use axum::routing::{get, post, put, MethodRouter};
 use axum::{Json, Router};
 
 use serde::Deserialize;
@@ -32,7 +34,7 @@ use super::dto::{
     ReplaceJobMetadataRequest, ReplaceJobMetadataResponse, SubmitJobRequest,
     UpdateJobMetadataRequest, UpdateJobMetadataResponse,
 };
-use crate::{Consistency, ControlPlane, UpdateJobMetadataCall};
+use crate::{catalog, Consistency, ControlPlane, UpdateJobMetadataCall};
 
 use super::authn::{RequestActor, RequestPresentation};
 use super::authorize::{precheck, Intent};
@@ -126,33 +128,55 @@ fn operational_routes<S: Clone + Send + Sync + 'static>(
     metrics: MetricsEndpoint,
     readyz: ReadyzEndpoint,
 ) -> Router<S> {
+    build_router(operational_table(metrics, readyz))
+}
+
+/// One catalogue operation and the handler that serves it.
+type RouteEntry<S> = (&'static catalog::Operation, MethodRouter<S>);
+
+/// Fold a catalogue table into a router. A path listed twice (GET and POST
+/// `/jobs`) merges its method routers, which is axum 0.7's `.route` contract.
+fn build_router<S: Clone + Send + Sync + 'static>(table: Vec<RouteEntry<S>>) -> Router<S> {
+    table
+        .into_iter()
+        .fold(Router::new(), |router, (op, handler)| {
+            router.route(&op.axum_path(), handler)
+        })
+}
+
+/// The operational routes as a catalogue table (see [`operational_routes`]).
+fn operational_table<S: Clone + Send + Sync + 'static>(
+    metrics: MetricsEndpoint,
+    readyz: ReadyzEndpoint,
+) -> Vec<RouteEntry<S>> {
     let metrics = Arc::new(metrics);
-    Router::new()
+    vec![
         // Prometheus scrape target (issue #46): the `/metrics` render contract
         // lives in `super::metrics`; this only marries it to the listener.
-        .route(
-            "/metrics",
+        (
+            catalog::op("metrics"),
             get(move || {
                 let metrics = Arc::clone(&metrics);
                 async move { metrics.render().await }
             }),
-        )
+        ),
         // Readiness (ADR 0037 §9): served in every daemon state, including
         // parked and formation-failed. `?require=healthy` is the only gate
         // query the endpoint recognizes; anything else is a 400 from
         // `ReadyzEndpoint::handle` itself.
-        .route(
-            "/readyz",
+        (
+            catalog::op("readyz"),
             get(move |Query(ReadyzQuery { require }): Query<ReadyzQuery>| {
                 let readyz = readyz.clone();
                 async move { readyz.handle(require).await }
             }),
-        )
+        ),
         // Liveness (ADR 0041): 200 for as long as the process is serving.
         // Must not consult the cluster or replica phase — that would risk
         // an orchestrator killing a healthy daemon mid-election. `/readyz`
         // is where such conditions are reported.
-        .route("/healthz", get(healthz))
+        (catalog::op("healthz"), get(healthz)),
+    ]
 }
 
 /// `GET /healthz` — the ADR 0041 liveness answer. Reaching this handler at
@@ -162,11 +186,12 @@ async fn healthz() -> impl IntoResponse {
     Json(dto::HealthzResponse { status: "ok" })
 }
 
-/// The `/api/v1` route map (ADR 0031), nested under its prefix by [`router`].
+/// The `/api/v1` routes (the [`catalog`] is their source of truth), nested
+/// under its prefix by [`router`].
 ///
 /// Every path here is written **without** the `/api/v1` prefix — [`router`]
 /// restores it with `.nest("/api/v1", …)`. Consistency defaults per route are
-/// the ADR 0031 table; they become code (`ReadParams::class(default)`) as each
+/// the catalogue's; they become code (`ReadParams::class(default)`) as each
 /// read handler is implemented.
 ///
 /// ## One table, one boundary
@@ -183,7 +208,7 @@ async fn healthz() -> impl IntoResponse {
 /// being written in the wrong sub-router, because there is no wrong
 /// sub-router.
 ///
-/// The two credential-less endpoints are instead named, once, in
+/// The credential-less endpoints are instead named, once, in
 /// [`UNAUTHENTICATED_ROUTES`](super::authn::UNAUTHENTICATED_ROUTES): exact
 /// method-and-path pairs the middleware waves through. That list is the single
 /// source of truth for "reachable without a credential", and it is checked
@@ -227,13 +252,13 @@ fn all_routes<P: ControlPlane>(
     credential_free_routes::<P>(enroll, authn).merge(state_routes::<P>())
 }
 
-/// The two routes the middleware's exemption table lets through
+/// The routes the middleware's exemption table lets through
 /// uncredentialed (see
 /// [`UNAUTHENTICATED_ROUTES`](super::authn::UNAUTHENTICATED_ROUTES) for *why*
 /// each is exempt).
 ///
-/// They are grouped here only because they share a shape — neither is a
-/// `ControlPlane` operation and neither extracts a
+/// They are grouped here only because they share a shape — none is a
+/// `ControlPlane` operation and none extracts a
 /// [`RequestActor`] — not because grouping them is what makes them public.
 /// Moving a route out of this function grants it nothing and revokes nothing;
 /// the exemption table is the only thing that decides.
@@ -241,7 +266,15 @@ fn credential_free_routes<P: ControlPlane>(
     enroll: EnrollEndpoint,
     authn: Arc<coppice_authn::AuthnChain>,
 ) -> Router<Arc<P>> {
-    Router::new()
+    build_router(credential_free_table(enroll, authn))
+}
+
+/// The credential-free routes as a catalogue table.
+fn credential_free_table<S: Clone + Send + Sync + 'static>(
+    enroll: EnrollEndpoint,
+    authn: Arc<coppice_authn::AuthnChain>,
+) -> Vec<RouteEntry<S>> {
+    vec![
         // Enrollment (ADR 0037 §4): certless first contact, authenticated
         // solely by a role-scoped bearer token, and served only here — the
         // pre-formation `closed_router` has no `/api/v1` tree at all, which is
@@ -249,8 +282,8 @@ fn credential_free_routes<P: ControlPlane>(
         // without a second check on this side. The body limit is a route layer
         // so an oversized request is refused by the framework before the
         // handler's own guards ever see it.
-        .route(
-            "/enroll",
+        (
+            catalog::op("enroll"),
             post(move |request: axum::extract::Request| {
                 let enroll = enroll.clone();
                 async move { enroll.handle(request).await }
@@ -258,91 +291,100 @@ fn credential_free_routes<P: ControlPlane>(
             .layer(axum::extract::DefaultBodyLimit::max(
                 super::enroll::MAX_ENROLL_BODY,
             )),
-        )
+        ),
         // The auth posture (ADR 0022), captured like `/enroll` captures its
         // endpoint: the chain is not a `ControlPlane` operation either.
-        .route(
-            "/auth/config",
+        (
+            catalog::op("get_auth_config"),
             get(move || {
                 let authn = Arc::clone(&authn);
                 async move { Json(auth_config(authn.mode())) }
             }),
-        )
+        ),
+    ]
 }
 
 /// Everything that reads or writes this cluster's state — that is, every
-/// `/api/v1` route but the two credential-free ones.
+/// `/api/v1` route but the credential-free ones.
 ///
 /// A separate function purely for readability; it is merged into one table by
 /// [`all_routes`] and authenticated by [`api_v1_routes`]'s layer along with
 /// everything else, so a route added here is authenticated by construction —
 /// as is a route added anywhere else under the prefix.
 fn state_routes<P: ControlPlane>() -> Router<Arc<P>> {
-    Router::new()
+    build_router(state_table::<P>())
+}
+
+/// The state routes as a catalogue table: each handler beside the catalogue
+/// operation (method, path, docs) it serves.
+fn state_table<P: ControlPlane>() -> Vec<RouteEntry<Arc<P>>> {
+    use catalog::op;
+    vec![
         // Session / auth (ADR 0022) — the request's own identity, plus the
         // ADR 0023 authority summary read from replicated bindings.
-        .route("/session", get(get_session::<P>))
+        (op("get_session"), get(get_session::<P>)),
         // Authorization policy (ADR 0023). The read is an ordinary bounded
         // read; the write is the unscoped-admin-only full replacement.
-        .route(
-            "/authorization",
-            get(get_authorization::<P>).put(update_authorization::<P>),
-        )
+        (op("get_authorization"), get(get_authorization::<P>)),
+        (op("update_authorization"), put(update_authorization::<P>)),
         // Cluster overview — bounded reads.
-        .route("/overview", get(get_overview::<P>))
-        .route("/queue/stats", get(get_queue_stats::<P>))
+        (op("get_overview"), get(get_overview::<P>)),
+        (op("get_queue_stats"), get(get_queue_stats::<P>)),
         // Jobs. List/detail are bounded; timeline and usage are eventual
-        // (derived: ring events / samples); logs are provisional until log
-        // storage exists.
-        .route("/jobs", get(list_jobs::<P>).post(submit_job::<P>))
-        .route("/jobs/:job", get(get_job::<P>))
-        .route("/jobs/:job/abort", post(abort_job::<P>))
+        // (derived: ring events / samples); logs are best-effort.
+        (op("list_jobs"), get(list_jobs::<P>)),
+        (op("submit_job"), post(submit_job::<P>)),
+        (op("get_job"), get(get_job::<P>)),
+        (op("abort_job"), post(abort_job::<P>)),
         // The ADR 0042 metadata writes, one path and two verbs: PUT is the
         // full replacement, POST the patch. Two methods rather than two
         // paths because they address the same resource — the job's metadata
         // map — and differ only in how much of it the caller claims to own.
-        .route(
-            "/jobs/:job/metadata",
-            put(replace_job_metadata::<P>).post(update_job_metadata::<P>),
-        )
-        .route("/jobs/:job/timeline", get(get_job_timeline::<P>))
-        .route("/jobs/:job/usage", get(super::usage::get_job_usage::<P>))
-        .route("/jobs/:job/logs", get(super::logs::get_job_logs::<P>))
+        (op("replace_job_metadata"), put(replace_job_metadata::<P>)),
+        (op("update_job_metadata"), post(update_job_metadata::<P>)),
+        (op("get_job_timeline"), get(get_job_timeline::<P>)),
+        (op("get_job_usage"), get(super::usage::get_job_usage::<P>)),
+        (op("get_job_logs"), get(super::logs::get_job_logs::<P>)),
         // Nodes. List/detail bounded; utilization/history eventual; logs
         // provisional.
-        .route("/nodes", get(list_nodes::<P>))
-        .route("/nodes/:node", get(get_node::<P>))
-        .route("/nodes/:node/utilization", get(get_node_utilization::<P>))
+        (op("list_nodes"), get(list_nodes::<P>)),
+        (op("get_node"), get(get_node::<P>)),
+        (op("get_node_utilization"), get(get_node_utilization::<P>)),
         // The ADR 0041 node writes. All three are bodyless: the path names
         // the node, and the route names the intent.
-        .route("/nodes/:node/drain", post(drain_node::<P>))
-        .route("/nodes/:node/undrain", post(undrain_node::<P>))
-        .route("/nodes/:node/remove", post(remove_node::<P>))
-        .route(
-            "/nodes/:node/history",
+        (op("drain_node"), post(drain_node::<P>)),
+        (op("undrain_node"), post(undrain_node::<P>)),
+        (op("remove_node"), post(remove_node::<P>)),
+        (
+            op("get_node_history"),
             get(unimplemented_id_read::<NodeId>("GetNodeHistory")),
-        )
-        .route(
-            "/nodes/:node/logs",
+        ),
+        (
+            op("get_node_logs"),
             get(unimplemented_id_read::<NodeId>("GetNodeLogs")),
-        )
+        ),
         // Coordinators — local status read; logs provisional.
-        .route("/coordinators", get(get_coordinators::<P>))
-        .route(
-            "/coordinators/:id/logs",
+        (op("get_coordinators"), get(get_coordinators::<P>)),
+        (
+            op("get_coordinator_logs"),
             // Coordinator ids are raft ids: plain u64, not typed uuids (ADR 0024).
             get(unimplemented_id_read::<u64>("GetCoordinatorLogs")),
-        )
+        ),
         // Quota entities. List bounded; detail defaults strong (ADR 0007:
         // configuration reads); configure is the ADR-0023-gated upsert.
-        .route(
-            "/quota-entities",
-            get(list_quota_entities::<P>).post(configure_quota_entity::<P>),
-        )
-        .route("/quota-entities/:entity", get(get_quota_entity::<P>))
+        (op("list_quota_entities"), get(list_quota_entities::<P>)),
+        (
+            op("configure_quota_entity"),
+            post(configure_quota_entity::<P>),
+        ),
+        (op("get_quota_entity"), get(get_quota_entity::<P>)),
         // The ADR 0008 event subscription, filtered and cursor-resumed per
         // ADR 0043. Eventual by nature: a derived, replica-local stream.
-        .route("/events", get(super::events::subscribe_events::<P>))
+        (
+            op("subscribe_events"),
+            get(super::events::subscribe_events::<P>),
+        ),
+    ]
 }
 
 /// `GET /api/v1/auth/config` — project the resolved posture (ADR 0022) into
@@ -437,7 +479,7 @@ async fn get_session<P: ControlPlane>(
 /// `GET /api/v1/authorization` — the replicated authorization policy: the full
 /// bindings list and the `groups_claim` name (ADR 0023).
 ///
-/// **Strong** by default (ADR 0031's table), which puts it in ADR 0007's
+/// **Strong** by default (ADR 0031, as the catalogue records it), which puts it in ADR 0007's
 /// configuration-read class alongside [`get_quota_entity`] rather than with
 /// the bounded list reads. The document this serves is the one an operator
 /// edits and PUTs back: a read-modify-write over a stale snapshot silently
@@ -4998,7 +5040,7 @@ mod tests {
         // `POST /enroll`: the endpoint's own uniform refusal, not the API's
         // 401 — the same assertion `enrollment_is_not_touched_by_the_authn_layer`
         // makes, restated here as the second half of the pair.
-        let response = router_with_authn(stub_plane(Default::default()), chain)
+        let response = router_with_authn(stub_plane(Default::default()), Arc::clone(&chain))
             .oneshot(enroll_request(None, CSR_BODY))
             .await
             .unwrap();
@@ -6734,5 +6776,264 @@ mod tests {
             reads.iter().all(|c| *c == Consistency::Eventual),
             "write handlers read {reads:?}"
         );
+    }
+
+    // ---- The API catalogue --------------------------------------
+
+    /// Every catalogue table the router is folded from, as operation ids.
+    fn routed_ids() -> Vec<&'static str> {
+        let authn = Arc::new(AuthnChain::open(no_ca()));
+        let mut ids: Vec<&'static str> = operational_table::<()>(
+            crate::http::MetricsEndpoint::detached_for_tests(),
+            crate::http::ReadyzEndpoint::detached_for_tests(),
+        )
+        .into_iter()
+        .map(|(op, _)| op.id)
+        .collect();
+        ids.extend(
+            credential_free_table::<()>(crate::http::EnrollEndpoint::detached_for_tests(), authn)
+                .into_iter()
+                .map(|(op, _)| op.id),
+        );
+        ids.extend(state_table::<StubPlane>().into_iter().map(|(op, _)| op.id));
+        ids
+    }
+
+    #[test]
+    fn catalog_every_operation_is_in_the_route_table_exactly_once() {
+        let mut routed = routed_ids();
+        routed.sort_unstable();
+        let mut dedup = routed.clone();
+        dedup.dedup();
+        assert_eq!(routed, dedup, "an operation is routed twice");
+
+        let mut catalogued: Vec<&str> = catalog::operations().iter().map(|o| o.id).collect();
+        catalogued.sort_unstable();
+        let mut unique = catalogued.clone();
+        unique.dedup();
+        assert_eq!(catalogued, unique, "two catalogue operations share an id");
+        assert_eq!(routed, catalogued, "router and catalogue disagree");
+
+        // No two operations claim the same method and path.
+        let mut keys: Vec<(String, &str)> = catalog::operations()
+            .iter()
+            .map(|o| (o.full_path(), o.method.as_str()))
+            .collect();
+        let before = keys.len();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(keys.len(), before, "two operations share a method and path");
+    }
+
+    #[test]
+    fn catalog_public_api_operations_are_exactly_the_unauthenticated_routes() {
+        let mut public: Vec<(String, String)> = catalog::operations()
+            .iter()
+            .filter(|o| o.group != catalog::OPERATIONAL)
+            .filter(|o| matches!(o.auth, catalog::Auth::Public))
+            .map(|o| (o.method.as_str().to_string(), o.path.to_string()))
+            .collect();
+        public.sort();
+        let mut exempt: Vec<(String, String)> = super::super::authn::UNAUTHENTICATED_ROUTES
+            .iter()
+            .map(|(m, p)| (m.to_string(), p.to_string()))
+            .collect();
+        exempt.sort();
+        assert_eq!(public, exempt);
+    }
+
+    /// A catalogue path template with each parameter replaced by its
+    /// example value.
+    fn concrete_path(op: &catalog::Operation) -> String {
+        let mut path = op.full_path();
+        for p in op.path_params {
+            let example = p.example.expect("path params carry an example");
+            path = path.replace(&format!("{{{}}}", p.name), example);
+        }
+        path
+    }
+
+    #[tokio::test]
+    async fn catalog_every_operation_reaches_a_handler() {
+        for op in catalog::operations() {
+            let builder = Request::builder()
+                .method(op.method.to_http())
+                .uri(concrete_path(op));
+            let request = if op.method == catalog::Method::Get {
+                builder.body(Body::empty()).unwrap()
+            } else {
+                builder
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap()
+            };
+            let response = app(None).oneshot(request).await.unwrap();
+            let status = response.status();
+            assert_ne!(
+                status,
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{} {} is not routed for its method",
+                op.method.as_str(),
+                op.full_path()
+            );
+            if status == StatusCode::NOT_FOUND {
+                let body = body_json(response).await;
+                assert_ne!(
+                    body["message"],
+                    "no such route",
+                    "{} {} is not routed",
+                    op.method.as_str(),
+                    op.full_path()
+                );
+            }
+        }
+    }
+
+    /// The state every catalogue example is replayed against: the example
+    /// ids, seeded so the documented answers are the real ones.
+    fn example_state() -> coppice_state::StateMachine {
+        use catalog::example_ids as ids;
+        let entity: QuotaEntityId = ids::ENTITY.parse().unwrap();
+        // 2026-07-01T00:00:00Z; the job is submitted 2026-07-16T09:30:00Z.
+        let created = Timestamp::from_micros(1_782_864_000_000_000).unwrap();
+        let mut state = coppice_state::StateMachine::default();
+        state.quota_entities.insert(
+            entity,
+            coppice_state::QuotaEntity {
+                parent: None,
+                name: ids::ENTITY_NAME.to_string(),
+                quota: coppice_core::quota::CostUnits(1_000_000),
+                usage: coppice_core::quota::UsageState::new(created),
+                created_at: created,
+                updated_at: created,
+            },
+        );
+        let job: JobId = ids::JOB.parse().unwrap();
+        let mut record = queued_job(job);
+        record.spec.quota_entity = entity;
+        record.submitted_at = Timestamp::from_micros(1_784_194_200_000_000).unwrap();
+        state.jobs.insert(job, record);
+        let node: NodeId = ids::NODE.parse().unwrap();
+        state.nodes.insert(node, utilization_node(node));
+        state
+    }
+
+    /// Percent-encode a query component (everything but RFC 3986 unreserved).
+    fn encode_component(raw: &str) -> String {
+        raw.bytes()
+            .map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                    (b as char).to_string()
+                }
+                _ => format!("%{b:02X}"),
+            })
+            .collect()
+    }
+
+    /// The schema a content map (`{media type: {schema: {$ref}}}`) names.
+    fn schema_name_of(content: &serde_json::Value) -> Option<String> {
+        let reference = content.as_object()?.values().next()?["schema"]["$ref"].as_str()?;
+        Some(reference.rsplit('/').next()?.to_string())
+    }
+
+    /// A validator for one named schema, resolving refs against the OpenAPI
+    /// document's own `components.schemas`.
+    fn validator_for(schemas: &serde_json::Value, name: &str) -> jsonschema::Validator {
+        let root = serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "components": {"schemas": schemas},
+            "$ref": format!("#/components/schemas/{name}"),
+        });
+        jsonschema::options()
+            .with_draft(jsonschema::Draft::Draft202012)
+            .should_validate_formats(true)
+            .build(&root)
+            .unwrap_or_else(|e| panic!("schema {name} does not compile: {e}"))
+    }
+
+    fn assert_valid(validator: &jsonschema::Validator, instance: &serde_json::Value, what: &str) {
+        let errors: Vec<String> = validator
+            .iter_errors(instance)
+            .map(|e| format!("{} at {}", e, e.instance_path()))
+            .collect();
+        assert!(errors.is_empty(), "{what}: {errors:#?}\n{instance:#}");
+    }
+
+    /// Every catalogue example, replayed through the real router: the status
+    /// must match, and the live body, the documented one, and the documented
+    /// request must validate against the operation's schema in the rendered
+    /// OpenAPI document (the error envelope for a failure).
+    #[tokio::test]
+    async fn catalog_examples_replay_against_the_router() {
+        let document = catalog::render_openapi();
+        let schemas = &document["components"]["schemas"];
+        let mut replayed = 0;
+        for op in catalog::operations() {
+            let operation = &document["paths"][op.full_path()][op.method.as_str().to_lowercase()];
+            for example in &op.examples {
+                let what = format!("{} example {:?}", op.id, example.name);
+                let base = if op.group == catalog::OPERATIONAL {
+                    ""
+                } else {
+                    catalog::BASE_PATH
+                };
+                let mut uri = format!("{base}{}", example.request.path);
+                if !example.request.query.is_empty() {
+                    let query: Vec<String> = example
+                        .request
+                        .query
+                        .iter()
+                        .map(|(k, v)| format!("{}={}", encode_component(k), encode_component(v)))
+                        .collect();
+                    uri = format!("{uri}?{}", query.join("&"));
+                }
+                let builder = Request::builder().method(op.method.to_http()).uri(uri);
+                let request = match &example.request.body {
+                    Some(body) => builder
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                    None => builder.body(Body::empty()).unwrap(),
+                };
+                let response = app_with_state(None, example_state())
+                    .oneshot(request)
+                    .await
+                    .unwrap();
+                let status = response.status().as_u16();
+                let live = body_json(response).await;
+                if std::env::var_os("COPPICE_PRINT_EXAMPLES").is_some() {
+                    println!("{what}: {status}\n{live}");
+                }
+                assert_eq!(status, example.response.status, "{what}: {live:#}");
+
+                let schema_name = if (200..300).contains(&status) {
+                    schema_name_of(&operation["responses"]["200"]["content"])
+                        .unwrap_or_else(|| panic!("{what}: a 2xx example needs a response schema"))
+                } else {
+                    "ErrorEnvelope".to_string()
+                };
+                let validator = validator_for(schemas, &schema_name);
+                assert_valid(&validator, &live, &format!("{what}: live response"));
+                if let Some(documented) = &example.response.body {
+                    assert_valid(
+                        &validator,
+                        documented,
+                        &format!("{what}: documented response"),
+                    );
+                }
+                if let (Some(body), Some(request)) = (
+                    &example.request.body,
+                    schema_name_of(&operation["requestBody"]["content"]),
+                ) {
+                    assert_valid(
+                        &validator_for(schemas, &request),
+                        body,
+                        &format!("{what}: documented request"),
+                    );
+                }
+                replayed += 1;
+            }
+        }
+        assert!(replayed >= 10, "only {replayed} examples replayed");
     }
 }

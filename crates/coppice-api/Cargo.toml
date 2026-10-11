@@ -62,6 +62,9 @@ coppice-tls.workspace = true
 # client's TLS backend out of this crate's test build — and a `default-features`
 # override is ignored on a workspace dependency that did not set one.
 coppice-client = { path = "../coppice-client", default-features = false }
+# The catalogue example-replay test validates every response against its
+# operation's generated JSON Schema.
+jsonschema.workspace = true
 rustls-pemfile.workspace = true
 tokio.workspace = true
 tower.workspace = true

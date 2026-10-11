@@ -10,6 +10,9 @@
 //! durable state transitions, not imperative worker control. See
 //! `docs/architecture/components.md` and `docs/operations/security.md`.
 
+// The catalogue every route is described by, and the router built from
+// (see `catalog`'s module docs).
+pub mod catalog;
 // The ADR 0043 event-subscription seam: the validated `jobs` selector and
 // the items a subscription delivers. A top-level module rather than one
 // under `http`, because it is the vocabulary `ControlPlane` speaks — the SSE

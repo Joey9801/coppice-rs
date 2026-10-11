@@ -1781,8 +1781,8 @@ pub struct ReplaceJobMetadataResponse {
 
 /// The patch's answer. Identical in shape to
 /// [`ReplaceJobMetadataResponse`] and deliberately a separate type: the two
-/// routes are two message pairs in ADR 0031's table, and a client generating
-/// from that table gets the name it expects.
+/// routes are two message pairs in the API catalogue, and a client generating
+/// from it gets the name it expects.
 #[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpdateJobMetadataResponse {
     pub job: JobId,
