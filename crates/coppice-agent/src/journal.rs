@@ -39,7 +39,7 @@ use coppice_consensus::fs::{write_atomic, Fs, FsFile};
 use coppice_core::attempt::{AttemptOutcome, PreemptReason};
 use coppice_core::id::{AllocationId, AttemptId, JobId};
 use coppice_core::preemption::NoticeSignal;
-use coppice_core::time::Duration;
+use coppice_core::time::{Duration, Timestamp};
 use coppice_proto::pb::agent::v1 as pb;
 use prost::Message;
 
@@ -87,6 +87,43 @@ pub enum TombstoneReason {
     Preempt { reason: PreemptReason },
 }
 
+impl TombstoneReason {
+    /// The outcome of the command that wrote the tombstone: what a refused
+    /// `StartJob`, or an otherwise unattributable kill, resolves as.
+    pub fn outcome(self) -> AttemptOutcome {
+        match self {
+            TombstoneReason::Abort => AttemptOutcome::Aborted,
+            TombstoneReason::Preempt { reason } => AttemptOutcome::Preempted { reason },
+        }
+    }
+}
+
+/// A journaled notice mark (ADR 0044 §3): the notice signal was delivered, and
+/// this is the attempt's stop time. The latest mark per allocation is in force;
+/// a replacement mark is only ever written earlier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoticeMarkRec {
+    /// When the agent's stop path runs, agent wall-clock.
+    pub stop_at: Timestamp,
+    /// Declared notice minus notice actually given; zero when none was lost.
+    pub shortfall: Duration,
+    /// When the signal was delivered, agent wall-clock: the start of the
+    /// workload's window, so a replacement mark can recompute the shortfall.
+    pub notified_at: Timestamp,
+}
+
+/// The node's journaled drain plan (ADR 0044 §5). In slice 2 only an external
+/// interruption starts one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DrainPlanRec {
+    /// The plan's deadline `D`, agent wall-clock: the provider's reclaim time.
+    pub deadline: Timestamp,
+    pub reason: PreemptReason,
+    /// A deadline drain's accepted-work target; unused until operator
+    /// deadline drains exist.
+    pub accepted_target: Option<Timestamp>,
+}
+
 /// A journaled, classified exit (ADR 0013).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExitRec {
@@ -106,9 +143,26 @@ pub struct JournalState {
     pub intents: BTreeMap<AllocationId, IntentRec>,
     pub tombstones: BTreeMap<AllocationId, TombstoneReason>,
     pub exits: BTreeMap<AllocationId, ExitRec>,
+    /// Notice intents (ADR 0044 §3): the platform asked this attempt to stop.
+    /// The classifier — a non-zero exit of an allocation listed here is
+    /// `Preempted { reason }`.
+    pub notice_intents: BTreeMap<AllocationId, PreemptReason>,
+    /// The notice mark in force per allocation (the latest written).
+    pub marks: BTreeMap<AllocationId, NoticeMarkRec>,
+    /// The active drain plan, if any; `None` once retired.
+    pub plan: Option<DrainPlanRec>,
 }
 
 impl JournalState {
+    /// The durable attribution for `allocation`'s exit (ADR 0044 §3): its
+    /// tombstone's command and its notice intent.
+    pub fn attribution(&self, allocation: &AllocationId) -> crate::executor::Attribution {
+        crate::executor::Attribution {
+            kill: self.tombstones.get(allocation).map(|t| t.outcome()),
+            notice: self.notice_intents.get(allocation).copied(),
+        }
+    }
+
     /// Fold one decoded record into the state. Fencing raises the watermark
     /// componentwise (records are only ever written strictly-raising, but
     /// componentwise max is robust to any interleaving). A CRC-valid frame
@@ -176,9 +230,35 @@ impl JournalState {
                     },
                 );
             }
-            // The notice records (ADR 0044 §3) are defined but not yet written
-            // by this agent; there is nothing to fold until they are.
-            Body::NoticeIntent(_) | Body::NoticeMark(_) | Body::DrainPlan(_) => {}
+            Body::NoticeIntent(n) => {
+                let allocation = try_id(n.allocation.clone(), "NoticeIntent.allocation")?;
+                let reason = try_reason(n.reason.clone(), "NoticeIntent.reason")?;
+                self.notice_intents.insert(allocation, reason);
+            }
+            Body::NoticeMark(m) => {
+                let allocation = try_id(m.allocation.clone(), "NoticeMark.allocation")?;
+                // Latest wins: the writer only ever replaces a mark with an
+                // earlier one (ADR 0044 §3), so the last record is in force.
+                self.marks.insert(
+                    allocation,
+                    NoticeMarkRec {
+                        stop_at: try_timestamp(m.stop_at_us, "NoticeMark.stop_at_us")?,
+                        shortfall: try_duration(m.shortfall_us, "NoticeMark.shortfall_us")?,
+                        notified_at: try_timestamp(m.notified_at_us, "NoticeMark.notified_at_us")?,
+                    },
+                );
+            }
+            Body::DrainPlan(p) => {
+                self.plan = Some(DrainPlanRec {
+                    deadline: try_timestamp(p.deadline_us, "DrainPlan.deadline_us")?,
+                    reason: try_reason(p.reason.clone(), "DrainPlan.reason")?,
+                    accepted_target: p
+                        .accepted_target_us
+                        .map(|us| try_timestamp(us, "DrainPlan.accepted_target_us"))
+                        .transpose()?,
+                });
+            }
+            Body::DrainPlanRetired(_) => self.plan = None,
         }
         Ok(())
     }
@@ -200,6 +280,16 @@ impl JournalState {
         }
         for (allocation, reason) in &self.tombstones {
             records.push(record_tombstone(*allocation, *reason));
+        }
+        for (allocation, reason) in &self.notice_intents {
+            records.push(record_notice_intent(*allocation, *reason));
+        }
+        for (allocation, mark) in &self.marks {
+            records.push(record_notice_mark(*allocation, mark));
+        }
+        // A retired plan is simply absent: there is nothing left to retire.
+        if let Some(plan) = &self.plan {
+            records.push(record_drain_plan(plan));
         }
         for exit in self.exits.values() {
             records.push(record_exit(exit));
@@ -305,6 +395,41 @@ impl<F: Fs> Journal<F> {
         self.append(&record_tombstone(allocation, reason))
     }
 
+    /// Journal a notice intent (fsynced) *before* the notice signal is
+    /// delivered (ADR 0044 §3).
+    pub fn journal_notice_intent(
+        &mut self,
+        allocation: AllocationId,
+        reason: PreemptReason,
+    ) -> io::Result<()> {
+        self.append(&record_notice_intent(allocation, reason))
+    }
+
+    /// Journal a notice mark (fsynced) *after* the signal and before it is
+    /// reported (ADR 0044 §3) — including a replacement mark, which must be
+    /// durable before the earlier stop it carries is re-reported.
+    pub fn journal_notice_mark(
+        &mut self,
+        allocation: AllocationId,
+        mark: &NoticeMarkRec,
+    ) -> io::Result<()> {
+        self.append(&record_notice_mark(allocation, mark))
+    }
+
+    /// Journal the node's drain plan (fsynced) before acting on it.
+    pub fn journal_drain_plan(&mut self, plan: &DrainPlanRec) -> io::Result<()> {
+        self.append(&record_drain_plan(plan))
+    }
+
+    /// Journal that the active drain plan is over (fsynced).
+    pub fn journal_drain_plan_retired(&mut self) -> io::Result<()> {
+        self.append(&pb::JournalRecord {
+            body: Some(pb::journal_record::Body::DrainPlanRetired(
+                pb::DrainPlanRetired {},
+            )),
+        })
+    }
+
     /// Journal a classified exit (fsynced) *before* reporting it.
     pub fn journal_exit(&mut self, exit: &ExitRec) -> io::Result<()> {
         self.append(&record_exit(exit))
@@ -369,6 +494,36 @@ fn tombstone_reason_from_pb(reason: Option<pb::TombstoneReason>) -> io::Result<T
                 .try_into()
                 .map_err(|_| corrupt("TombstoneReason.preempt.reason invalid"))?,
         }),
+    }
+}
+
+fn record_notice_intent(allocation: AllocationId, reason: PreemptReason) -> pb::JournalRecord {
+    pb::JournalRecord {
+        body: Some(pb::journal_record::Body::NoticeIntent(pb::NoticeIntent {
+            allocation: Some(allocation.into()),
+            reason: Some(reason.into()),
+        })),
+    }
+}
+
+fn record_notice_mark(allocation: AllocationId, mark: &NoticeMarkRec) -> pb::JournalRecord {
+    pb::JournalRecord {
+        body: Some(pb::journal_record::Body::NoticeMark(pb::NoticeMark {
+            allocation: Some(allocation.into()),
+            stop_at_us: mark.stop_at.as_micros(),
+            shortfall_us: u64::try_from(mark.shortfall.as_micros()).unwrap_or(0),
+            notified_at_us: mark.notified_at.as_micros(),
+        })),
+    }
+}
+
+fn record_drain_plan(plan: &DrainPlanRec) -> pb::JournalRecord {
+    pb::JournalRecord {
+        body: Some(pb::journal_record::Body::DrainPlan(pb::DrainPlan {
+            deadline_us: plan.deadline.as_micros(),
+            reason: Some(plan.reason.into()),
+            accepted_target_us: plan.accepted_target.map(Timestamp::as_micros),
+        })),
     }
 }
 
@@ -447,6 +602,23 @@ where
 fn try_duration(micros: u64, field: &'static str) -> io::Result<Duration> {
     i64::try_from(micros)
         .map(Duration::from_micros)
+        .map_err(|_| corrupt(field))
+}
+
+/// A journaled wall-clock instant; out of [`Timestamp`]'s range only when
+/// corrupt.
+fn try_timestamp(micros: i64, field: &'static str) -> io::Result<Timestamp> {
+    Timestamp::from_micros(micros).ok_or_else(|| corrupt(field))
+}
+
+/// A journaled preemption reason; every writer sets one.
+fn try_reason(
+    reason: Option<coppice_proto::pb::core::v1::PreemptReason>,
+    field: &'static str,
+) -> io::Result<PreemptReason> {
+    reason
+        .ok_or_else(|| corrupt(field))?
+        .try_into()
         .map_err(|_| corrupt(field))
 }
 

@@ -15,8 +15,9 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration as StdDuration;
 
-use coppice_core::attempt::AttemptOutcome;
+use coppice_core::attempt::{AttemptOutcome, PreemptReason};
 use coppice_core::id::{AllocationId, AttemptId, JobId};
+use coppice_core::preemption::NoticeSignal;
 use coppice_core::resource::Resources;
 use coppice_core::time::{Duration, Timestamp};
 use coppice_proto::pb::agent::v1 as pb;
@@ -139,6 +140,15 @@ pub enum StopOutcome {
     Unknown,
 }
 
+/// What delivering a notice signal found (ADR 0044 §3). Neither arm fails the
+/// notice protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalOutcome {
+    Delivered,
+    /// Exited, or unknown to the runtime.
+    NotRunning,
+}
+
 /// Why a container failed to start, mapped to ADR 0013 outcomes. The pull vs.
 /// start and user vs. platform distinctions decide the terminal outcome and
 /// its default retry policy.
@@ -176,21 +186,33 @@ pub enum ExecutorError {
     Other(String),
 }
 
-/// Classify an observed exit (ADR 0013): the kernel's OOM kill, the container's
-/// own exit code, or an otherwise-unattributable SIGKILL paired with an abort
-/// tombstone.
+/// What the journal says about who asked an allocation to end — the durable
+/// attribution the runtime's exit evidence cannot carry (ADR 0013, ADR 0044
+/// §3). Built by [`crate::journal::JournalState::attribution`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Attribution {
+    /// The outcome of the command that wrote the allocation's tombstone.
+    pub kill: Option<AttemptOutcome>,
+    /// The reason of the allocation's notice intent.
+    pub notice: Option<PreemptReason>,
+}
+
+/// Classify an observed exit (ADR 0013, ADR 0044 §3): the kernel's OOM kill,
+/// the container's own exit code, or an exit the journal attributes to the
+/// platform.
 ///
-/// [`ExitCause::Killed`] deliberately carries no attribution on its own: it is
-/// the shape Docker exposes for either an external SIGKILL or an OOM whose
-/// daemon notification was lost. `abort_requested` supplies the missing
-/// attribution, so that otherwise-ambiguous kill is `Aborted`. Stronger runtime
-/// evidence still wins: confirmed limit kills and natural exits keep their
-/// ordinary classification.
-pub fn classify_exit(exit: &ExitInfo, abort_requested: bool) -> AttemptOutcome {
+/// [`ExitCause::Killed`] carries no attribution on its own: it is the shape
+/// Docker exposes for either an external SIGKILL or an OOM whose daemon
+/// notification was lost. A tombstone supplies the missing attribution,
+/// failing that a notice intent. Confirmed limit kills and exit 0 are always
+/// runtime truth; an abort tombstone alone does not change a natural exit.
+pub fn classify_exit(exit: &ExitInfo, attribution: &Attribution) -> AttemptOutcome {
+    let preempted = attribution
+        .notice
+        .map(|reason| AttemptOutcome::Preempted { reason });
     match exit.cause {
         ExitCause::OomKilled => AttemptOutcome::MemoryLimitExceeded,
         ExitCause::DiskKilled => AttemptOutcome::DiskLimitExceeded,
-        ExitCause::Killed if abort_requested => AttemptOutcome::Aborted,
         // A kill we could not attribute reports the same *outcome* as a plain
         // exit — the code (137) is the only fact we have, and the replicated
         // outcome taxonomy has no "killed, cause unknown" variant to name it.
@@ -198,7 +220,15 @@ pub fn classify_exit(exit: &ExitInfo, abort_requested: bool) -> AttemptOutcome {
         // descriptor gate + coordinator + journal) and wants its own ADR; the
         // evidence layer records the distinction now so that decision is a
         // mapping change here and nothing else.
-        ExitCause::Natural | ExitCause::Killed => AttemptOutcome::Exited { code: exit.code },
+        ExitCause::Killed => attribution
+            .kill
+            .clone()
+            .or(preempted)
+            .unwrap_or(AttemptOutcome::Exited { code: exit.code }),
+        ExitCause::Natural if exit.code != 0 => {
+            preempted.unwrap_or(AttemptOutcome::Exited { code: exit.code })
+        }
+        ExitCause::Natural => AttemptOutcome::Exited { code: exit.code },
     }
 }
 
@@ -213,15 +243,33 @@ pub trait Executor: Send + Sync + 'static {
     /// Start a container for `spec`. The intent has already been journaled and
     /// fsynced by the caller (ADR 0009), so a running container always has
     /// durable intent behind it.
-    async fn start(&self, spec: StartSpec) -> Result<(), StartError>;
+    ///
+    /// Desugared with an explicit `Send` bound: the live loop runs starts on
+    /// their own tasks.
+    fn start(
+        &self,
+        spec: StartSpec,
+    ) -> impl std::future::Future<Output = Result<(), StartError>> + Send;
 
     /// Stop the container for `allocation` (SIGTERM, `grace`, SIGKILL). The
     /// returned [`StopOutcome`] drives truth-wins classification.
-    async fn stop(
+    ///
+    /// Desugared with an explicit `Send` bound: the live loop runs stops on
+    /// their own tasks.
+    fn stop(
         &self,
         allocation: AllocationId,
         grace: Duration,
-    ) -> Result<StopOutcome, ExecutorError>;
+    ) -> impl std::future::Future<Output = Result<StopOutcome, ExecutorError>> + Send;
+
+    /// Deliver a notice signal to the container's PID 1 (ADR 0044 §3). Not a
+    /// stop: the container keeps running unless the workload chooses to exit.
+    /// A container that is not running answers [`SignalOutcome::NotRunning`].
+    async fn signal(
+        &self,
+        allocation: AllocationId,
+        signal: NoticeSignal,
+    ) -> Result<SignalOutcome, ExecutorError>;
 
     /// The full set of containers this runtime knows about, by label. The
     /// runtime half of restart reconciliation (ADR 0009).
@@ -340,6 +388,11 @@ struct FakeInner {
     /// clears the flag. Lets a test drive the "the daemon went away" readiness
     /// path without a daemon.
     fail_next_observe: Option<String>,
+    /// Every notice signal delivered to a running container, in order.
+    signals: Vec<(AllocationId, NoticeSignal)>,
+    /// A container listed here exits naturally with the given code on the
+    /// given signal; unlisted containers ignore notice signals.
+    exit_on_signal: std::collections::BTreeMap<AllocationId, (NoticeSignal, i32)>,
 }
 
 impl Default for FakeInner {
@@ -356,6 +409,8 @@ impl Default for FakeInner {
             observe_delay: StdDuration::ZERO,
             fail_next_observe: None,
             started_env: Default::default(),
+            signals: Vec::new(),
+            exit_on_signal: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -492,6 +547,25 @@ impl FakeExecutor {
     pub fn fail_next_observe(&self, message: &str) {
         self.lock().fail_next_observe = Some(message.to_string());
     }
+
+    /// Program the container for `allocation` to exit with `code` when it
+    /// receives `signal`, like a workload that traps its notice signal.
+    pub fn exit_on_signal(&self, allocation: AllocationId, signal: NoticeSignal, code: i32) {
+        self.lock()
+            .exit_on_signal
+            .insert(allocation, (signal, code));
+    }
+
+    /// The notice signals delivered to `allocation`'s running container, in
+    /// order.
+    pub fn signals_delivered(&self, allocation: AllocationId) -> Vec<NoticeSignal> {
+        self.lock()
+            .signals
+            .iter()
+            .filter(|(alloc, _)| *alloc == allocation)
+            .map(|(_, signal)| *signal)
+            .collect()
+    }
 }
 
 impl Executor for FakeExecutor {
@@ -546,6 +620,40 @@ impl Executor for FakeExecutor {
             return Ok(StopOutcome::Stopped(exit));
         }
         Ok(StopOutcome::Unknown)
+    }
+
+    async fn signal(
+        &self,
+        allocation: AllocationId,
+        signal: NoticeSignal,
+    ) -> Result<SignalOutcome, ExecutorError> {
+        let exit = {
+            let mut inner = self.lock();
+            if !inner.running.contains_key(&allocation) {
+                return Ok(SignalOutcome::NotRunning);
+            }
+            inner.signals.push((allocation, signal));
+            match inner.exit_on_signal.get(&allocation) {
+                Some((trapped, code)) if *trapped == signal => {
+                    let runtime = inner
+                        .started_at
+                        .get(&allocation)
+                        .map(|at| inner.now.duration_since(*at).max(Duration::ZERO))
+                        .unwrap_or(Duration::ZERO);
+                    Some(ExitInfo {
+                        code: *code,
+                        cause: ExitCause::Natural,
+                        runtime,
+                        finished_at: inner.now,
+                    })
+                }
+                _ => None,
+            }
+        };
+        if let Some(exit) = exit {
+            self.finish(allocation, exit);
+        }
+        Ok(SignalOutcome::Delivered)
     }
 
     async fn observe(&self) -> Result<Vec<ObservedContainer>, ExecutorError> {
@@ -631,18 +739,27 @@ mod tests {
         }
     }
 
+    const NONE: Attribution = Attribution {
+        kill: None,
+        notice: None,
+    };
+    const ABORT: Attribution = Attribution {
+        kill: Some(AttemptOutcome::Aborted),
+        notice: None,
+    };
+
     #[test]
     fn classify_distinguishes_cause_from_exit_code() {
         assert_eq!(
-            classify_exit(&exit(0, ExitCause::Natural), false),
+            classify_exit(&exit(0, ExitCause::Natural), &NONE),
             AttemptOutcome::Exited { code: 0 }
         );
         assert_eq!(
-            classify_exit(&exit(137, ExitCause::OomKilled), false),
+            classify_exit(&exit(137, ExitCause::OomKilled), &NONE),
             AttemptOutcome::MemoryLimitExceeded
         );
         assert_eq!(
-            classify_exit(&exit(137, ExitCause::DiskKilled), false),
+            classify_exit(&exit(137, ExitCause::DiskKilled), &NONE),
             AttemptOutcome::DiskLimitExceeded
         );
     }
@@ -650,16 +767,53 @@ mod tests {
     #[test]
     fn abort_attribution_only_resolves_an_unconfirmed_kill() {
         assert_eq!(
-            classify_exit(&exit(137, ExitCause::Killed), true),
+            classify_exit(&exit(137, ExitCause::Killed), &ABORT),
             AttemptOutcome::Aborted
         );
         assert_eq!(
-            classify_exit(&exit(137, ExitCause::OomKilled), true),
+            classify_exit(&exit(137, ExitCause::OomKilled), &ABORT),
             AttemptOutcome::MemoryLimitExceeded
         );
         assert_eq!(
-            classify_exit(&exit(3, ExitCause::Natural), true),
+            classify_exit(&exit(3, ExitCause::Natural), &ABORT),
             AttemptOutcome::Exited { code: 3 }
+        );
+    }
+
+    #[test]
+    fn a_notice_intent_makes_a_non_zero_exit_preempted() {
+        let reason = PreemptReason::Interruption;
+        let noticed = Attribution {
+            kill: None,
+            notice: Some(reason),
+        };
+        let preempted = AttemptOutcome::Preempted { reason };
+        assert_eq!(
+            classify_exit(&exit(75, ExitCause::Natural), &noticed),
+            preempted
+        );
+        assert_eq!(
+            classify_exit(&exit(137, ExitCause::Killed), &noticed),
+            preempted
+        );
+        // The work finished: exit 0 is the job's own, notice or not.
+        assert_eq!(
+            classify_exit(&exit(0, ExitCause::Natural), &noticed),
+            AttemptOutcome::Exited { code: 0 }
+        );
+        // A limit kill during the notice window is still the limit.
+        assert_eq!(
+            classify_exit(&exit(137, ExitCause::OomKilled), &noticed),
+            AttemptOutcome::MemoryLimitExceeded
+        );
+        // A preemption tombstone attributes the unconfirmed kill to itself.
+        let stopped = Attribution {
+            kill: Some(preempted.clone()),
+            notice: Some(reason),
+        };
+        assert_eq!(
+            classify_exit(&exit(137, ExitCause::Killed), &stopped),
+            preempted
         );
     }
 

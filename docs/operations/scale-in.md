@@ -141,9 +141,10 @@ is set (the AWS demo sets it; `deploy/examples/agent.toml` shows it).
 | `reconnecting` | 503 | session lost, reconnect loop running |
 | `docker-unavailable` | 503 | registered, but the last container observation failed |
 | `draining` | 503 | shutdown in progress; `running` is the work still being waited for |
+| `interrupted` | 503 | the host reported an external interruption: every attempt is notified and will be stopped before the provider's deadline (ADR 0044 §5); wins over `draining` |
 
 The body carries `phase`, `node_id`, `registered`, `docker_ok`,
-`draining`, `running`, and `reason`. A hook that wants "has this node
+`draining`, `interrupted`, `running`, and `reason`. A hook that wants "has this node
 finished draining" polls `/readyz` until `running` is zero or the process
 has exited.
 

@@ -78,7 +78,7 @@ The wire schema is `coppice.agent.v1`
 token and `command_seq` in one common `CommandHeader` on every
 coordinator→agent command, and `AgentReport` covers registration,
 heartbeats (capacity, running set, image-cache inventory, node usage),
-attempt status, and the ObservedSet. That file is the code-side anchor for this document;
+attempt status, attempt notices, and the ObservedSet. That file is the code-side anchor for this document;
 evolution follows [schema-style](../architecture/schema-style.md).
 
 ## The session, as implemented
@@ -144,7 +144,8 @@ filesystem seam with the storage engine's crash-safety discipline) holds:
 
 - `FencingUpdate { leader_term, node_epoch }` — the accepted-token
   watermark.
-- `StartIntent { allocation, attempt, job, node_epoch, max_runtime_us? }` —
+- `StartIntent { allocation, attempt, job, node_epoch, max_runtime_us?,
+  notice_signal, notice_us, abort_grace_us }` —
   journaled and fsynced **before** the container starts, so a running
   container always has durable intent behind it. `max_runtime_us` is the
   enforced bound copied from `StartJob`, journaled so the max-runtime
@@ -152,13 +153,101 @@ filesystem seam with the storage engine's crash-safety discipline) holds:
   agent re-arms it for each running, unexited container as `max_runtime`
   minus the runtime the container reports (saturating at zero, which fires
   at once). No launch wall-clock is journaled; elapsed time comes from the
-  runtime.
-- `AllocationTombstone { allocation }` — journaled before a stop is acted
-  on, so a racing or re-delivered `StartJob` is refused even across a
-  restart (ADR 0013).
+  runtime. The notice contract and `abort_grace_us` (from `StartJob`) let
+  the agent signal and stop the attempt on its own, below.
+- `AllocationTombstone { allocation, reason }` — journaled before a stop is
+  acted on, so a racing or re-delivered `StartJob` is refused even across a
+  restart (ADR 0013). `reason` names the command that wrote it — `Abort`
+  (a `StopJob`) or `Preempt { reason }` (the agent's own preemption stop) —
+  and a refused `StartJob` resolves as that command: `Aborted` or
+  `Preempted { reason }`.
+- `NoticeIntent { allocation, reason }`, `NoticeMark { allocation,
+  stop_at_us, shortfall_us, notified_at_us }`, `DrainPlan { deadline_us,
+  reason, accepted_target_us? }` and `DrainPlanRetired` — the termination
+  mechanism's records, below. The latest mark per allocation and the latest
+  plan are in force; compaction keeps only those, and drops a retired plan.
 - `ObservedExit { allocation, attempt, job, outcome, runtime_us }` — the
   classified exit, journaled before it is reported, so an outcome observed
   while the coordinator was unreachable survives to the next ObservedSet.
+
+### Platform terminations (ADR 0044 §3, §5)
+
+The agent terminates attempts on the platform's behalf without a
+coordinator command. In this slice only an **external interruption** starts
+one (a spot reclaim, read from the configured `[preemption]
+interruption_source`): it becomes the node's **drain plan** with the
+provider's reclaim time as its deadline `D`, journaled before anything else.
+From then on every `Register` and `Heartbeat` carries `draining = true` and
+`interruption_deadline_us = D` (agent wall-clock, display-only — the
+coordinator stores it on the node record for the node view and plans
+against nothing but marks), and every attempt still running is notified at
+once. For each, with `T_stop = D − 30 s − abort_grace` (the attempt's own
+`abort_grace_us`, dispatched on `StartJob`):
+
+1. journal `NoticeIntent { allocation, reason }`, fsynced;
+2. deliver the job's declared notice signal to PID 1;
+3. journal `NoticeMark { stop_at = T_stop, shortfall }`, fsynced, where
+   `shortfall = max(0, notice − (T_stop − now))`;
+4. report **`AgentReport.attempt_notice`** `{ allocation, attempt, job,
+   reason, remaining_us, shortfall_us }`, `remaining_us = T_stop − now`
+   saturating at zero; the leader stamps the attempt's
+   `preemption.acknowledged.deadline` as its own receive time plus
+   `remaining`, never the agent's clock (`RecordAttemptNotified`);
+5. at `T_stop`, journal the tombstone `Preempt { reason }` and run the
+   ordinary stop (`SIGTERM`, `abort_grace`, `SIGKILL`) on a task of its own,
+   so a node-wide stop over many containers never delays heartbeats or
+   commands. The result is classified and reported as usual.
+
+A second notice may only make `D` earlier: the plan is replaced and every
+mark later than its new `T_stop` gets a replacement mark, journaled before
+it is re-reported, so a restart can never restore a stop later than one the
+coordinator has published. A `StartJob` that arrives under an active plan is
+still started — its committed intent predates the announcement — and is
+notified at once (its stop fires immediately if `T_stop` has passed).
+
+**Classification** is the agent's: a kill by its stop path is
+`Preempted { reason }` whether or not the signal landed; a non-zero exit the
+agent did not cause is `Preempted` if a notice intent exists for the
+allocation and `Exited` otherwise; exit 0 is `Exited { code: 0 }`; a limit
+kill or a `max_runtime` watchdog that fires first keeps its outcome.
+
+**Nothing executor-bound blocks the loop.** A `StartJob` journals its
+intent (the fsync-before-start barrier is unchanged) and its start then runs
+on a task of its own, reporting `Running` or the start failure when it
+finishes; a duplicate `StartJob` meanwhile reports nothing. A `StopJob`
+journals its tombstone and its stop runs the same way. So an image pull or
+an `abort_grace` wait never delays a notice, a stop or a heartbeat. A
+notice for an attempt whose start is still in flight is delivered once it
+has a container (a signal now would reach nothing, and a mark without one
+would claim a notice never given); a stop time already past then fires at
+once with the shortfall reported. A `StopJob` that races a start in flight
+stops the container as soon as the start returns. An exit observed while
+the agent's own stop of that allocation is in flight is held for the stop's
+answer — an exit during our `SIGTERM` is the stop's, so a workload exiting
+0 on it is still `Aborted` or `Preempted` — and is classified on its own
+evidence only if the stop fails or finds no container.
+
+**None of this needs a session.** The plan, the signals, the journaling and
+the stop timers run in the agent's own loop through discovery, the dial and
+the reconnect backoff as well as a live stream, because an interruption's
+two minutes may be exactly when the coordinator is unreachable. Reports
+produced while disconnected are not queued: after the reconnect, every
+running allocation with a mark in force carries it in its
+**`ObservedAllocation.notice`** `{ reason, remaining_us, shortfall_us }`
+(remaining recomputed), and terminal outcomes come from the journal.
+
+**Recovery.** On start the agent resumes every mark's stop time (at once if
+past). A notice intent with no mark is signalled again: under an active plan
+its stop is the plan's `T_stop` and the shortfall is reported; with no plan
+it gets a fresh countdown of its declared notice. Under an active plan every
+mark later than the plan's `T_stop` is shortened, so a crash between an
+earlier replacement plan and its replacement marks cannot leave a later
+stop in force. A plan whose `D` has
+already passed came back from the dead (an EC2 `stop`, or a reclaim that
+never landed): whatever still runs under it is stopped at once and the plan
+is retired (`DrainPlanRetired`) so the node does not drain forever. A notice
+whose deadline has already passed while no plan is active is ignored as
+stale. The ADR 0041 SIGTERM drain is unchanged and notice-free.
 
 ### Restart reconciliation sequence
 
@@ -170,6 +259,13 @@ never trusting its own memory over that pair:
   with its true state (running, or exited with the classified outcome).
 - A journaled exit with no surviving container reports the journaled
   outcome.
+- Work this agent process is still acting on is **unresolved**: a start
+  still in flight (intent journaled, no container yet), or an allocation
+  whose exit the agent's own stop has not yet classified, reports
+  `running = false` with no `outcome`. The leader neither adopts, loses, nor
+  records an outcome for it; the agent's own `AttemptStatus` follows when
+  the start or stop finishes. (A container the stop has not yet ended is
+  reported running, as the runtime shows.)
 - A journaled intent with neither runtime evidence nor a journaled exit
   reports `running = false, outcome = AgentError` — the honest "I lost
   it". The agent never restarts pending journal intents after a crash: the

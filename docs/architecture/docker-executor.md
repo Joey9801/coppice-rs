@@ -15,8 +15,8 @@ truth wins the race).
 
 ## 1. What already exists and is not redesigned
 
-- **The `Executor` trait** — `start` / `stop` / `observe` / `next_exit` /
-  `cache_inventory`. Classification, journaling, fencing, and reporting all
+- **The `Executor` trait** — `start` / `stop` / `signal` / `observe` /
+  `next_exit` / `cache_inventory`. Classification, journaling, fencing, and reporting all
   live above it in `Session`. This design keeps that boundary; the trait
   grows two small extensions (§10).
 - **The journal** — `StartIntent` before start, `AllocationTombstone` before
@@ -266,6 +266,19 @@ as stop-terminated, never the reverse.
 | Image alone exceeds the job's disk request (§6.2) | `Start` | `true` |
 | Invalid command/entrypoint (exec format at create time) | `Start` | `true` |
 | Daemon errors, name conflicts we can't resolve, cgroup failures | `Start` | `false` |
+
+**Notice signals** (ADR 0044 §3). `signal(allocation, sig)` is
+`POST /containers/{id}/kill?signal=<SIGUSR1|…>`: the job's declared notice
+signal, delivered to PID 1 only (the shell-wrapper caveat of `SIGTERM`
+applies). It is not a stop: no kill-in-flight marker is armed, so an exit
+the workload chooses in response is its own and keeps the ordinary OOM
+settle. A container that is gone (404) or not running (409) answers
+`NotRunning` rather than an error — the session marks the attempt anyway,
+and the journaled notice intent classifies whatever exit it had
+(`Preempted` for a non-zero exit). The stop path for a preemption is the
+ordinary `stop()` above with the attempt's dispatched `abort_grace`, run on
+its own task (the trait's `stop` future is `Send` for that), and its kill is
+attributed `Preempted { reason }` by the session.
 
 An exit may surface through both `next_exit` and a concurrent
 `stop`/`observe`; the executor keeps a per-allocation claimed-exit set to

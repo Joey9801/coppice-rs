@@ -12,15 +12,30 @@
 //! it read at startup.
 //!
 //! All decisions live in [`Session`]; this file only moves bytes and owns the
-//! timers (heartbeat cadence, max-runtime watchdogs). It is not unit-tested —
-//! there is no live server in the unit suite — but every branch it can take
-//! delegates to a [`Session`] method that is.
+//! timers (heartbeat cadence, max-runtime watchdogs, notice stop times). It is
+//! not unit-tested — there is no live server in the unit suite — but every
+//! branch it can take delegates to a [`Session`] method that is.
+//!
+//! # Notices and executor work do not wait (ADR 0044 §3, §5)
+//!
+//! An interruption gives the host two minutes, and the coordinator may be
+//! unreachable for all of them. So the notice machinery is [`Background`],
+//! owned by [`run`] rather than by a session and raced at **every** await the
+//! loop makes (discovery, dial, live session, backoff). Reports are sent on a
+//! live stream and dropped otherwise; the next registration's `ObservedSet`
+//! repeats them.
+//!
+//! [`Background`] also runs every slow executor call (starts, stops) on its
+//! own task: the session journals first and queues the call, and the result
+//! returns as an event. No command ever blocks a notice, nor the reverse.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use coppice_consensus::fs::Fs;
+use coppice_core::id::AllocationId;
+use coppice_core::time::Timestamp;
 use coppice_proto::pb::agent::v1 as pb;
 use coppice_tls::TlsStore;
 use tokio::sync::mpsc;
@@ -30,9 +45,10 @@ use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity};
 use tonic::Request;
 
 use crate::config::Config;
-use crate::executor::Executor;
+use crate::executor::{Executor, ExecutorError, StartError, StopOutcome};
+use crate::interruption::Interruption;
 use crate::session::renewal::Renewal;
-use crate::session::Session;
+use crate::session::{Session, StopRequest};
 
 use coppice_net::session::Client;
 
@@ -56,6 +72,10 @@ const TASK_DRAIN: Duration = Duration::from_secs(10);
 /// stream and waits for the coordinator to end the command stream in reply,
 /// which is this side's only confirmation that the last reports went out.
 const OUTBOUND_FLUSH: Duration = Duration::from_millis(500);
+/// The longest the notice timer sleeps before re-reading the wall clock: stop
+/// times are wall-clock instants, so a long monotonic sleep would miss a
+/// clock step.
+const STOP_TIMER_GRANULARITY: Duration = Duration::from_secs(1);
 
 /// Run the agent session until the process is asked to stop: connect, serve,
 /// reconnect. Returns `Ok(())` once `shutdown` has flipped and the drain below
@@ -132,6 +152,13 @@ where
     // list and a warning of its own.
     let discovery = coppice_discovery::build(&config.discovery)?;
 
+    // The notice machinery, owned here so it spans every phase of the loop.
+    // Recovery runs before any coordinator is found; its reports are dropped
+    // (the ObservedSet repeats them).
+    let source: Option<tokio::sync::watch::Receiver<Option<Interruption>>> = None;
+    let mut background = Background::new(source, session.executor().clone());
+    session.resume_notices(Timestamp::now()).await?;
+
     let mut drain = Drain::new(config.shutdown_grace);
     // Pending max-runtime watchdog deadlines. Owned here, not by `serve_once`,
     // so they survive a reconnect even when the new session's `observe()`
@@ -152,12 +179,16 @@ where
         // may be unbounded. With no stream there is nothing to announce on, so
         // an idle draining agent keeps reconnecting until it can say it is
         // leaving (ADR 0041) — the deadline is its only other way out.
-        let candidates = tokio::select! {
-            candidates = discovery.candidates() => candidates,
-            _ = grace.elapsed() => {
-                drain.warn_deadline(&session, "consulting discovery");
-                break Ok(());
-            }
+        let Some(candidates) = with_notices(
+            discovery.candidates(),
+            &mut session,
+            &mut background,
+            &mut grace,
+        )
+        .await
+        else {
+            drain.warn_deadline(&session, "consulting discovery");
+            break Ok(());
         };
         if candidates.is_empty() {
             // Nothing to dial this round: the source is unreachable or lists
@@ -169,7 +200,16 @@ where
                 ?backoff,
                 "discovery returned no coordinator candidates; retrying after backoff"
             );
-            if backoff_sleep(backoff, &mut grace, &mut drain, &mut shutdown, &mut session).await {
+            if backoff_sleep(
+                backoff,
+                &mut grace,
+                &mut drain,
+                &mut shutdown,
+                &mut session,
+                &mut background,
+            )
+            .await
+            {
                 drain.warn_deadline(&session, "waiting to reconnect");
                 break Ok(());
             }
@@ -179,29 +219,51 @@ where
         let endpoint = candidates[endpoint_idx % candidates.len()].as_str();
         endpoint_idx += 1;
 
+        // The dial and the stream open borrow nothing of the session, so the
+        // notice machinery keeps running under them: a coordinator that takes
+        // its time to answer must not hold up a stop.
+        let register = session.register_report();
+        let announced = session.active_plan().map(|p| p.deadline);
+        let Some(connected) = with_notices(
+            open_stream(endpoint, &tls, register),
+            &mut session,
+            &mut background,
+            &mut grace,
+        )
+        .await
+        else {
+            drain.warn_deadline(&session, "dialling a coordinator");
+            break Ok(());
+        };
+
         // `serve_once` borrows `session` and `drain` mutably for as long as the
         // select expression lives, so the deadline is recorded as a flag and
         // acted on once those borrows have been released with the dropped
         // future.
         let mut expired = false;
-        let served = tokio::select! {
-            served = serve_once(
-                &mut session,
-                endpoint,
-                &tls,
-                config,
-                &mut exit_rx,
-                &reap_tx,
-                &mut shutdown,
-                &mut drain,
-                &mut deadlines,
-            ) => served,
-            // The grace window closed with a session step still in flight —
-            // dropping the future above is what cancels it.
-            _ = grace.elapsed() => {
-                expired = true;
-                Ok(Served::Drained)
-            }
+        let served = match connected {
+            Err(e) => Err(e),
+            Ok(connected) => tokio::select! {
+                served = serve_once(
+                    &mut session,
+                    connected,
+                    announced,
+                    tls.as_ref(),
+                    config,
+                    &mut exit_rx,
+                    &reap_tx,
+                    &mut shutdown,
+                    &mut drain,
+                    &mut deadlines,
+                    &mut background,
+                ) => served,
+                // The grace window closed with a session step still in flight —
+                // dropping the future above is what cancels it.
+                _ = grace.elapsed() => {
+                    expired = true;
+                    Ok(Served::Drained)
+                }
+            },
         };
         if expired {
             drain.warn_deadline(&session, "serving the session");
@@ -224,7 +286,16 @@ where
         // or did not deliver, the next registration carries `draining` again
         // and re-establishes it at the coordinator (ADR 0041).
         drain.announced = false;
-        if backoff_sleep(backoff, &mut grace, &mut drain, &mut shutdown, &mut session).await {
+        if backoff_sleep(
+            backoff,
+            &mut grace,
+            &mut drain,
+            &mut shutdown,
+            &mut session,
+            &mut background,
+        )
+        .await
+        {
             drain.warn_deadline(&session, "waiting to reconnect");
             break Ok(());
         }
@@ -242,6 +313,11 @@ where
     // reporting has nowhere to go, and the journal is the durable record
     // either way (ADR 0009).
     drop(reap_tx);
+    // Dropping the background machinery aborts any start or stop still in
+    // flight: the loop that would journal its result is gone. A journaled
+    // tombstone re-runs a stop on the next start; a start cut short is
+    // reconciled from the journal and runtime like any crash (ADR 0009).
+    drop(background);
     let deadline = tokio::time::Instant::now() + TASK_DRAIN;
     crate::drain_task("reaper", reaper_join, deadline).await;
     watcher_join.abort();
@@ -373,23 +449,240 @@ async fn flipped(shutdown: &mut tokio::sync::watch::Receiver<bool>) {
 
 /// Sleep for the reconnect backoff, waking early on a shutdown flip (which
 /// begins the drain and retries at once — a draining agent wants its
-/// announcement on the wire). Returns `true` if the grace window closed
-/// instead, which ends the run.
-async fn backoff_sleep<F: Fs, E: Executor>(
+/// announcement on the wire), and serving notice events throughout. Returns
+/// `true` if the grace window closed instead, which ends the run.
+async fn backoff_sleep<F: Fs, E: Executor + Clone>(
     backoff: Duration,
     grace: &mut GraceDeadline,
     drain: &mut Drain,
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
     session: &mut Session<F, E>,
+    background: &mut Background<E>,
 ) -> bool {
-    tokio::select! {
-        _ = tokio::time::sleep(backoff) => false,
-        _ = flipped(shutdown), if !drain.started => {
-            drain.begin(session);
-            false
+    let sleep = tokio::time::sleep(backoff);
+    tokio::pin!(sleep);
+    loop {
+        let next_stop = session.next_stop_at();
+        tokio::select! {
+            _ = &mut sleep => return false,
+            _ = flipped(shutdown), if !drain.started => {
+                drain.begin(session);
+                return false;
+            }
+            _ = grace.elapsed() => return true,
+            event = background.next(next_stop) => {
+                if let Err(e) = on_background_event(session, background, event, None).await {
+                    tracing::warn!(error = %e, "notice event failed between connections");
+                }
+            }
         }
-        _ = grace.elapsed() => true,
     }
+}
+
+/// Await `fut` — a step between connections that borrows nothing of the
+/// session — while serving notice events. `None` if the grace window closed
+/// first, which ends the run.
+async fn with_notices<T, F, E>(
+    fut: impl std::future::Future<Output = T>,
+    session: &mut Session<F, E>,
+    background: &mut Background<E>,
+    grace: &mut GraceDeadline,
+) -> Option<T>
+where
+    F: Fs,
+    E: Executor + Clone,
+{
+    tokio::pin!(fut);
+    loop {
+        let next_stop = session.next_stop_at();
+        tokio::select! {
+            value = &mut fut => return Some(value),
+            _ = grace.elapsed() => return None,
+            event = background.next(next_stop) => {
+                if let Err(e) = on_background_event(session, background, event, None).await {
+                    tracing::warn!(error = %e, "notice event failed between connections");
+                }
+            }
+        }
+    }
+}
+
+enum BackgroundEvent {
+    /// The interruption source published a notice with this deadline.
+    Interruption(Timestamp),
+    /// A stop time may have arrived.
+    StopsDue,
+    StartDone(AllocationId, Result<(), StartError>),
+    StopDone(AllocationId, Result<StopOutcome, ExecutorError>),
+}
+
+/// The executor-bound work [`run`] owns across every phase of the loop (see
+/// the module docs): the interruption source's watch, the stop-time timer,
+/// and the spawned starts and stops.
+struct Background<E> {
+    /// `None` with no source configured, or once the source has gone away.
+    source: Option<tokio::sync::watch::Receiver<Option<Interruption>>>,
+    starts: tokio::task::JoinSet<(AllocationId, Result<(), StartError>)>,
+    stops: tokio::task::JoinSet<(AllocationId, Result<StopOutcome, ExecutorError>)>,
+    /// Which allocation each in-flight task is for, so a task that dies (a
+    /// panic) still reports back: a start as failed, a stop for its retry.
+    task_ids: BTreeMap<tokio::task::Id, AllocationId>,
+    executor: E,
+}
+
+impl<E: Executor + Clone> Background<E> {
+    fn new(
+        source: Option<tokio::sync::watch::Receiver<Option<Interruption>>>,
+        executor: E,
+    ) -> Background<E> {
+        Background {
+            source,
+            starts: tokio::task::JoinSet::new(),
+            stops: tokio::task::JoinSet::new(),
+            task_ids: BTreeMap::new(),
+            executor,
+        }
+    }
+
+    /// Spawn every start and stop the session has queued, plus `stops`.
+    fn spawn<F: Fs>(&mut self, session: &mut Session<F, E>, stops: Vec<StopRequest>) {
+        for spec in session.take_pending_starts() {
+            let executor = self.executor.clone();
+            let allocation = spec.allocation;
+            let handle = self
+                .starts
+                .spawn(async move { (allocation, executor.start(spec).await) });
+            self.task_ids.insert(handle.id(), allocation);
+        }
+        for StopRequest { allocation, grace } in
+            stops.into_iter().chain(session.take_pending_stops())
+        {
+            let executor = self.executor.clone();
+            let handle = self
+                .stops
+                .spawn(async move { (allocation, executor.stop(allocation, grace).await) });
+            self.task_ids.insert(handle.id(), allocation);
+        }
+    }
+
+    /// The next event. Must stay cancel-safe: every phase of the loop races
+    /// it against its own work.
+    async fn next(&mut self, next_stop_at: Option<Timestamp>) -> BackgroundEvent {
+        let stop_wait = next_stop_at.map(|at| {
+            at.duration_since(Timestamp::now())
+                .to_std()
+                .unwrap_or(Duration::ZERO)
+                .min(STOP_TIMER_GRANULARITY)
+        });
+        loop {
+            tokio::select! {
+                changed = source_changed(&mut self.source) => {
+                    if let Some(deadline) = changed {
+                        return BackgroundEvent::Interruption(deadline);
+                    }
+                }
+                _ = async {
+                    match stop_wait {
+                        Some(wait) => tokio::time::sleep(wait).await,
+                        None => std::future::pending().await,
+                    }
+                } => return BackgroundEvent::StopsDue,
+                Some(joined) = self.starts.join_next_with_id(), if !self.starts.is_empty() => {
+                    match joined {
+                        Ok((id, (allocation, result))) => {
+                            self.task_ids.remove(&id);
+                            return BackgroundEvent::StartDone(allocation, result);
+                        }
+                        Err(e) => {
+                            if let Some(allocation) = self.task_ids.remove(&e.id()) {
+                                return BackgroundEvent::StartDone(
+                                    allocation,
+                                    Err(StartError::Start {
+                                        user_error: false,
+                                        message: format!("start task failed: {e}"),
+                                    }),
+                                );
+                            }
+                        }
+                    }
+                }
+                Some(joined) = self.stops.join_next_with_id(), if !self.stops.is_empty() => {
+                    match joined {
+                        Ok((id, (allocation, result))) => {
+                            self.task_ids.remove(&id);
+                            return BackgroundEvent::StopDone(allocation, result);
+                        }
+                        Err(e) => {
+                            if let Some(allocation) = self.task_ids.remove(&e.id()) {
+                                return BackgroundEvent::StopDone(
+                                    allocation,
+                                    Err(ExecutorError::Other(format!("stop task failed: {e}"))),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The next notice deadline from the source, or never: pends forever with no
+/// source, and drops the source once its sender is gone. `Some(None)` cannot
+/// escape — a change to "no notice" is not an event.
+async fn source_changed(
+    source: &mut Option<tokio::sync::watch::Receiver<Option<Interruption>>>,
+) -> Option<Timestamp> {
+    let Some(rx) = source.as_mut() else {
+        return std::future::pending().await;
+    };
+    match rx.changed().await {
+        Ok(()) => rx.borrow_and_update().map(|n| n.deadline),
+        Err(_) => {
+            // The source is gone; whatever it last published was already
+            // seen. Nothing more will come.
+            *source = None;
+            None
+        }
+    }
+}
+
+/// Hand one background event to the session, spawn whatever it queued in
+/// response, and send its reports when there is a stream (`tx`).
+/// Disconnected reports are dropped: the next registration's ObservedSet
+/// carries every running container, live mark and journaled exit.
+async fn on_background_event<F, E>(
+    session: &mut Session<F, E>,
+    background: &mut Background<E>,
+    event: BackgroundEvent,
+    tx: Option<&mpsc::Sender<pb::AgentReport>>,
+) -> anyhow::Result<()>
+where
+    F: Fs,
+    E: Executor + Clone,
+{
+    // Clock read at the edge (workspace convention).
+    let now = Timestamp::now();
+    let mut stops = Vec::new();
+    let reports = match event {
+        BackgroundEvent::Interruption(deadline) => session.on_interruption(deadline, now).await?,
+        BackgroundEvent::StopsDue => {
+            stops = session.begin_due_stops(now)?;
+            Vec::new()
+        }
+        BackgroundEvent::StartDone(allocation, result) => {
+            session.finish_start(allocation, result, now).await?
+        }
+        BackgroundEvent::StopDone(allocation, result) => {
+            session.finish_stop(allocation, result, now)?
+        }
+    };
+    background.spawn(session, stops);
+    session.refresh_health();
+    if let Some(tx) = tx {
+        send_all(tx, reports).await?;
+    }
+    Ok(())
 }
 
 /// Dial `endpoint` with a client config built from the store's *current*
@@ -410,10 +703,45 @@ async fn dial(endpoint: &str, store: &TlsStore) -> anyhow::Result<Channel> {
     Ok(channel)
 }
 
+/// A dialled coordinator with the session stream open and `Register` queued.
+struct Connected {
+    client: Client<Channel>,
+    tx: mpsc::Sender<pb::AgentReport>,
+    inbound: tonic::Streaming<pb::AgentCommand>,
+}
+
+/// Dial `endpoint` and open the session stream with `register` as its first
+/// message (node_epoch = 0). Borrows nothing of the session, so the loop can
+/// keep serving notice events while the network takes its time.
+async fn open_stream(
+    endpoint: &str,
+    tls: &TlsStore,
+    register: pb::AgentReport,
+) -> anyhow::Result<Connected> {
+    let channel = dial(endpoint, tls).await?;
+    let mut client = Client::new(channel);
+
+    let (tx, rx) = mpsc::channel::<pb::AgentReport>(OUTBOUND_CAPACITY);
+    let outbound = ReceiverStream::new(rx);
+    tx.send(register).await.ok();
+
+    let inbound = client.session(Request::new(outbound)).await?.into_inner();
+    Ok(Connected {
+        client,
+        tx,
+        inbound,
+    })
+}
+
+/// Serve one connected session until it closes or the drain finishes.
+/// `announced` is the drain-plan deadline the queued `Register` carried: if
+/// the plan has changed since (a notice that landed during the dial, or one
+/// mid-session), a heartbeat re-announces it as soon as registration is done.
 #[allow(clippy::too_many_arguments)] // wiring seam: each is a distinct loop input
 async fn serve_once<F, E>(
     session: &mut Session<F, E>,
-    endpoint: &str,
+    connected: Connected,
+    mut announced: Option<Timestamp>,
     tls: &TlsStore,
     config: &Config,
     exit_rx: &mut mpsc::Receiver<crate::executor::ExitEvent>,
@@ -421,21 +749,17 @@ async fn serve_once<F, E>(
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
     drain: &mut Drain,
     deadlines: &mut BTreeMap<coppice_core::id::AllocationId, Instant>,
+    background: &mut Background<E>,
 ) -> anyhow::Result<Served>
 where
     F: Fs,
     E: Executor + Clone,
 {
-    let channel = dial(endpoint, tls).await?;
-    let mut client = Client::new(channel);
-
-    let (tx, rx) = mpsc::channel::<pb::AgentReport>(OUTBOUND_CAPACITY);
-    let outbound = ReceiverStream::new(rx);
-
-    // First message: Register (node_epoch = 0).
-    tx.send(session.register_report()).await.ok();
-
-    let mut inbound = client.session(Request::new(outbound)).await?.into_inner();
+    let Connected {
+        mut client,
+        tx,
+        mut inbound,
+    } = connected;
 
     let mut heartbeat = tokio::time::interval(config.heartbeat_interval);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -507,6 +831,15 @@ where
             drain.announced = true;
             tracing::info!("draining announced to the coordinator; no new placements from here");
         }
+        // An interruption plan that started or changed since the `Register`
+        // went out is announced the same way (ADR 0044 §5): the coordinator
+        // must stop placing here now, not at the next tick.
+        let plan = session.active_plan().map(|p| p.deadline);
+        if plan != announced && session.is_registered() {
+            let hb = session.heartbeat_report().await;
+            send_all(&tx, vec![hb]).await?;
+            announced = plan;
+        }
         // Then: stop, if there is nothing left to be accountable for.
         if drain.complete(session) {
             tracing::info!("drain complete: no live work left, session closing");
@@ -535,11 +868,18 @@ where
             }
         };
 
+        let next_stop = session.next_stop_at();
         tokio::select! {
+            event = background.next(next_stop) => {
+                on_background_event(session, background, event, Some(&tx)).await?;
+            }
             message = inbound.message() => {
                 match message {
                     Ok(Some(cmd)) => {
                         let reports = session.handle_command(cmd).await?;
+                        // Executor-bound work the command queued (a start, an
+                        // abort's stop) runs on its own task.
+                        background.spawn(session, Vec::new());
                         send_all(&tx, reports).await?;
                     }
                     Ok(None) => return Ok(Served::Closed),

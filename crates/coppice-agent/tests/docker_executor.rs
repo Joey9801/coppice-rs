@@ -56,8 +56,8 @@ use coppice_agent::executor::docker::api;
 use coppice_agent::executor::docker::cache::CacheOptions;
 use coppice_agent::executor::docker::TelemetryWiring;
 use coppice_agent::executor::{
-    classify_exit, ContainerState, DockerExecutor, Executor, ExitCause, ExitInfo,
-    ObservedContainer, StartError, StartSpec, StopOutcome,
+    classify_exit, Attribution, ContainerState, DockerExecutor, Executor, ExitCause, ExitInfo,
+    ObservedContainer, SignalOutcome, StartError, StartSpec, StopOutcome,
 };
 use coppice_agent::node_service::{serve as serve_node_service, NodeServiceListener};
 use coppice_agent::pressure::DiskPressure;
@@ -65,9 +65,10 @@ use coppice_agent::telemetry::{
     FilesystemSink, FilesystemSinkOptions, HubSink, LogQuery, LogStream, MetricSample,
     SinkInstance, SinkKind, StoredLogChunk, Telemetry, TelemetryHub,
 };
-use coppice_core::attempt::AttemptOutcome;
+use coppice_core::attempt::{AttemptOutcome, PreemptReason};
 use coppice_core::bytes::ByteSize;
 use coppice_core::id::{AllocationId, AttemptId, JobId, NodeId};
+use coppice_core::preemption::NoticeSignal;
 use coppice_core::resource::Resources;
 use coppice_core::time::{Duration as CoreDuration, Timestamp};
 use coppice_net::node_service::Client as NodeServiceClient;
@@ -1130,7 +1131,7 @@ async fn env_overlay_reaches_the_container() {
             info.cause
         );
         ensure!(
-            classify_exit(&info, false) == AttemptOutcome::Exited { code: 0 },
+            classify_exit(&info, &Default::default()) == AttemptOutcome::Exited { code: 0 },
             "a clean exit under an env overlay must classify as Exited {{ code: 0 }}"
         );
         Ok(())
@@ -1439,6 +1440,77 @@ async fn stop_grace_term_trap() {
         ensure!(
             elapsed < StdDuration::from_secs(8),
             "stop took {elapsed:?}; TERM was not honored within the grace"
+        );
+        Ok(())
+    }
+    .await;
+
+    harness::cleanup(&exec, &[alloc]).await;
+    r.unwrap();
+}
+
+// ---- 4b. preemption notice signal (ADR 0044 §3) --------------------------
+
+/// The notice signal reaches PID 1: a shell trapping SIGUSR1 and exiting 75
+/// exits naturally with 75, which classifies as `Preempted` only when the
+/// agent attributes a notice, and as a plain `Exited` otherwise. Signalling
+/// after the exit answers `NotRunning`.
+#[tokio::test]
+async fn notice_signal_reaches_pid1_and_a_trapped_exit_classifies_preempted() {
+    let Some(docker) = harness::docker().await else {
+        return;
+    };
+    let (exec, _tx) = harness::executor(docker).await;
+    let sp = harness::spec(
+        harness::BUSYBOX,
+        &[
+            "sh",
+            "-c",
+            "trap 'exit 75' USR1; while true; do sleep 0.1; done",
+        ],
+        Resources::ZERO,
+    );
+    let alloc = sp.allocation;
+
+    let r: anyhow::Result<()> = async {
+        exec.start(sp).await?;
+        harness::wait_observed_running(&exec, alloc, 30).await?;
+        // Let the shell install its trap before signalling.
+        tokio::time::sleep(StdDuration::from_secs(1)).await;
+
+        let outcome = exec.signal(alloc, NoticeSignal::Sigusr1).await?;
+        ensure!(
+            outcome == SignalOutcome::Delivered,
+            "expected Delivered, got {outcome:?}"
+        );
+
+        let info = harness::wait_exit(&exec, alloc, 30).await?;
+        ensure!(info.code == 75, "expected exit 75, got {info:?}");
+        ensure!(
+            info.cause == ExitCause::Natural,
+            "expected a natural exit, got {info:?}"
+        );
+
+        let noticed = Attribution {
+            kill: None,
+            notice: Some(PreemptReason::Interruption),
+        };
+        ensure!(
+            classify_exit(&info, &noticed)
+                == AttemptOutcome::Preempted {
+                    reason: PreemptReason::Interruption
+                },
+            "noticed exit must classify Preempted"
+        );
+        ensure!(
+            classify_exit(&info, &Attribution::default()) == AttemptOutcome::Exited { code: 75 },
+            "un-noticed exit must classify Exited"
+        );
+
+        let after = exec.signal(alloc, NoticeSignal::Sigusr1).await?;
+        ensure!(
+            after == SignalOutcome::NotRunning,
+            "expected NotRunning after exit, got {after:?}"
         );
         Ok(())
     }
@@ -1858,9 +1930,9 @@ async fn poll_mode_disk_kill() {
                 info.code
             );
             ensure!(
-                classify_exit(&info, false) == AttemptOutcome::DiskLimitExceeded,
+                classify_exit(&info, &Default::default()) == AttemptOutcome::DiskLimitExceeded,
                 "DiskKilled must classify as DiskLimitExceeded, got {:?}",
-                classify_exit(&info, false)
+                classify_exit(&info, &Default::default())
             );
 
             // Evidence survives until reap (§5): observe still reports it Exited.
