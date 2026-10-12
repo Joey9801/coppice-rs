@@ -79,6 +79,7 @@ impl From<&AttemptRecord> for pb::AttemptRecord {
             started_at_us: r.started_at.map(|t| t.as_micros()),
             ended_at_us: r.ended_at.map(|t| t.as_micros()),
             settlement: r.settlement.map(Into::into),
+            effective_preemptible: r.effective_preemptible,
         }
     }
 }
@@ -102,6 +103,7 @@ impl TryFrom<pb::AttemptRecord> for AttemptRecord {
                 .map(|us| timestamp(us, "AttemptRecord.ended_at_us"))
                 .transpose()?,
             settlement: r.settlement.map(TryInto::try_into).transpose()?,
+            effective_preemptible: r.effective_preemptible,
         })
     }
 }
@@ -161,6 +163,7 @@ impl From<(&coppice_core::id::QuotaEntityId, &QuotaEntity)> for pb::QuotaEntityR
             usage: Some(e.usage.into()),
             created_at_us: e.created_at.as_micros(),
             updated_at_us: e.updated_at.as_micros(),
+            preemptible: Some(e.preemptible),
         }
     }
 }
@@ -180,6 +183,8 @@ impl TryFrom<pb::QuotaEntityRecord> for (coppice_core::id::QuotaEntityId, QuotaE
                 // accepted loss of a display-only instant.
                 created_at: timestamp(r.created_at_us, "QuotaEntityRecord.created_at_us")?,
                 updated_at: timestamp(r.updated_at_us, "QuotaEntityRecord.updated_at_us")?,
+                // Absent decodes to the ADR 0044 default, switched on.
+                preemptible: r.preemptible.unwrap_or(true),
             },
         ))
     }
@@ -811,6 +816,7 @@ mod tests {
             usage: UsageState::new(ts(5_000_000)),
             created_at: ts(1_000_000),
             updated_at: ts(9_000_000),
+            preemptible: false,
         };
 
         let record: pb::QuotaEntityRecord = (&id, &entity).into();
@@ -835,10 +841,15 @@ mod tests {
             usage: Some(UsageState::new(ts(0)).into()),
             created_at_us: 0,
             updated_at_us: 0,
+            preemptible: None,
         };
 
         let (_, decoded): (QuotaEntityId, QuotaEntity) = record.try_into().unwrap();
         assert_eq!(decoded.created_at, ts(0));
         assert_eq!(decoded.updated_at, ts(0));
+        assert!(
+            decoded.preemptible,
+            "absent switch decodes to the default, on"
+        );
     }
 }

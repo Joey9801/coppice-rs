@@ -27,8 +27,8 @@ use tokio::sync::watch;
 
 use coppice_api::http::dto::{
     AbortJobRequest, ConfigureQuotaEntityRequest, ConfigureQuotaEntityResponse, EvictNodeRequest,
-    SetNodeSchedulableRequest, SubmitJobRequest, SubmitJobResponse, UpdateAuthorizationRequest,
-    UpdateAuthorizationResponse, UpdateJobMetadataResponse,
+    PreemptionRequest, SetNodeSchedulableRequest, SubmitJobRequest, SubmitJobResponse,
+    UpdateAuthorizationRequest, UpdateAuthorizationResponse, UpdateJobMetadataResponse,
 };
 use coppice_api::{
     ApiError, ClusterUsage, Consistency, ControlPlane, CoordinatorMemberSummary,
@@ -44,6 +44,7 @@ use coppice_core::id::{ClusterId, JobId, NodeId, QuotaEntityId};
 
 use crate::tasks::node_client::NodeClient;
 use coppice_core::job::Job;
+use coppice_core::preemption::{NoticeSignal, PreemptionSpec};
 use coppice_core::quota::{CostUnits, PriorityMultiplier};
 use coppice_core::time::{Duration, Timestamp};
 use coppice_state::command::{
@@ -299,6 +300,55 @@ fn multiplier_for(view: &StateView, priority: i32) -> Option<PriorityMultiplier>
         .copied()
 }
 
+/// The bounds check on a declared preemption notice (ADR 0044 §1) against
+/// one published view's policy: `true` when the notice fits, or when the job
+/// declared none (apply gives it the floor, which fits by construction).
+///
+/// Looked up through [`lookup_linearized`] with the entity and multiplier,
+/// for the same reason they are: refusing is terminal, so a refusal must not
+/// come from a view that has not yet seen a policy update the leader has
+/// committed.
+fn notice_fits(view: &StateView, notice: Option<Duration>) -> bool {
+    let policy = &view.state().policy;
+    notice.map_or(true, |n| {
+        coppice_core::preemption::validate_notice(
+            n,
+            policy.preemption_notice_floor,
+            policy.preemption_notice_cap,
+        )
+        .is_ok()
+    })
+}
+
+/// Shape-check a submission's `[preemption]` table (ADR 0044 §1): the
+/// signal against the allowlist, the notice a non-negative, representable
+/// number of seconds. The policy bounds are checked later, against the
+/// leader's view ([`notice_fits`]).
+fn preemption_shape(req: Option<&PreemptionRequest>) -> Result<PreemptionSpec, String> {
+    let Some(req) = req else {
+        return Ok(PreemptionSpec::default());
+    };
+    let notice = match req.notice_seconds {
+        None => None,
+        Some(seconds) if seconds < 0 => {
+            return Err("preemption.notice_seconds must not be negative".into());
+        }
+        Some(seconds) => Some(
+            Duration::checked_from_secs(seconds)
+                .ok_or_else(|| format!("preemption.notice_seconds {seconds} is out of range"))?,
+        ),
+    };
+    let notice_signal = match &req.notice_signal {
+        None => NoticeSignal::default(),
+        Some(name) => name.parse::<NoticeSignal>().map_err(|e| e.to_string())?,
+    };
+    Ok(PreemptionSpec {
+        preemptible: req.preemptible,
+        notice,
+        notice_signal,
+    })
+}
+
 /// Validate and propose one submission on this replica (ADR 0031's write
 /// class), with no forwarding of any kind.
 ///
@@ -379,6 +429,9 @@ pub(crate) async fn submit_job_here<C: Consensus>(
     // proposer did.
     coppice_core::env::validate(&req.env).map_err(|e| invalid(e.to_string()))?;
     let env = req.env.clone();
+    // ADR 0044 §1: the shape of the `[preemption]` table here; its notice
+    // against the policy bounds below, on the leader's view.
+    let preemption = preemption_shape(req.preemption.as_ref()).map_err(invalid)?;
 
     // Everything above this line is shape validation: it reads only the
     // request, so its verdict is the same on every replica and a follower is
@@ -421,11 +474,22 @@ pub(crate) async fn submit_job_here<C: Consensus>(
     // are terminal ("change your request"), so it is only rendered behind a
     // read barrier: a path created, or a class added, just before this
     // request is found there rather than refused.
+    //
+    // The preemption notice's bounds are policy too, and ride the same
+    // lookup: a refusal is terminal, so it waits for the barrier like the
+    // other two misses. It is enforced only for an id the view does not
+    // already hold: a retry of a committed submission (ADR 0026) was
+    // admitted under the bounds of its day, and must reach apply — which
+    // judges identity and re-checks authority — even if the policy has
+    // since moved its notice out of range. (A view that has not yet seen the
+    // original commit falls through to the barrier like any other miss.)
     let found = lookup_linearized(consensus, views, |view| {
-        Some((
+        let found = (
             resolve_ref(view, &req.quota_entity)?,
             multiplier_for(view, req.priority)?,
-        ))
+        );
+        (view.state().jobs.contains_key(&job) || notice_fits(view, preemption.notice))
+            .then_some(found)
     })
     .await?;
     let (quota_entity, multiplier) = match found {
@@ -437,10 +501,26 @@ pub(crate) async fn submit_job_here<C: Consensus>(
         Err(view) => {
             return Err(match resolve_ref(&view, &req.quota_entity) {
                 None => LocalWriteError::Api(ApiError::unknown_quota_entity(&req.quota_entity)),
-                Some(_) => invalid(format!(
+                Some(_) if multiplier_for(&view, req.priority).is_none() => invalid(format!(
                     "no multiplier configured for priority {}",
                     req.priority
                 )),
+                Some(_) => {
+                    let policy = &view.state().policy;
+                    let notice = preemption.notice.unwrap_or_default();
+                    invalid(
+                        coppice_core::preemption::validate_notice(
+                            notice,
+                            policy.preemption_notice_floor,
+                            policy.preemption_notice_cap,
+                        )
+                        .err()
+                        .map_or_else(
+                            || "preemption notice is out of bounds".into(),
+                            |e| e.to_string(),
+                        ),
+                    )
+                }
             });
         }
     };
@@ -470,6 +550,10 @@ pub(crate) async fn submit_job_here<C: Consensus>(
             // drifted from a lagging binary — still cannot land an oversized
             // map in replicated state.
             metadata,
+            // A notice left unset stays unset: apply resolves it to the
+            // policy floor at the command's own log position, and re-checks
+            // a declared one against the bounds there.
+            preemption,
         },
         multiplier,
         submitted_at: Timestamp::now(),
@@ -610,6 +694,7 @@ pub(crate) async fn configure_quota_entity_here<C: Consensus>(
         quota: CostUnits(req.quota_ucu),
         updated_at: Timestamp::now(),
         actor: Some(actor.clone()),
+        preemptible: req.preemptible,
     });
 
     match consensus.propose(command).await {
@@ -2006,6 +2091,7 @@ mod tests {
             entrypoint: None,
             metadata: Default::default(),
             env: Default::default(),
+            preemption: None,
         }
     }
 
@@ -2063,6 +2149,113 @@ mod tests {
         req.max_runtime_seconds = Some(i64::MAX);
         let result = cp.submit_job(req, test_actor()).await;
         assert!(matches!(result, Err(ApiError::Invalid(_))));
+    }
+
+    /// The `[preemption]` table's shape (ADR 0044 §1) is judged on any
+    /// replica: a signal outside the allowlist, a negative notice.
+    #[tokio::test]
+    async fn submit_with_a_malformed_preemption_table_is_invalid() {
+        for preemption in [
+            dto::PreemptionRequest {
+                notice_signal: Some("SIGKILL".to_string()),
+                ..Default::default()
+            },
+            dto::PreemptionRequest {
+                notice_seconds: Some(-1),
+                ..Default::default()
+            },
+        ] {
+            let cp = control_plane(ProposeOutcome::Accepted);
+            let mut req = submit_request(JobId::new());
+            req.preemption = Some(preemption);
+            let result = cp.submit_job(req, test_actor()).await;
+            assert!(matches!(result, Err(ApiError::Invalid(_))), "{result:?}");
+        }
+    }
+
+    /// The notice bounds are policy, so the leader checks them against its
+    /// view — behind the barrier — and a notice inside them, or none at all,
+    /// is proposed as the client wrote it: apply resolves an absent one.
+    #[tokio::test]
+    async fn the_leader_checks_the_notice_against_the_policy_bounds() {
+        let (cp, consensus, _publisher) = control_plane_and_publisher(ProposeOutcome::Accepted);
+        consensus.set_read_index(1); // the index the publisher seeded
+        let mut req = submit_request(JobId::new());
+        req.preemption = Some(dto::PreemptionRequest {
+            preemptible: true,
+            notice_seconds: Some(301),
+            notice_signal: None,
+        });
+        match cp.submit_job(req, test_actor()).await {
+            Err(ApiError::Invalid(m)) => assert!(m.contains("cap"), "{m}"),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+        assert!(consensus.proposed().is_empty(), "nothing proposed");
+
+        for (notice_seconds, expected) in
+            [(Some(120), Some(Duration::from_secs(120))), (None, None)]
+        {
+            let (cp, consensus, _publisher) = control_plane_and_publisher(ProposeOutcome::Accepted);
+            let mut req = submit_request(JobId::new());
+            req.preemption = Some(dto::PreemptionRequest {
+                preemptible: true,
+                notice_seconds,
+                notice_signal: Some("SIGTERM".to_string()),
+            });
+            cp.submit_job(req, test_actor()).await.expect("accepted");
+            match consensus.proposed().as_slice() {
+                [Command::SubmitJob(submit)] => {
+                    assert_eq!(
+                        submit.job.preemption,
+                        PreemptionSpec {
+                            preemptible: true,
+                            notice: expected,
+                            notice_signal: NoticeSignal::Sigterm,
+                        }
+                    );
+                }
+                other => panic!("expected one submission, got {other:?}"),
+            }
+        }
+    }
+
+    /// A retry of an already-committed submission is not refused on the
+    /// notice bounds: they may have moved since the original was admitted
+    /// (ADR 0044 §1), and apply judges a retry on identity alone.
+    #[tokio::test]
+    async fn a_committed_retry_is_not_refused_on_the_notice_bounds() {
+        use coppice_core::resource::Resources;
+        let (consensus, mut publisher) = FakeConsensus::new(ProposeOutcome::Accepted);
+        let job = JobId::new();
+        let mut state = state_with_priorities(&[0]);
+        state.jobs.insert(
+            job,
+            crate::test_support::job_record(job, "busybox", Resources::default(), None),
+        );
+        publisher.publish_now(&state, 1);
+        let views = consensus.views();
+        let consensus = Arc::new(consensus);
+        let cp = CoordinatorControlPlane::new(Arc::clone(&consensus), views, ClusterId::new());
+        consensus.set_read_index(1);
+
+        // 301 s is over the cap (300 s), as a floor raised past the original
+        // notice would leave it.
+        let preemption = Some(dto::PreemptionRequest {
+            preemptible: true,
+            notice_seconds: Some(301),
+            notice_signal: None,
+        });
+        let mut retry = submit_request(job);
+        retry.preemption = preemption.clone();
+        cp.submit_job(retry, test_actor()).await.expect("proposed");
+        assert_eq!(consensus.proposed().len(), 1, "reached apply");
+
+        // The same notice on a fresh id is still refused.
+        let mut fresh = submit_request(JobId::new());
+        fresh.preemption = preemption;
+        let result = cp.submit_job(fresh, test_actor()).await;
+        assert!(matches!(result, Err(ApiError::Invalid(_))), "{result:?}");
+        assert_eq!(consensus.proposed().len(), 1, "nothing more proposed");
     }
 
     #[tokio::test]
@@ -2519,6 +2712,7 @@ mod tests {
             parent: None,
             name: "team".to_string(),
             quota_ucu: 1_000_000,
+            preemptible: None,
         }
     }
 
@@ -3066,6 +3260,7 @@ mod tests {
             quota: CostUnits(1_000_000),
             updated_at: Timestamp::from_micros(1).expect("in range"),
             actor: None,
+            preemptible: None,
         })
     }
 
@@ -3212,6 +3407,7 @@ mod tests {
             parent: Some(path_ref("acme")),
             name: "eng".to_string(),
             quota_ucu: 1_000_000,
+            preemptible: None,
         };
         let (result, ()) = tokio::join!(cp.configure_quota_entity(request, test_actor()), {
             let publisher = &mut publisher;
@@ -3238,6 +3434,7 @@ mod tests {
                     parent: Some(QuotaEntityRef::Id(acme)),
                     name: "eng".to_string(),
                     quota_ucu: 2_000_000,
+                    preemptible: None,
                 },
                 test_actor(),
             )
@@ -3262,6 +3459,7 @@ mod tests {
                         parent: Some(parent),
                         name: "x".to_string(),
                         quota_ucu: 1,
+                        preemptible: None,
                     },
                     test_actor(),
                 )

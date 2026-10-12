@@ -13,6 +13,12 @@
 //! `=` nor NUL, so the first `=` in an encoded entry is always the
 //! separator.
 //!
+//! Names beginning with [`RESERVED_PREFIX`] (`COPPICE_`) belong to the
+//! platform: the agent injects a reserved block of them into every container
+//! (the *resumption identity* of
+//! `docs/decisions/0044-job-preemption-and-spot-capacity.md` §2, named in
+//! [`reserved`]), so a job may not set one.
+//!
 //! It is **not** a secret channel. The map is stored in replicated state,
 //! rides every snapshot, and is served through the API and the UI
 //! (`docs/decisions/0011-container-security-posture.md`), so a value put
@@ -38,6 +44,36 @@ pub const MAX_VALUE_BYTES: usize = 4096;
 /// replicated, snapshotted state.
 pub const MAX_TOTAL_BYTES: usize = 32 * 1024;
 
+/// The prefix of every platform-owned variable name. A job's own `env` may
+/// not use it (ADR 0044 §2): the agent injects the [`reserved`] block, and a
+/// user value must never shadow or impersonate it.
+pub const RESERVED_PREFIX: &str = "COPPICE_";
+
+/// The reserved variables the agent injects into every container, ADR 0044
+/// §2's *resumption identity*: who the attempt is and what happened to the
+/// last incarnation of the job that ran.
+pub mod reserved {
+    /// The job's id, stable across attempts.
+    pub const JOB_ID: &str = "COPPICE_JOB_ID";
+    /// This attempt's id.
+    pub const ATTEMPT_ID: &str = "COPPICE_ATTEMPT_ID";
+    /// Position in the job's attempt lineage: 0, 1, 2, … — counting attempts
+    /// that never ran.
+    pub const ATTEMPT_INDEX: &str = "COPPICE_ATTEMPT_INDEX";
+    /// The most recent earlier attempt that reached `Running`; unset if none
+    /// did.
+    pub const PREVIOUS_ATTEMPT_ID: &str = "COPPICE_PREVIOUS_ATTEMPT_ID";
+    /// That attempt's outcome name (`exited`, `node_lost`, …); unset with the
+    /// id.
+    pub const PREVIOUS_ATTEMPT_OUTCOME: &str = "COPPICE_PREVIOUS_ATTEMPT_OUTCOME";
+    /// `1` or `0`: the attempt's effective preemptibility.
+    pub const PREEMPTIBLE: &str = "COPPICE_PREEMPTIBLE";
+    /// The declared notice signal's name, `SIGUSR1` style.
+    pub const NOTICE_SIGNAL: &str = "COPPICE_NOTICE_SIGNAL";
+    /// The declared notice in whole seconds.
+    pub const NOTICE_S: &str = "COPPICE_NOTICE_S";
+}
+
 /// Why an environment map was refused.
 ///
 /// Rendered into `RejectionReason::InvalidJobEnv` at apply and into an
@@ -60,6 +96,11 @@ pub enum EnvError {
     ValueNul { name: String },
     #[error("environment totals {total} bytes of names and values, more than the limit of 32768")]
     TooLarge { total: usize },
+    #[error(
+        "environment variable name {name:?} uses the reserved prefix `COPPICE_`; \
+         the platform sets those names itself"
+    )]
+    ReservedName { name: String },
 }
 
 /// Check an environment map against every limit.
@@ -101,6 +142,11 @@ fn validate_name(name: &str) -> Result<(), EnvError> {
             len: name.len(),
         });
     }
+    if name.starts_with(RESERVED_PREFIX) {
+        return Err(EnvError::ReservedName {
+            name: name.to_string(),
+        });
+    }
     let bytes = name.as_bytes();
     // A portable name never starts with a digit, so `1PATH` — which no shell
     // can reference — is refused rather than quietly shipped.
@@ -125,6 +171,23 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect()
+    }
+
+    #[test]
+    fn validate_refuses_the_reserved_prefix() {
+        let env = map(&[("COPPICE_JOB_ID", "spoofed")]);
+        assert_eq!(
+            validate(&env),
+            Err(EnvError::ReservedName {
+                name: "COPPICE_JOB_ID".into()
+            })
+        );
+        // The prefix is exact and case-sensitive: lookalikes are ordinary
+        // names.
+        assert_eq!(
+            validate(&map(&[("COPPICEX", "1"), ("coppice_x", "1")])),
+            Ok(())
+        );
     }
 
     #[test]

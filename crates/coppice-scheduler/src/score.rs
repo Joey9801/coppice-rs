@@ -181,6 +181,7 @@ mod tests {
             },
             created_at: ts(),
             updated_at: ts(),
+            preemptible: true,
         }
     }
 

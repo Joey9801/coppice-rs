@@ -65,6 +65,40 @@ message Job {
   // emit ascending name order, readers accept any order and reject
   // duplicate names.
   repeated EnvVar env = 13;
+  // The `[preemption]` declarations (ADR 0044 §1). Immutable after
+  // submission. Absent decodes to the defaults: not preemptible, notice left
+  // to the policy floor, SIGUSR1.
+  PreemptionSpec preemption = 14;
+}
+
+// A job's preemption declarations (ADR 0044 §1): the permission to be chosen
+// as a victim, and the notice contract every job has, preemptible or not.
+message PreemptionSpec {
+  // Permission for the scheduler to choose this job's running attempt as a
+  // victim, and for the job to be placed on `preemptible_only` nodes. What
+  // the platform acts on is the attempt's *effective* preemptibility, this
+  // and-ed with every ancestor quota entity's switch, recorded at placement.
+  bool preemptible = 1;
+  // Notice before a platform-initiated termination, microseconds. Explicit
+  // presence: absent on a submission means "the policy floor", which apply
+  // resolves before storing, so a stored job always carries it. Bounded by
+  // policy `preemption_notice_floor ≤ notice ≤ preemption_notice_cap`,
+  // checked at the API and at apply.
+  optional uint64 notice_us = 2;
+  // The signal the notice is delivered as.
+  NoticeSignal notice_signal = 3;
+}
+
+// The closed allowlist of notice signals (ADR 0044 §1). Treated as closed at
+// the boundary: an unspecified or unknown value in a committed payload is a
+// decode failure, not a silent default.
+enum NoticeSignal {
+  NOTICE_SIGNAL_UNSPECIFIED = 0;
+  NOTICE_SIGNAL_SIGHUP = 1;
+  NOTICE_SIGNAL_SIGINT = 2;
+  NOTICE_SIGNAL_SIGUSR1 = 3;
+  NOTICE_SIGNAL_SIGUSR2 = 4;
+  NOTICE_SIGNAL_SIGTERM = 5;
 }
 
 // One environment variable of a job's `env` overlay. A message rather than a

@@ -13,7 +13,7 @@ use crate::pagination::{JobCursor, TimelineCursor};
 use crate::time::Timestamp;
 
 use super::{
-    AccrualView, AttemptOutcome, AttemptState, AttemptView, JobFilter, JobStateKind,
+    AccrualView, AttemptOutcome, AttemptState, AttemptView, JobFilter, JobStateKind, NoticeSignal,
     QuotaEntityView, Resources, RetryPolicy,
 };
 
@@ -136,6 +136,25 @@ pub struct JobSpecView {
     /// coordinator that predates the field still reads.
     #[serde(default)]
     pub env: JobEnv,
+    /// The job's `[preemption]` declarations as stored (ADR 0044 §1), with
+    /// the notice resolved — a job that declared none shows the floor it was
+    /// given.
+    pub preemption: PreemptionView,
+}
+
+/// A stored job's `[preemption]` declarations (ADR 0044 §1).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct PreemptionView {
+    /// What the job declared. Whether a given attempt was actually
+    /// preemptible is that attempt's [`AttemptView::preemptible`], which also
+    /// folds in the quota entities' switches.
+    pub preemptible: bool,
+    /// The notice the job is given.
+    #[serde(rename = "notice_seconds", with = "crate::time::seconds")]
+    pub notice: Duration,
+    /// The signal sent when the notice starts.
+    pub notice_signal: NoticeSignal,
 }
 
 /// A committed abort request on a job.
@@ -271,7 +290,11 @@ pub struct CostReport {
     /// Runtime penalty folded in for a job with no declared max runtime;
     /// `1.0` when the job is bounded.
     pub unbounded_multiplier: f64,
-    /// The µCU/second actually priced: rate × priority × unbounded.
+    /// Preemptibility discount folded in for an effectively preemptible job
+    /// (ADR 0044 §1); `1.0` when the job is not.
+    pub preemptible_multiplier: f64,
+    /// The µCU/second actually priced: rate × priority × unbounded ×
+    /// preemptible.
     pub effective_rate_ucu_per_second: u64,
     /// Duration the upfront placement charge covers: the job's declared max
     /// runtime. For an unbounded job it is the renewal interval (ADR 0046).
@@ -568,6 +591,57 @@ pub struct SubmitJobRequest {
     /// spec.
     #[serde(default)]
     pub env: JobEnv,
+    /// The `[preemption]` table (ADR 0044 §1); absent is all defaults. Fixed
+    /// at submission and part of the submission's idempotency identity, so a
+    /// retry must resend it verbatim.
+    #[serde(default)]
+    pub preemption: Option<PreemptionRequest>,
+}
+
+/// A submission's `[preemption]` table (ADR 0044 §1).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct PreemptionRequest {
+    /// Permission for the platform to choose this job as a victim and to
+    /// place it on `preemptible_only` nodes. Default `false`.
+    #[serde(default)]
+    pub preemptible: bool,
+    /// Notice before a preemption kill, whole seconds on the wire; absent is
+    /// the cluster's `preemption_notice_floor`, and the server rejects a
+    /// value outside `floor ..= cap`.
+    #[serde(
+        default,
+        rename = "notice_seconds",
+        with = "crate::time::seconds::option"
+    )]
+    pub notice: Option<Duration>,
+    /// The signal sent when the notice starts; absent is `SIGUSR1`.
+    #[serde(default)]
+    pub notice_signal: Option<NoticeSignal>,
+}
+
+impl PreemptionRequest {
+    /// A table that only sets `preemptible`; notice and signal are the
+    /// server's defaults.
+    pub fn new(preemptible: bool) -> PreemptionRequest {
+        PreemptionRequest {
+            preemptible,
+            notice: None,
+            notice_signal: None,
+        }
+    }
+
+    /// Ask for a specific notice (whole seconds on the wire).
+    pub fn with_notice(mut self, notice: Duration) -> PreemptionRequest {
+        self.notice = Some(notice);
+        self
+    }
+
+    /// Ask for a specific notice signal.
+    pub fn with_notice_signal(mut self, signal: NoticeSignal) -> PreemptionRequest {
+        self.notice_signal = Some(signal);
+        self
+    }
 }
 
 impl SubmitJobRequest {
@@ -592,6 +666,7 @@ impl SubmitJobRequest {
             retry: None,
             metadata: JobMetadata::new(),
             env: JobEnv::new(),
+            preemption: None,
         }
     }
 
@@ -631,6 +706,12 @@ impl SubmitJobRequest {
     /// Set the container's environment overlay.
     pub fn with_env(mut self, env: JobEnv) -> SubmitJobRequest {
         self.env = env;
+        self
+    }
+
+    /// Set the `[preemption]` table.
+    pub fn with_preemption(mut self, preemption: PreemptionRequest) -> SubmitJobRequest {
+        self.preemption = Some(preemption);
         self
     }
 
@@ -1072,6 +1153,7 @@ mod tests {
                 "retry": null,
                 "metadata": {},
                 "env": {},
+                "preemption": null,
             })
         );
         let back: SubmitJobRequest = serde_json::from_value(json).unwrap();
@@ -1307,6 +1389,7 @@ mod tests {
             "rate_breakdown": { "cpu": 60, "memory": 40, "disk": 0 },
             "priority_multiplier": 1.0,
             "unbounded_multiplier": 1.0,
+            "preemptible_multiplier": 0.5,
             "effective_rate_ucu_per_second": 100,
             "charge_window_seconds": 3600,
             "charge_window_is_default": false,
@@ -1370,6 +1453,71 @@ mod tests {
                 ("cursor", "v1:1:0".to_string()),
                 ("limit", "20".to_string()),
             ]
+        );
+    }
+
+    #[test]
+    fn preemption_request_serializes_whole_seconds_and_signal_names() {
+        let request = PreemptionRequest::new(true)
+            .with_notice(Duration::from_secs(120))
+            .with_notice_signal(NoticeSignal::Sigusr2);
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "preemptible": true,
+                "notice_seconds": 120,
+                "notice_signal": "SIGUSR2",
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<PreemptionRequest>(json).unwrap(),
+            request
+        );
+        // An empty table is all defaults.
+        let empty: PreemptionRequest = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(empty, PreemptionRequest::default());
+    }
+
+    #[test]
+    fn a_submit_request_carries_the_preemption_table_or_null() {
+        let request = SubmitJobRequest::new(
+            JobId::new(),
+            "alpine",
+            ["true"],
+            Resources::default(),
+            QuotaEntityId::new(),
+        );
+        assert_eq!(
+            serde_json::to_value(&request).unwrap()["preemption"],
+            serde_json::Value::Null
+        );
+        let request = request.with_preemption(PreemptionRequest::new(true));
+        assert_eq!(
+            serde_json::to_value(&request).unwrap()["preemption"]["preemptible"],
+            serde_json::json!(true)
+        );
+    }
+
+    #[test]
+    fn a_preemption_view_reads_the_notice_as_a_duration() {
+        let view: PreemptionView = serde_json::from_value(serde_json::json!({
+            "preemptible": true,
+            "notice_seconds": 90,
+            "notice_signal": "SIGTERM",
+        }))
+        .unwrap();
+        assert_eq!(view.notice, Duration::from_secs(90));
+        assert_eq!(view.notice_signal, NoticeSignal::Sigterm);
+        let odd: PreemptionView = serde_json::from_value(serde_json::json!({
+            "preemptible": false,
+            "notice_seconds": 60,
+            "notice_signal": "SIGWINCH",
+        }))
+        .unwrap();
+        assert_eq!(
+            odd.notice_signal,
+            NoticeSignal::Unknown("SIGWINCH".to_string())
         );
     }
 

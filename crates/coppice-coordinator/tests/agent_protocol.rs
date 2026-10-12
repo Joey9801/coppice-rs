@@ -313,6 +313,7 @@ async fn seed_quota(coord: &RunningCoordinator, entity: QuotaEntityId) {
             quota: CostUnits(1_000_000_000_000),
             updated_at: Timestamp::now(),
             actor: None,
+            preemptible: None,
         }))
         .await
         .expect("propose ConfigureQuotaEntity");
@@ -349,6 +350,7 @@ async fn submit_job(
                 abort_requested: None,
                 submitted_by: None,
                 metadata: Default::default(),
+                preemption: Default::default(),
             },
             multiplier: PriorityMultiplier::ONE,
             submitted_at: Timestamp::now(),
@@ -1828,6 +1830,7 @@ async fn run_bounded_to_running(max_runtime: coppice_core::time::Duration) -> Bo
                 abort_requested: None,
                 submitted_by: None,
                 metadata: Default::default(),
+                preemption: Default::default(),
             },
             multiplier: PriorityMultiplier::ONE,
             submitted_at: Timestamp::now(),

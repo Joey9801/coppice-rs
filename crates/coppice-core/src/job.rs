@@ -19,6 +19,7 @@
 use crate::env::JobEnv;
 use crate::id::{AttemptId, JobId, QuotaEntityId};
 use crate::metadata::JobMetadata;
+use crate::preemption::PreemptionSpec;
 use crate::resource::Resources;
 use crate::time::{Duration, Timestamp};
 
@@ -89,6 +90,15 @@ pub struct Job {
     /// [`crate::metadata::validate`] at the API edge *and* at apply, so the
     /// replicated state never holds an oversized map.
     pub metadata: JobMetadata,
+    /// The `[preemption]` declarations
+    /// (`docs/decisions/0044-job-preemption-and-spot-capacity.md` §1):
+    /// whether the platform may choose this job as a victim, and the notice
+    /// contract it is given before any platform-initiated termination.
+    /// Immutable after submission, like every placement-relevant field. The
+    /// notice is checked against the replicated policy bounds at the API
+    /// edge *and* at apply, which also resolves an absent notice to the
+    /// policy floor before storing.
+    pub preemption: PreemptionSpec,
 }
 
 /// Per-job retry policy.

@@ -553,6 +553,22 @@ message ForwardSubmitJobRequest {
   // and on a miss a view caught up to a read barrier — and answers an
   // unresolvable path with the Rejected outcome (UNKNOWN_QUOTA_ENTITY).
   string quota_entity_ref = 20;
+  // The `[preemption]` table as the client wrote it (ADR 0044 §1); absent
+  // when the client sent none. Raw, like `priority`: the leader checks the
+  // notice against *its own* view of the policy bounds and resolves the
+  // defaults, exactly as it does for a direct submission.
+  ForwardPreemption preemption = 21;
+}
+
+// A forwarded submission's `[preemption]` table, spelled as the JSON body
+// spells it.
+message ForwardPreemption {
+  bool preemptible = 1;
+  // Whole seconds; absent leaves the notice to the policy floor.
+  optional int64 notice_seconds = 2;
+  // The signal name as the client wrote it (`SIGUSR1`); absent means the
+  // default. The leader validates it against the allowlist.
+  optional string notice_signal = 3;
 }
 
 message ForwardSubmitJobResponse {
@@ -595,6 +611,9 @@ message ForwardConfigureQuotaEntityRequest {
   // comes back as the Rejected outcome above (UNKNOWN_QUOTA_ENTITY), as does
   // apply's refusal of one differing from an existing entity's stored parent.
   optional string parent_ref = 13;
+  // The entity's preemption switch (ADR 0044 §1). Absent leaves an existing
+  // entity's switch as it is and creates a new one switched on.
+  optional bool preemptible = 14;
 }
 
 message ForwardConfigureQuotaEntityResponse {

@@ -88,6 +88,7 @@ fn submit_request(job: JobId, quota_entity: QuotaEntityId) -> dto::SubmitJobRequ
         entrypoint: None,
         metadata: Default::default(),
         env: Default::default(),
+        preemption: None,
     }
 }
 
@@ -142,6 +143,7 @@ async fn retried_submission_across_leader_change_creates_one_job() {
             quota: CostUnits(1_000_000),
             updated_at: Timestamp::from_micros(1).expect("in range"),
             actor: None,
+            preemptible: None,
         }))
         .await
         .expect("configure quota entity")

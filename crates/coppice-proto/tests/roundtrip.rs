@@ -13,6 +13,7 @@ use coppice_core::id::{
 use coppice_core::job::{Job, JobState, RetryPolicy};
 use coppice_core::metadata::JobMetadata;
 use coppice_core::node::HostFacts;
+use coppice_core::preemption::{NoticeSignal, PreemptionSpec};
 use coppice_core::quota::{CostUnits, PriorityMultiplier};
 use coppice_core::resource::Resources;
 use coppice_core::time::{Duration, Timestamp};
@@ -54,6 +55,12 @@ fn job(n: u128) -> Job {
         submitted_by: Some("user-42".into()),
         metadata: metadata_fixture(),
         env: env_fixture(),
+        // Non-default in every field, so a dropped one shows.
+        preemption: PreemptionSpec {
+            preemptible: true,
+            notice: Some(Duration::from_secs(120)),
+            notice_signal: NoticeSignal::Sigterm,
+        },
     }
 }
 
@@ -265,6 +272,7 @@ fn every_command() -> Vec<Command> {
             quota: CostUnits(1_000_000_000),
             updated_at: ts(),
             actor: None,
+            preemptible: None,
         }),
         Command::UpdatePolicy(UpdatePolicy {
             policy: PolicyConfig {
@@ -857,6 +865,50 @@ fn policy_config_absent_incentive_knobs_are_neutral() {
     let back: PolicyConfig = encoded.try_into().expect("policy must convert");
     assert_eq!(back.unbounded_runtime_multiplier, PriorityMultiplier::ONE);
     assert_eq!(back.refund_fraction_milli, 1000);
+}
+
+#[test]
+fn policy_config_preemption_knobs_roundtrip_and_default_when_absent() {
+    let policy = PolicyConfig {
+        preemptible_multiplier: PriorityMultiplier(1 << 30),
+        preemption_notice_floor: Duration::from_secs(10),
+        preemption_notice_cap: Duration::from_mins(3),
+        ..PolicyConfig::default()
+    };
+    let encoded: pb::core::v1::PolicyConfig = (&policy).into();
+    let back: PolicyConfig = encoded.clone().try_into().expect("policy must convert");
+    assert_eq!(back, policy, "policy roundtrip must be lossless");
+
+    // Absent decodes to the ADR 0044 §6 defaults (0.75, 60 s, 5 min).
+    let mut absent = encoded;
+    absent.preemptible_multiplier_q32_32 = None;
+    absent.preemption_notice_floor_us = None;
+    absent.preemption_notice_cap_us = None;
+    let back: PolicyConfig = absent.try_into().expect("policy must convert");
+    assert_eq!(back.preemptible_multiplier, PriorityMultiplier(3 << 30));
+    assert_eq!(back.preemption_notice_floor, Duration::from_secs(60));
+    assert_eq!(back.preemption_notice_cap, Duration::from_mins(5));
+}
+
+#[test]
+fn preemption_spec_absent_is_defaults_and_signal_is_closed() {
+    // An absent table decodes to the defaults: not preemptible, notice left
+    // to the floor, SIGUSR1.
+    let mut encoded: pb::core::v1::Job = (&job(1)).into();
+    encoded.preemption = None;
+    let back: Job = encoded.clone().try_into().expect("job must convert");
+    assert_eq!(back.preemption, PreemptionSpec::default());
+
+    // The signal enum is closed: UNSPECIFIED is a decode failure.
+    encoded.preemption = Some(pb::core::v1::PreemptionSpec {
+        preemptible: false,
+        notice_us: None,
+        notice_signal: 0,
+    });
+    assert!(matches!(
+        Job::try_from(encoded),
+        Err(ConvertError::UnknownEnum { .. })
+    ));
 }
 
 #[test]

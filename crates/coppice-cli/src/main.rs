@@ -604,6 +604,67 @@ mod tests {
         }
     }
 
+    #[test]
+    fn quota_configure_parses_the_preemptible_switch() {
+        for (flag, want) in [("true", Some(true)), ("false", Some(false))] {
+            let cli = Cli::parse_from([
+                "coppice",
+                "quota",
+                "configure",
+                "acme/team-a",
+                "--quota-ucu",
+                "1000",
+                "--preemptible",
+                flag,
+            ]);
+            match cli.command {
+                Command::Quota(quota::QuotaArgs {
+                    command: quota::QuotaCommand::Configure { preemptible, .. },
+                    ..
+                }) => assert_eq!(preemptible, want),
+                other => panic!("expected quota configure, got {other:?}"),
+            }
+        }
+        // Absent means "leave unchanged".
+        let cli = Cli::parse_from([
+            "coppice",
+            "quota",
+            "configure",
+            "acme/team-a",
+            "--quota-ucu",
+            "1000",
+        ]);
+        match cli.command {
+            Command::Quota(quota::QuotaArgs {
+                command: quota::QuotaCommand::Configure { preemptible, .. },
+                ..
+            }) => assert_eq!(preemptible, None),
+            other => panic!("expected quota configure, got {other:?}"),
+        }
+        // Not a bool, and not alongside --file.
+        assert!(Cli::try_parse_from([
+            "coppice",
+            "quota",
+            "configure",
+            "acme/team-a",
+            "--quota-ucu",
+            "1",
+            "--preemptible",
+            "maybe",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "coppice",
+            "quota",
+            "configure",
+            "--file",
+            "e.toml",
+            "--preemptible",
+            "false",
+        ])
+        .is_err());
+    }
+
     /// The two `quota configure` input modes are alternatives: a file and
     /// `PATH`/flags describing different entities would have no defined
     /// winner.

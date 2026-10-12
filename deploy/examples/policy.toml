@@ -25,6 +25,14 @@ disk_gib_hours_per_cu = 15.0   # 15 GiB-hours of disk cost 1 CU
 node = "24h"      # a drained, empty, silent node record before the GC evicts it (ADR 0041)
 terminal = "72h"  # a terminal job before it leaves replicated state (ADR 0012)
 
+[preemption]
+# ADR 0044's replicated preemption knobs, each seeded only while the replicated
+# field still holds its booted default. The values here ARE the defaults,
+# stated so the demo's policy reads in full.
+preemptible_multiplier = 0.75 # charge discount for an effectively preemptible job (≤ 1.0)
+notice_floor = "60s"          # shortest notice a job may declare, and the default notice
+notice_cap = "5m"             # longest notice a job may declare
+
 [[priority_multiplier]]
 # The whole table is seeded in one shot, and only while the replicated table is
 # still empty. One entry is enough for the demo: priority 0 at face value.

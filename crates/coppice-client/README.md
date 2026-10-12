@@ -112,6 +112,39 @@ async fn main() -> coppice_client::Result<()> {
 }
 ```
 
+## Preemption
+
+A job opts in to being preempted with a `[preemption]` table (ADR 0044). The
+default is not preemptible; a preemptible job is charged at a discount and may
+be placed on preemptible-only nodes, in return for a notice signal ahead of the
+kill.
+
+```rust,no_run
+use std::time::Duration;
+
+use coppice_client::{NoticeSignal, PreemptionRequest, SubmitJobRequest};
+
+# fn go(request: SubmitJobRequest) -> SubmitJobRequest {
+request.with_preemption(
+    PreemptionRequest::new(true)
+        // Whole seconds, within the cluster's notice floor..=cap; absent is
+        // the floor (60 s by default).
+        .with_notice(Duration::from_secs(120))
+        // One of SIGHUP, SIGINT, SIGUSR1, SIGUSR2, SIGTERM; absent is SIGUSR1.
+        .with_notice_signal(NoticeSignal::Sigusr2),
+)
+# }
+```
+
+Reads show the outcome: `JobSpecView::preemption` is what the job declared
+(with the notice resolved), `AttemptView::preemptible` is whether that attempt
+was effectively preemptible (the job's flag and every ancestor quota entity's
+switch, at placement), and `CostReport::preemptible_multiplier` is the discount
+folded into the price (`1.0` when not preemptible). A quota entity's switch is
+`QuotaEntityNode::preemptible` and is set with
+`ConfigureQuotaEntityRequest::with_preemptible`; `false` turns preemption off
+for the entity's whole subtree.
+
 ## Watching a set of jobs
 
 Polling every job a service owns is almost all redundant requests. Instead,

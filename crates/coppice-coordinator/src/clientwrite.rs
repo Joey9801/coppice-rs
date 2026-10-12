@@ -813,6 +813,13 @@ pub(crate) fn submit_to_pb(
             .map(|r| coppice_core::job::RetryPolicy::from(r).into()),
         metadata: Some(metadata_map_to_pb(&req.metadata)),
         env: env_to_pb(&req.env),
+        // Raw, like `priority`: the leader checks it against its own view
+        // of the policy bounds.
+        preemption: req.preemption.as_ref().map(|p| pb::ForwardPreemption {
+            preemptible: p.preemptible,
+            notice_seconds: p.notice_seconds,
+            notice_signal: p.notice_signal.clone(),
+        }),
     }
 }
 
@@ -871,6 +878,13 @@ pub(crate) fn submit_from_pb(
                     retry_user_errors: core.retry_user_errors,
                 }
             }),
+            preemption: req
+                .preemption
+                .map(|p| coppice_api::http::dto::PreemptionRequest {
+                    preemptible: p.preemptible,
+                    notice_seconds: p.notice_seconds,
+                    notice_signal: p.notice_signal,
+                }),
         },
         actor,
     ))
@@ -900,6 +914,7 @@ pub(crate) fn configure_to_pb(
         name: req.name.clone(),
         quota_ucu: req.quota_ucu,
         actor: Some(actor.into()),
+        preemptible: req.preemptible,
     }
 }
 
@@ -920,6 +935,7 @@ pub(crate) fn configure_from_pb(
                 .transpose()?,
             name: req.name,
             quota_ucu: req.quota_ucu,
+            preemptible: req.preemptible,
         },
         actor,
     ))
@@ -1128,6 +1144,11 @@ mod tests {
             env: [("RUST_LOG".to_string(), "info".to_string())]
                 .into_iter()
                 .collect(),
+            preemption: Some(dto::PreemptionRequest {
+                preemptible: true,
+                notice_seconds: Some(120),
+                notice_signal: Some("SIGUSR2".to_string()),
+            }),
         }
     }
 
@@ -1160,6 +1181,9 @@ mod tests {
         assert_eq!(round_tripped.quota_entity, original.quota_entity);
         assert_eq!(round_tripped.metadata, original.metadata);
         assert_eq!(round_tripped.env, original.env);
+        // Raw, so the leader judges the notice and the signal name exactly
+        // as the client wrote them (ADR 0044 §1).
+        assert_eq!(round_tripped.preemption, original.preemption);
         let retry = round_tripped.retry.expect("retry policy survives");
         assert_eq!(retry.max_retries, 2);
         assert!(retry.retry_user_errors);
@@ -1225,6 +1249,7 @@ mod tests {
             name: "platform".to_string(),
             quota_ucu: 1,
             actor: Some((&actor()).into()),
+            preemptible: Some(false),
         };
         wire.actor = None;
         assert!(configure_from_pb(wire).is_err());
@@ -1337,12 +1362,19 @@ mod tests {
         let entity = QuotaEntityId::new();
         let parent = QuotaEntityRef::Id(QuotaEntityId::new());
         let path: QuotaEntityRef = "acme/eng".parse().unwrap();
-        for expected_parent in [None, Some(parent), Some(path)] {
+        // The preemption switch (ADR 0044 §1) keeps its three readings too:
+        // absent ("leave it as it is") must not arrive as an explicit value.
+        for (expected_parent, preemptible) in [
+            (None, None),
+            (Some(parent), Some(false)),
+            (Some(path), Some(true)),
+        ] {
             let req = ConfigureQuotaEntityRequest {
                 entity,
                 parent: expected_parent.clone(),
                 name: "platform".to_string(),
                 quota_ucu: 12_345,
+                preemptible,
             };
             let wire = configure_to_pb(HISTORY, &req, &actor());
             let (back, back_actor) = configure_from_pb(wire).expect("a well-formed upsert");
@@ -1351,6 +1383,7 @@ mod tests {
             assert_eq!(back.parent, expected_parent);
             assert_eq!(back.name, "platform");
             assert_eq!(back.quota_ucu, 12_345);
+            assert_eq!(back.preemptible, preemptible);
         }
     }
 

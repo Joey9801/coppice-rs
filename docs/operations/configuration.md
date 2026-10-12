@@ -31,6 +31,7 @@ node want a different value than its peers?* → config file.
 | Decay policy (tick, λ — the "half-life"), penalty exponent | replicated policy ([ADR 0019](../decisions/0019-deterministic-quota-arithmetic.md)) |
 | Priority-multiplier table | replicated policy |
 | Data-retention windows | replicated policy ([ADR 0012](../decisions/0012-data-retention.md)) |
+| Preemptibility discount, preemption-notice floor and cap; a quota entity's preemption switch | replicated policy ([ADR 0044](../decisions/0044-job-preemption-and-spot-capacity.md)) |
 | Agent-liveness / allocation-lost deadlines (fencing inputs) | replicated policy |
 | SSO role/group → authorization mappings (role bindings) | replicated policy ([ADR 0023](../decisions/0023-scoped-role-bindings.md)) |
 | OIDC groups-claim name | replicated policy (interpretation of a token decides who is an admin — [ADR 0022](../decisions/0022-oidc-identity-and-authentication.md)) |
@@ -417,6 +418,33 @@ fresh one. `terminal` is the post-terminal job window of
 the replicated field still holds its booted default, exactly like the prices,
 so a re-run of `init` never overwrites an operator's later edit; either may be
 omitted, and zero is refused.
+
+The document may also set the three **preemption knobs** of
+[ADR 0044](../decisions/0044-job-preemption-and-spot-capacity.md):
+
+```toml
+[preemption]
+preemptible_multiplier = 0.75 # charge discount for an effectively preemptible job, ≤ 1.0
+notice_floor = "60s"          # the shortest notice a job may declare, and the default
+notice_cap = "5m"             # the longest notice a job may declare
+```
+
+A job declares its own `[preemption]` table (`preemptible`, `notice`,
+`notice_signal`); its notice must sit within `notice_floor ..= notice_cap`,
+checked at submission against the policy then in force, and a job that
+declares none is given the floor. The discount is folded into the charge
+multiplier at placement for an attempt that is *effectively* preemptible —
+the job opted in and no quota entity on its path switched preemption off —
+and is recorded on the attempt, so a later edit reprices nothing already
+placed. Each knob is seeded only while the replicated field still holds its
+booted default, like the retention windows; a multiplier above 1.0, or a
+floor that would end up above the cap, is refused.
+
+A `[[quota_entity]]` may also say `preemptible = false` to create the
+entity with preemption switched off for its whole subtree (the production
+queue whose jobs look exactly like the pre-production runs beside it);
+absent creates it switched on. Like the quota, it only applies when the
+entity is created.
 
 The document may also carry the cluster's **day-0 role bindings**
 ([ADR 0023](../decisions/0023-scoped-role-bindings.md)). A fresh cluster's

@@ -162,6 +162,7 @@ async fn seed_quota(coord: &RunningCoordinator, entity: QuotaEntityId) {
             quota: CostUnits(1_000_000_000_000),
             updated_at: Timestamp::now(),
             actor: None,
+            preemptible: None,
         }))
         .await
         .expect("propose ConfigureQuotaEntity");
@@ -200,6 +201,7 @@ async fn submit(coord: &RunningCoordinator, job: JobId, entity: QuotaEntityId, t
                 abort_requested: None,
                 submitted_by: None,
                 metadata,
+                preemption: Default::default(),
             },
             multiplier: PriorityMultiplier::ONE,
             submitted_at: Timestamp::now(),

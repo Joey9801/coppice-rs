@@ -545,6 +545,7 @@ fn attempt_view(ar: &AttemptRecord) -> dto::AttemptView {
         ended_at: ar.ended_at,
         rate_ucu_per_second: ar.rate_ucu_per_second,
         charged_ucu: ar.charge.amount.0,
+        preemptible: ar.effective_preemptible,
     }
 }
 
@@ -1171,6 +1172,34 @@ fn cost_report(state: &StateMachine, record: &JobRecord) -> dto::CostReport {
     } else {
         (PriorityMultiplier::ONE, priority_multiplier)
     };
+    // The preemptibility discount folds in after it, the same arithmetic
+    // `commit_placements` uses (ADR 0044 §1), for an effectively preemptible
+    // job: as the latest attempt recorded it, or — before any placement —
+    // as a placement now would resolve it.
+    let preemptible = record
+        .attempts
+        .last()
+        .and_then(|id| state.attempts.get(id))
+        .map_or_else(
+            || state.effective_preemptible(&record.spec),
+            |ar| ar.effective_preemptible,
+        );
+    let (preemptible_multiplier, effective_multiplier) = if preemptible {
+        let p = policy.preemptible_multiplier;
+        (p, effective_multiplier.saturating_mul(p))
+    } else {
+        (PriorityMultiplier::ONE, effective_multiplier)
+    };
+    // The component multipliers above are informational, read from the
+    // current policy. The effective figures for a placed job are the ones
+    // its latest attempt froze at placement (`AttemptRecord.multiplier`,
+    // already fully folded), so a later policy edit never reprices it;
+    // before any placement the policy-based fold above is the estimate.
+    let effective_multiplier = record
+        .attempts
+        .last()
+        .and_then(|id| state.attempts.get(id))
+        .map_or(effective_multiplier, |ar| ar.multiplier);
 
     // The charge window: the declared bound, or — for a job with no bound —
     // the renewal interval it is charged in (ADR 0046): the one captured on
@@ -1230,6 +1259,7 @@ fn cost_report(state: &StateMachine, record: &JobRecord) -> dto::CostReport {
         rate_breakdown,
         priority_multiplier: priority_multiplier.0 as f64 / Q32_SCALE,
         unbounded_multiplier: unbounded_multiplier.0 as f64 / Q32_SCALE,
+        preemptible_multiplier: preemptible_multiplier.0 as f64 / Q32_SCALE,
         effective_rate_ucu_per_second,
         charge_window_seconds,
         charge_window_is_default,
@@ -1324,6 +1354,18 @@ pub fn get_job(
                 retry_user_errors: spec.retry.retry_user_errors,
             },
             submitted_by: spec.submitted_by.clone(),
+            preemption: dto::PreemptionView {
+                preemptible: spec.preemption.preemptible,
+                // Resolved at apply, so always present on a stored job; the
+                // policy floor is what an absent notice would have resolved
+                // to.
+                notice_seconds: spec
+                    .preemption
+                    .notice
+                    .unwrap_or(state.policy.preemption_notice_floor)
+                    .as_secs(),
+                notice_signal: spec.preemption.notice_signal.name().to_string(),
+            },
         },
         submitted_at: record.submitted_at,
         state_since: state_since(state, record),
@@ -1426,6 +1468,7 @@ fn quota_entity_node(
         penalty,
         created_at: e.created_at,
         updated_at: e.updated_at,
+        preemptible: e.preemptible,
         queued_count: count.queued,
         running_count: count.running,
     }
@@ -1622,6 +1665,7 @@ mod tests {
             started_at: Some(ts(1000)),
             ended_at: None,
             settlement: None,
+            effective_preemptible: false,
         }
     }
 
@@ -1997,6 +2041,7 @@ mod tests {
                 abort_requested: None,
                 submitted_by: None,
                 metadata: Default::default(),
+                preemption: Default::default(),
             },
             state,
             multiplier: PriorityMultiplier::ONE,
@@ -2729,6 +2774,7 @@ mod tests {
                 usage: coppice_core::quota::UsageState::new(ts(0)),
                 created_at: ts(0),
                 updated_at: ts(0),
+                preemptible: true,
             },
         );
         state.quota_entities.insert(
@@ -2740,6 +2786,7 @@ mod tests {
                 usage: coppice_core::quota::UsageState::new(ts(0)),
                 created_at: ts(0),
                 updated_at: ts(0),
+                preemptible: true,
             },
         );
         let root_job = job_id(1);
@@ -3033,6 +3080,7 @@ mod tests {
                 },
                 created_at: at,
                 updated_at: at,
+                preemptible: true,
             },
         );
     }
@@ -3365,6 +3413,38 @@ mod tests {
     }
 
     #[test]
+    fn get_job_cost_report_does_not_reprice_a_placed_attempt() {
+        let now = ts(1_000_000);
+        let mut state = StateMachine::default();
+        state.policy.cost_weights = REFERENCE_WEIGHTS;
+        state.policy.preemptible_multiplier = PriorityMultiplier(PriorityMultiplier::ONE.0 / 2);
+        let entity = quota_id(1);
+        put_entity(&mut state, entity, None, "e", 1_000_000, 0, now);
+
+        let id = job_id(1);
+        let mut rec = spec_job(id, "img", entity, cpu(1000), 1_000_000);
+        rec.spec.max_runtime = Some(Duration::from_secs(3600));
+        rec.spec.preemption.preemptible = true;
+        let attempt = AttemptId::new();
+        rec.state = JobState::Attempting(attempt);
+        rec.attempts = vec![attempt];
+        state.jobs.insert(id, rec);
+        // Placed under the 0.5 discount: the attempt froze the folded 0.5.
+        let mut ar = test_attempt(attempt, id, NodeId::new(), AttemptState::Running);
+        ar.multiplier = PriorityMultiplier(PriorityMultiplier::ONE.0 / 2);
+        ar.effective_preemptible = true;
+        state.attempts.insert(attempt, ar);
+
+        let before = get_job(&state, &id, now, &no_memos()).unwrap().cost;
+        assert_eq!(before.effective_rate_ucu_per_second, 500_000);
+
+        state.policy.preemptible_multiplier = PriorityMultiplier::ONE;
+        let after = get_job(&state, &id, now, &no_memos()).unwrap().cost;
+        assert_eq!(after.effective_rate_ucu_per_second, 500_000);
+        assert_eq!(after.estimated_ucu, before.estimated_ucu);
+    }
+
+    #[test]
     fn get_job_cost_report_folds_the_unbounded_surcharge() {
         let now = ts(1_000_000);
         let mut state = StateMachine::default();
@@ -3416,6 +3496,9 @@ mod tests {
         rec.state = JobState::Attempting(attempt);
         state.jobs.insert(id, rec);
         let mut a = test_attempt(attempt, id, NodeId::new(), AttemptState::Running);
+        // What placement records for an unbounded job: the surcharge folded in.
+        a.multiplier =
+            PriorityMultiplier::ONE.saturating_mul(state.policy.unbounded_runtime_multiplier);
         a.charge.interval = Some(ChargeInterval {
             seconds: 600,
             paid: 3,
@@ -3627,6 +3710,7 @@ mod tests {
             },
             created_at,
             updated_at: created_at,
+            preemptible: true,
         }
     }
 

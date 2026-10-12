@@ -844,6 +844,7 @@ mod tests {
             started_at: started.then(|| ts(1000)),
             ended_at: None,
             settlement: None,
+            effective_preemptible: false,
         }
     }
 
@@ -863,6 +864,7 @@ mod tests {
                 abort_requested: None,
                 submitted_by: None,
                 metadata: Default::default(),
+                preemption: Default::default(),
             },
             state: JobState::Queued,
             multiplier: PriorityMultiplier::ONE,

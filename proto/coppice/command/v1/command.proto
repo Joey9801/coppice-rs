@@ -351,6 +351,10 @@ message ConfigureQuotaEntity {
   // Who asked (ADR 0023). A scoped admin may configure entities whose
   // position — including any new parent — stays inside their subtree.
   coppice.core.v1.Actor actor = 6;
+  // The entity's preemption switch (ADR 0044 §1); false switches preemption
+  // off for the subtree. Absent leaves an existing entity's switch as it is
+  // and creates a new entity with the default, true.
+  optional bool preemptible = 7;
 }
 
 // Full replacement of the replicated policy. In-flight charge records keep

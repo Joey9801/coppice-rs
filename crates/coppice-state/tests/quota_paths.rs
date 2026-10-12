@@ -20,6 +20,7 @@ fn named(entity: QuotaEntityId, parent: Option<QuotaEntityId>, name: &str) -> Co
         quota: CostUnits(1_000_000),
         updated_at: base_ts(),
         actor: None,
+        preemptible: None,
     })
 }
 
@@ -159,6 +160,7 @@ fn a_quota_only_update_is_accepted_and_preserves_usage_and_created_at() {
             quota: CostUnits(42),
             updated_at: later,
             actor: None,
+            preemptible: None,
         }),
     );
     let e = &sm.quota_entities[&qid(3)];

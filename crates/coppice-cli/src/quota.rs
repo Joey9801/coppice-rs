@@ -101,7 +101,7 @@ pub enum QuotaCommand {
         path: Option<QuotaEntityPath>,
         /// A single-entity TOML file (see the module docs for the schema).
         /// Conflicts with `PATH` and every direct flag below.
-        #[arg(long, conflicts_with_all = ["entity", "quota_ucu"])]
+        #[arg(long, conflicts_with_all = ["entity", "quota_ucu", "preemptible"])]
         file: Option<PathBuf>,
         /// The id to create the entity with when nothing lives at `PATH` yet
         /// (omit to mint one). When something does, it must be this id —
@@ -112,6 +112,12 @@ pub enum QuotaCommand {
         /// `--file` is given.
         #[arg(long, conflicts_with = "file")]
         quota_ucu: Option<u64>,
+        /// The entity's preemption switch (ADR 0044 §1): `false` switches
+        /// preemption off for the entity's whole subtree. Omit to leave an
+        /// existing entity's switch as it is (a new entity starts switched
+        /// on).
+        #[arg(long, conflicts_with = "file")]
+        preemptible: Option<bool>,
         /// Print the server's JSON response instead of the summary line.
         #[arg(long)]
         json: bool,
@@ -129,8 +135,20 @@ pub async fn run(args: QuotaArgs) -> Result<()> {
             file,
             entity,
             quota_ucu,
+            preemptible,
             json,
-        } => configure(&client, file.as_deref(), path, entity, quota_ucu, json).await,
+        } => {
+            configure(
+                &client,
+                file.as_deref(),
+                path,
+                entity,
+                quota_ucu,
+                preemptible,
+                json,
+            )
+            .await
+        }
     }
 }
 
@@ -164,13 +182,14 @@ async fn list(client: &Client, json: bool) -> Result<()> {
 /// under `quota show`, so both renders look like one program. The path is
 /// the primary column (ADR 0045); the id rides alongside rather than `name`
 /// and `parent`, which the path already carries.
-const QUOTA_LIST_HEADERS: [&str; 8] = [
+const QUOTA_LIST_HEADERS: [&str; 9] = [
     "path",
     "id",
     "quota (uCU)",
     "usage (uCU)",
     "over quota",
     "penalty",
+    "preemptible",
     "queued",
     "running",
 ];
@@ -195,9 +214,19 @@ fn quota_node_row(node: &QuotaEntityNode) -> Vec<String> {
         node.usage_ucu.to_string(),
         format_ratio(node.over_quota_ratio),
         format_ratio(node.penalty),
+        yes_no(node.preemptible).to_string(),
         node.queued_count.to_string(),
         node.running_count.to_string(),
     ]
+}
+
+/// A switch as a table cell.
+fn yes_no(value: bool) -> &'static str {
+    if value {
+        "yes"
+    } else {
+        "no"
+    }
 }
 
 /// Format a ratio (`over_quota_ratio` or `penalty`) to two decimals, or as
@@ -267,6 +296,15 @@ fn render_quota_detail(detail: &GetQuotaEntityResponse) -> String {
     kv(&mut out, "usage", &format!("{} uCU", node.usage_ucu));
     kv(&mut out, "over quota", &format_ratio(node.over_quota_ratio));
     kv(&mut out, "penalty", &format_ratio(node.penalty));
+    kv(
+        &mut out,
+        "preemption",
+        if node.preemptible {
+            "on"
+        } else {
+            "off (subtree never preempted)"
+        },
+    );
     kv(&mut out, "created", &node.created_at.to_string());
     kv(&mut out, "updated", &node.updated_at.to_string());
     kv(&mut out, "queued", &node.queued_count.to_string());
@@ -358,6 +396,11 @@ pub struct QuotaEntityFile {
     /// already lives at `path`, or mint a fresh id there.
     #[serde(default)]
     pub id: Option<QuotaEntityId>,
+    /// The entity's preemption switch (ADR 0044 §1), spelled as in the
+    /// formation policy's `[[quota_entity]]`. Absent leaves an existing
+    /// entity's switch unchanged; a new entity starts switched on.
+    #[serde(default)]
+    pub preemptible: Option<bool>,
 }
 
 impl QuotaEntityFile {
@@ -391,22 +434,30 @@ async fn configure(
     path: Option<QuotaEntityPath>,
     entity: Option<QuotaEntityId>,
     quota_ucu: Option<u64>,
+    preemptible: Option<bool>,
     json: bool,
 ) -> Result<()> {
-    let (path, entity, quota_ucu) = match file {
+    let (path, entity, quota_ucu, preemptible) = match file {
         Some(file) => {
             let spec = QuotaEntityFile::load(file)?;
-            (spec.path, spec.id, spec.quota)
+            (spec.path, spec.id, spec.quota, spec.preemptible)
         }
         None => {
             let path = path.context("PATH is required unless --file is given")?;
             let quota_ucu = quota_ucu.context("--quota-ucu is required unless --file is given")?;
-            (path, entity, quota_ucu)
+            (path, entity, quota_ucu, preemptible)
         }
+    };
+    // The switch rides on the request unchanged; `None` stays absent so an
+    // update never silently flips it.
+    let with_switch = |request: ConfigureQuotaEntityRequest| match preemptible {
+        Some(switch) => request.with_preemptible(switch),
+        None => request,
     };
 
     let lookup = resolve_path(client, &path).await?;
     let (request, minted) = build_configure_request(&path, entity, lookup, quota_ucu)?;
+    let request = with_switch(request);
     let outcome = match post_configure(client, &request, json).await {
         // A create refused as a conflict may have lost a race: another caller
         // created this path between the lookup and the write
@@ -419,6 +470,7 @@ async fn configure(
                 PathLookup::NotFound => Err(e),
                 found => {
                     let (request, _) = build_configure_request(&path, entity, found, quota_ucu)?;
+                    let request = with_switch(request);
                     eprintln!(
                         "note: {path} was created concurrently by another caller; updating that \
                          entity ({})",
@@ -612,6 +664,7 @@ mod tests {
             penalty: 1.0,
             created_at: ts(1_000_000),
             updated_at: ts(2_000_000),
+            preemptible: false,
             queued_count: 2,
             running_count: 1,
         }
@@ -666,6 +719,7 @@ mod tests {
             "penalty": null,
             "created_at": "1970-01-01T00:00:01.000000Z",
             "updated_at": "1970-01-01T00:00:02.000000Z",
+            "preemptible": true,
             "queued_count": 1,
             "running_count": 0,
         })
@@ -769,6 +823,29 @@ mod tests {
         assert!(rendered.contains("over quota      unbounded"), "{rendered}");
         assert!(rendered.contains("penalty         unbounded"), "{rendered}");
         assert!(!rendered.contains("inf"), "{rendered}");
+    }
+
+    #[test]
+    fn quota_list_and_show_render_the_preemption_switch() {
+        let node = sample_node(dto_quota_id(1), None);
+        let client_node: QuotaEntityNode = to_client(node.clone());
+        let list = render_quota_list(std::slice::from_ref(&client_node));
+        assert!(list.contains("preemptible"), "{list}");
+        let row = list.lines().find(|l| l.contains("acme/team-a")).unwrap();
+        assert!(row.contains(" no "), "{row}");
+
+        let detail: GetQuotaEntityResponse = serde_json::from_value(serde_json::json!({
+            "entity": serde_json::to_value(&client_node).unwrap(),
+            "chain": [],
+            "children": [],
+            "stats": serde_json::to_value(sample_stats()).unwrap(),
+        }))
+        .unwrap();
+        let rendered = render_quota_detail(&detail);
+        assert!(
+            rendered.contains("preemption      off (subtree never preempted)"),
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -1048,6 +1125,7 @@ mod tests {
             Some(quota_path("acme/team-b")),
             None,
             Some(500),
+            Some(false),
             false,
         )
         .await
@@ -1058,6 +1136,7 @@ mod tests {
         assert_eq!(received[0].entity, existing);
         assert_eq!(received[0].name, "team-b");
         assert_eq!(received[0].quota_ucu, 500);
+        assert_eq!(received[0].preemptible, Some(false));
     }
 
     #[tokio::test]
@@ -1073,6 +1152,7 @@ mod tests {
             Some(quota_path("acme/team-new")),
             None,
             Some(500),
+            None,
             false,
         )
         .await
@@ -1081,6 +1161,7 @@ mod tests {
         let received = captured.lock().unwrap();
         assert_eq!(received.len(), 1);
         assert_eq!(received[0].name, "team-new");
+        assert_eq!(received[0].preemptible, None, "absent switch stays absent");
     }
 
     #[tokio::test]
@@ -1095,9 +1176,17 @@ mod tests {
         let mut file = NamedTempFile::new().unwrap();
         file.write_all(toml_body.as_bytes()).unwrap();
 
-        configure(&client(&base), Some(file.path()), None, None, None, false)
-            .await
-            .expect("configure --file succeeds");
+        configure(
+            &client(&base),
+            Some(file.path()),
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .expect("configure --file succeeds");
 
         let received = captured.lock().unwrap();
         assert_eq!(received.len(), 1);
@@ -1122,6 +1211,7 @@ mod tests {
             Some(quota_path("acme/team-b")),
             Some(quota_id(6)),
             Some(500),
+            None,
             false,
         )
         .await
@@ -1203,6 +1293,7 @@ mod tests {
             Some(quota_path("acme/team-new")),
             None,
             Some(500),
+            None,
             false,
         )
         .await
@@ -1246,6 +1337,7 @@ mod tests {
             Some(quota_path("acme/x")),
             None,
             Some(1),
+            None,
             false,
         )
         .await

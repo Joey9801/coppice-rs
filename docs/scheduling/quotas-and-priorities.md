@@ -70,6 +70,14 @@ cost (µCU)   = ⌊rate × runtime_seconds × priority_multiplier / 2³²⌋
   runtime; see
   [ADR 0029](../decisions/0029-runtime-declaration-incentives.md) for the
   break-even and the reasoning.
+- An attempt that is *effectively preemptible* — its job declared
+  `[preemption] preemptible = true` and no quota entity on its path has
+  preemption switched off — then folds in the discount the same way,
+  `m' = ⌊m' × preemptible_multiplier / 2³²⌋` (replicated policy, Q32.32,
+  ≤ 1.0, default 0.75), multiplying with the unbounded surcharge when both
+  apply. The verdict and the folded multiplier are recorded on the attempt
+  at placement, so a later policy or entity edit reprices nothing already
+  placed ([ADR 0044](../decisions/0044-job-preemption-and-spot-capacity.md)).
 - **Unbounded jobs are charged by interval, not for a synthetic runtime.**
   With no `max_runtime` there is nothing to charge up front for, so
   placement charges **one interval**: `rate × interval_s × m'`, where

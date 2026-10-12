@@ -10,6 +10,7 @@ use coppice_core::env::JobEnv;
 use coppice_core::job::{AbortRequest, Job, JobState, RetryPolicy};
 use coppice_core::metadata::JobMetadata;
 use coppice_core::node::{HostFacts, Node};
+use coppice_core::preemption::{NoticeSignal, PreemptionSpec};
 use coppice_core::quota::{
     ChargeInterval, ChargeRecord, CostUnits, CostWeights, DecayPolicy, PriorityMultiplier,
     Settlement, TrueUp, UsageState,
@@ -18,7 +19,7 @@ use coppice_core::resource::Resources;
 
 use coppice_core::time::Duration;
 
-use super::{positive_duration, req, timestamp, ConvertError};
+use super::{nonnegative_duration, positive_duration, req, timestamp, ConvertError};
 use crate::pb::core::v1 as pb;
 
 // ---- Ids ----
@@ -236,6 +237,7 @@ impl From<&Job> for pb::Job {
             submitted_by: job.submitted_by.clone(),
             metadata: metadata_to_pb(&job.metadata),
             env: env_to_pb(&job.env),
+            preemption: Some((&job.preemption).into()),
         }
     }
 }
@@ -279,6 +281,69 @@ impl TryFrom<pb::Job> for Job {
             submitted_by: job.submitted_by,
             metadata: metadata_from_pb(job.metadata, "Job.metadata")?,
             env: env_from_pb(job.env, "Job.env")?,
+            // Absent is the all-defaults table (see job.proto).
+            preemption: job
+                .preemption
+                .map(TryInto::try_into)
+                .transpose()?
+                .unwrap_or_default(),
+        })
+    }
+}
+
+// ---- Preemption declarations (ADR 0044 §1) ----
+
+/// The `NoticeSignal` domain enum ↔ its closed proto enum.
+pub fn notice_signal_to_pb(signal: NoticeSignal) -> pb::NoticeSignal {
+    match signal {
+        NoticeSignal::Sighup => pb::NoticeSignal::Sighup,
+        NoticeSignal::Sigint => pb::NoticeSignal::Sigint,
+        NoticeSignal::Sigusr1 => pb::NoticeSignal::Sigusr1,
+        NoticeSignal::Sigusr2 => pb::NoticeSignal::Sigusr2,
+        NoticeSignal::Sigterm => pb::NoticeSignal::Sigterm,
+    }
+}
+
+/// Decode a `NoticeSignal` from its `i32` wire value. The enum is closed:
+/// `UNSPECIFIED` and any unknown value are rejected, never defaulted.
+pub fn notice_signal_from_pb(
+    value: i32,
+    field: &'static str,
+) -> Result<NoticeSignal, ConvertError> {
+    match pb::NoticeSignal::try_from(value) {
+        Ok(pb::NoticeSignal::Sighup) => Ok(NoticeSignal::Sighup),
+        Ok(pb::NoticeSignal::Sigint) => Ok(NoticeSignal::Sigint),
+        Ok(pb::NoticeSignal::Sigusr1) => Ok(NoticeSignal::Sigusr1),
+        Ok(pb::NoticeSignal::Sigusr2) => Ok(NoticeSignal::Sigusr2),
+        Ok(pb::NoticeSignal::Sigterm) => Ok(NoticeSignal::Sigterm),
+        _ => Err(ConvertError::UnknownEnum { field, value }),
+    }
+}
+
+impl From<&PreemptionSpec> for pb::PreemptionSpec {
+    fn from(spec: &PreemptionSpec) -> Self {
+        pb::PreemptionSpec {
+            preemptible: spec.preemptible,
+            notice_us: spec.notice.map(|d| d.as_micros() as u64),
+            notice_signal: notice_signal_to_pb(spec.notice_signal) as i32,
+        }
+    }
+}
+
+impl TryFrom<pb::PreemptionSpec> for PreemptionSpec {
+    type Error = ConvertError;
+
+    fn try_from(spec: pb::PreemptionSpec) -> Result<Self, ConvertError> {
+        Ok(PreemptionSpec {
+            preemptible: spec.preemptible,
+            notice: spec
+                .notice_us
+                .map(|us| nonnegative_duration(us, "PreemptionSpec.notice_us"))
+                .transpose()?,
+            notice_signal: notice_signal_from_pb(
+                spec.notice_signal,
+                "PreemptionSpec.notice_signal",
+            )?,
         })
     }
 }
