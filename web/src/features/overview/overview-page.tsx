@@ -95,7 +95,7 @@ export function OverviewPage() {
           value={capacity.nodes.total}
           hint={
             <>
-              {capacity.nodes.schedulable} schedulable &middot;{' '}
+              {capacity.nodes.open} open &middot;{' '}
               <span className={cn(capacity.nodes.lost > 0 && 'text-red-600 dark:text-red-400')}>
                 {capacity.nodes.lost} lost
               </span>

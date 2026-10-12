@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { NodeUtilization, Resources } from '@/api/types'
-import { nodeCapacityHistory } from './lib'
+import { drainStatus, nodeCapacityHistory } from './lib'
 
 function res(cpuMillis: number): Resources {
   return { cpuMillis, memoryBytes: cpuMillis * 1024, diskBytes: cpuMillis * 2 }
@@ -39,5 +39,23 @@ describe('nodeCapacityHistory', () => {
 
   it('is empty when the node has no samples yet', () => {
     expect(nodeCapacityHistory({ capacity: res(8_000), samples: [] })).toEqual([])
+  })
+})
+
+describe('drainStatus', () => {
+  const now = new Date(1_720_000_000_000)
+  const requestedAt = new Date(1_719_999_000_000)
+
+  it('reports a bounded drain by its horizon', () => {
+    const horizon = new Date(now.getTime() + 2 * 3600 * 1000)
+    expect(drainStatus({ requestedAt, horizon, complete: false }, now)).toBe('empty in 2h')
+  })
+
+  it('reports an unbounded drain', () => {
+    expect(drainStatus({ requestedAt, horizon: null, complete: false }, now)).toBe('unbounded')
+  })
+
+  it('reports a complete drain', () => {
+    expect(drainStatus({ requestedAt, horizon: null, complete: true }, now)).toBe('complete')
   })
 })

@@ -315,7 +315,7 @@ describe('MockWorld construction', () => {
     const node = interrupted[0]!
     expect(node.preemptibleOnly).toBe(true)
     // ADR 0044 §5: an interrupted agent announces its drain with the deadline.
-    expect(node.draining).toBe(true)
+    expect(node.agentDraining).toBe(true)
     expect(node.interruptionDeadline!.getTime()).toBeGreaterThan(NOW_US / 1000)
     // Every attempt still running there is preempting for the interruption.
     for (const a of world.buildNodeDetail(node.id).activeAttempts) {

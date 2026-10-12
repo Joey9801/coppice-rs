@@ -53,7 +53,7 @@ describe('getClusterOverview', () => {
           ],
         },
         capacity: {
-          nodes: { total: 2, schedulable: 2, lost: 0 },
+          nodes: { total: 2, open: 2, lost: 0 },
           capacity: { cpu_millis: 1000, memory_bytes: 2, disk_bytes: 3 },
           allocated: { cpu_millis: 100, memory_bytes: 1, disk_bytes: 1 },
           used: { cpu_millis: 50, memory_bytes: 0, disk_bytes: 0 },
@@ -109,7 +109,7 @@ describe('getClusterOverview', () => {
           history: [],
         },
         capacity: {
-          nodes: { total: 1, schedulable: 1, lost: 0 },
+          nodes: { total: 1, open: 1, lost: 0 },
           capacity: { cpu_millis: 1000, memory_bytes: 2, disk_bytes: 3 },
           allocated: { cpu_millis: 0, memory_bytes: 0, disk_bytes: 0 },
           used: null,
@@ -694,8 +694,8 @@ describe('platform terminations (ADR 0044 §2–§5)', () => {
       allocated: { cpu_millis: 0, memory_bytes: 0, disk_bytes: 0 },
       used: null,
       labels: {},
-      schedulable: true,
-      draining: true,
+      agent_draining: true,
+      drain: null,
       preemptible_only: true,
       interruption_deadline: deadline,
       health: 'healthy',
@@ -846,8 +846,8 @@ describe('preemption fields (ADR 0044)', () => {
             allocated: { cpu_millis: 0, memory_bytes: 0, disk_bytes: 0 },
             used: null,
             labels: {},
-            schedulable: true,
-            draining: false,
+            agent_draining: false,
+            drain: null,
             preemptible_only: true,
             interruption_deadline: null,
             health: 'healthy',
@@ -861,6 +861,58 @@ describe('preemption fields (ADR 0044)', () => {
     )
     const nodes = await createRealClient().listNodes()
     expect(nodes[0]!.preemptibleOnly).toBe(true)
+  })
+
+  it('maps the operator drain record and the agent announcement separately', async () => {
+    const node = (id: string, extra: Record<string, unknown>) => ({
+      id: `node-00000000-0000-0000-0000-00000000000${id}`,
+      capacity: { cpu_millis: 1, memory_bytes: 1, disk_bytes: 1 },
+      allocated: { cpu_millis: 0, memory_bytes: 0, disk_bytes: 0 },
+      used: null,
+      labels: {},
+      agent_draining: false,
+      drain: null,
+      preemptible_only: false,
+      interruption_deadline: null,
+      health: 'healthy',
+      epoch: 1,
+      last_heartbeat: null,
+      running_count: 0,
+      accruing_count: 0,
+      ...extra,
+    })
+    const requested = '2026-10-12T10:00:00Z'
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        nodes: [
+          node('1', {}),
+          node('2', {
+            drain: { requested_at: requested, horizon: '2026-10-12T12:00:00Z', complete: false },
+          }),
+          node('3', { drain: { requested_at: requested, horizon: null, complete: false } }),
+          node('4', {
+            agent_draining: true,
+            drain: { requested_at: requested, horizon: null, complete: true },
+          }),
+          node('5', { agent_draining: true }),
+        ],
+      }),
+    )
+    const nodes = await createRealClient().listNodes()
+    expect(nodes[0]).toMatchObject({ drain: null, agentDraining: false })
+    expect(nodes[1]!.drain).toEqual({
+      requestedAt: new Date(requested),
+      horizon: new Date('2026-10-12T12:00:00Z'),
+      complete: false,
+    })
+    expect(nodes[2]!.drain).toEqual({
+      requestedAt: new Date(requested),
+      horizon: null,
+      complete: false,
+    })
+    expect(nodes[3]).toMatchObject({ agentDraining: true })
+    expect(nodes[3]!.drain).toMatchObject({ horizon: null, complete: true })
+    expect(nodes[4]).toMatchObject({ drain: null, agentDraining: true })
   })
 
   it('sends the entity preemption switch only when set', async () => {

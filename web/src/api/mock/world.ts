@@ -50,6 +50,7 @@ import type {
   HostFacts,
   NodeDetail,
   NodeHealth,
+  NodeDrain,
   NodeSummary,
   NodeUtilization,
   OutcomeClass,
@@ -323,13 +324,14 @@ interface MNode {
   id: string
   capacity: Resources
   labels: Record<string, string>
-  schedulable: boolean
+  /** Operator drain record (ADR 0044 §5); null when none. */
+  drain: NodeDrain | null
+  /** The agent's own shutdown announcement. */
+  agentDraining: boolean
   /** Spot capacity (ADR 0044 §4): hosts only effectively preemptible attempts. */
   preemptibleOnly: boolean
   /** Provider interruption deadline (ADR 0044 §5); an interrupted node takes no new work. */
   interruptionDeadlineUs: number | null
-  /** The agent's own drain announcement, distinct from the admin cordon in `schedulable`. */
-  draining: boolean
   health: NodeHealth
   epoch: number
   lastHeartbeatUs: number | null
@@ -860,7 +862,22 @@ export class MockWorld {
       const memPerCore = pool === 'highmem' ? 12 : pool === 'compute' ? 2 : 4
       const memGiB = cores * memPerCore
       const diskTiB = this.rng.range(0.5, 8)
-      const draining = i === 3 // one node draining (schedulable false, still runs work)
+      // Operator drains: i=3 bounded by a horizon (admits backfill only), i=8
+      // unbounded (live work with no enforced bound), i=14 complete (empty).
+      // i=11 is the agent's own shutdown announcement; i=14 has both.
+      const drain: NodeDrain | null =
+        i === 3
+          ? {
+              requestedAt: at(this.nowUs - 20 * MINUTE_US),
+              horizon: at(this.nowUs + 2 * HOUR_US),
+              complete: false,
+            }
+          : i === 8
+            ? { requestedAt: at(this.nowUs - HOUR_US), horizon: null, complete: false }
+            : i === 14
+              ? { requestedAt: at(this.nowUs - 3 * HOUR_US), horizon: null, complete: true }
+              : null
+      const agentDraining = i === 11 || i === 14
       const lost = i === 7 // one node Lost (stale heartbeat)
       const noSampler = i === 10 // one node with no usage sampler wired up
       const spot = i === 5 || i === 12 // two spot-only nodes (preemptible work only)
@@ -890,10 +907,10 @@ export class MockWorld {
           agentVersion: '0.0.1',
         },
         labels: { zone: this.rng.pick(zones), pool },
-        schedulable: !draining,
+        drain,
+        agentDraining,
         preemptibleOnly: spot,
         interruptionDeadlineUs: null,
-        draining: false,
         health: lost ? 'Lost' : 'Healthy',
         epoch: lost ? this.rng.int(4, 9) : this.rng.int(1, 3),
         lastHeartbeatUs: lost
@@ -932,11 +949,15 @@ export class MockWorld {
   }
 
   /**
-   * Placeable nodes = healthy and not agent-draining (an admin-cordoned node
-   * still hosts existing work; an interrupted agent drains, ADR 0044 §5).
+   * Placeable nodes = healthy and not interrupted (an interrupted agent
+   * drains and admits nothing, ADR 0044 §5). The mock is looser than the
+   * server for the other drain facts: a drained or agent-draining node is
+   * still placed on, which keeps the seeded job mix stable.
    */
   private placeableNodes(): MNode[] {
-    return [...this.nodes.values()].filter((n) => n.health === 'Healthy' && !n.draining)
+    return [...this.nodes.values()].filter(
+      (n) => n.health === 'Healthy' && n.interruptionDeadlineUs === null,
+    )
   }
 
   private nodeFreeCapacity(): Map<string, Resources> {
@@ -1369,7 +1390,7 @@ export class MockWorld {
       const deadlineUs = this.nowUs + 2 * MINUTE_US
       interrupted.interruptionDeadlineUs = deadlineUs
       // The agent drains as it reports the interruption (ADR 0044 §5).
-      interrupted.draining = true
+      interrupted.agentDraining = true
       const noticedUs = this.nowUs - 20 * SECOND_US
       for (const { job, attempt } of running) {
         if (attempt.node !== interrupted.id) continue
@@ -2329,7 +2350,7 @@ export class MockWorld {
 
   /**
    * Aggregate capacity/allocated/used across all nodes for one instant.
-   * `capacity` excludes Lost nodes (they contribute no schedulable
+   * `capacity` excludes Lost nodes (they contribute no open
    * capacity); `allocated` and `used` sum across every node, mirroring
    * `nodeSummary`'s per-node fields. `used` is `null` only when no node is
    * currently reporting usage — never a fabricated zero — and
@@ -2365,18 +2386,18 @@ export class MockWorld {
   }
 
   buildClusterOverview(): ClusterOverview {
-    let schedulable = 0
+    let open = 0
     let lost = 0
     for (const node of this.nodes.values()) {
       if (node.health === 'Lost') lost += 1
-      else if (node.schedulable) schedulable += 1
+      else if (node.drain === null && !node.agentDraining) open += 1
     }
     const snapshot = this.capacitySnapshot()
     return {
       clusterId: this.clusterId,
       queue: this.buildQueueStats(),
       capacity: {
-        nodes: { total: this.nodes.size, schedulable, lost },
+        nodes: { total: this.nodes.size, open, lost },
         capacity: snapshot.capacity,
         allocated: snapshot.allocated,
         used: snapshot.used,
@@ -3268,8 +3289,8 @@ export class MockWorld {
       allocated: this.nodeAllocated(node.id),
       used: this.nodeUsedOrNull(node.id),
       labels: { ...node.labels },
-      schedulable: node.schedulable,
-      draining: node.draining,
+      drain: node.drain === null ? null : { ...node.drain },
+      agentDraining: node.agentDraining,
       preemptibleOnly: node.preemptibleOnly,
       interruptionDeadline:
         node.interruptionDeadlineUs === null ? null : at(node.interruptionDeadlineUs),

@@ -41,6 +41,7 @@ import {
   type NodeDetail,
   type NodeHealth,
   type NodeId,
+  type NodeDrain,
   type NodeSummary,
   type NodeUtilization,
   type OutcomeClass,
@@ -641,7 +642,7 @@ interface WireGetJobTimelineResponse {
 
 interface WireNodeCounts {
   total: number
-  schedulable: number
+  open: number
   lost: number
 }
 
@@ -1193,14 +1194,28 @@ function getJobLogs(id: JobId, cursor: string | null, request: LogRequest): Prom
 
 type WireNodeHealth = 'unknown' | 'healthy' | 'lost'
 
+interface WireNodeDrain {
+  requested_at: string
+  horizon: string | null
+  complete: boolean
+}
+
+function mapNodeDrain(d: WireNodeDrain): NodeDrain {
+  return {
+    requestedAt: toDate(d.requested_at),
+    horizon: toDateOrNull(d.horizon),
+    complete: d.complete,
+  }
+}
+
 interface WireNodeSummary {
   id: NodeId
   capacity: WireResources
   allocated: WireResources
   used: WireResources | null
   labels: Record<string, string>
-  schedulable: boolean
-  draining?: boolean
+  agent_draining: boolean
+  drain: WireNodeDrain | null
   preemptible_only: boolean
   interruption_deadline: string | null
   health: WireNodeHealth
@@ -1217,8 +1232,8 @@ function mapNodeSummary(n: WireNodeSummary): NodeSummary {
     allocated: mapResources(n.allocated),
     used: mapResourcesOrNull(n.used),
     labels: n.labels,
-    schedulable: n.schedulable,
-    draining: n.draining ?? false,
+    drain: n.drain === null ? null : mapNodeDrain(n.drain),
+    agentDraining: n.agent_draining,
     preemptibleOnly: n.preemptible_only,
     interruptionDeadline: toDateOrNull(n.interruption_deadline),
     health: snakeToPascal(n.health) as NodeHealth,
