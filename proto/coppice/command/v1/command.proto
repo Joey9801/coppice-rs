@@ -65,6 +65,7 @@ message Command {
 
     EvictTerminalJobs evict_terminal_jobs = 60;
     EvictNodes evict_nodes = 61;
+    RenewIntervalCharges renew_interval_charges = 62;
 
     ConfigureQuotaEntity configure_quota_entity = 70;
     UpdatePolicy update_policy = 71;
@@ -314,6 +315,27 @@ message EvictNodes {
   // Who asked (ADR 0023). Absent on the retention GC's own proposals; node
   // removal is a cluster verb, an unscoped operator or admin binding.
   coppice.core.v1.Actor actor = 3;
+}
+
+// Charge running unbounded attempts for the runtime they are about to consume
+// (ADR 0046). Proposed by leader housekeeping for every Running attempt whose
+// charge is interval-based and whose runtime has reached the end of the
+// intervals it has paid for. Each item carries the paid count the proposer
+// observed as a compare-and-set token, so duplicate proposals across leader
+// changes are no-ops; items for attempts that are gone, not running, already
+// renewed, or not yet due are skipped.
+message RenewIntervalCharges {
+  repeated IntervalRenewal renewals = 1;
+  // Charge timestamp for every renewal, and the instant each attempt's
+  // runtime is measured against to decide how many intervals are due.
+  int64 proposed_at_us = 2;
+}
+
+// One attempt's renewal within RenewIntervalCharges.
+message IntervalRenewal {
+  coppice.core.v1.AttemptId attempt = 1;
+  // The ChargeInterval.paid count the proposer observed.
+  uint32 paid = 2;
 }
 
 // Create or update one quota entity. Updates preserve accumulated usage —

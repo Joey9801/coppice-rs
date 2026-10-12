@@ -837,6 +837,7 @@ mod tests {
                 amount: CostUnits(0),
                 charged_at: ts(0),
                 refund_fraction_milli: FULL_REFUND_MILLI,
+                interval: None,
             },
             rate_ucu_per_second: 0,
             multiplier: PriorityMultiplier::ONE,

@@ -71,6 +71,7 @@ pub enum Command {
     // Housekeeping.
     EvictTerminalJobs(EvictTerminalJobs),
     EvictNodes(EvictNodes),
+    RenewIntervalCharges(RenewIntervalCharges),
     // Admin / policy.
     ConfigureQuotaEntity(ConfigureQuotaEntity),
     UpdatePolicy(UpdatePolicy),
@@ -117,6 +118,7 @@ impl Command {
             Command::SetNodeDraining(c) => c.at,
             Command::EvictTerminalJobs(c) => c.evicted_at,
             Command::EvictNodes(c) => c.evicted_at,
+            Command::RenewIntervalCharges(c) => c.proposed_at,
             Command::ConfigureQuotaEntity(c) => c.updated_at,
             Command::UpdatePolicy(c) => c.updated_at,
             Command::UpdateAuthorization(c) => c.updated_at,
@@ -406,6 +408,34 @@ pub struct EvictNodes {
     /// for the retention GC's own proposals.
     pub actor: Option<Actor>,
     pub evicted_at: Timestamp,
+}
+
+/// Charge running unbounded attempts for the runtime they are about to
+/// consume (ADR 0046).
+///
+/// Proposed by leader housekeeping for every `Running` attempt whose charge
+/// is interval-based and whose runtime has reached the end of the intervals
+/// it has paid for. Each item names the paid count the proposer observed, a
+/// compare-and-set token: apply charges only when the record still shows that
+/// count, so a duplicate proposal across a leader change is a no-op. Items
+/// for attempts that are gone, terminal, not running, already renewed, or
+/// not yet due are skipped silently; an item naming a bounded attempt is a
+/// proposer bug and rejects the whole command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenewIntervalCharges {
+    pub renewals: Vec<IntervalRenewal>,
+    /// Charge timestamp for every renewal in the batch, and the instant
+    /// apply measures each attempt's runtime against to decide how many
+    /// intervals are due.
+    pub proposed_at: Timestamp,
+}
+
+/// One attempt's interval renewal within [`RenewIntervalCharges`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IntervalRenewal {
+    pub attempt: AttemptId,
+    /// The `ChargeInterval::paid` count the proposer observed.
+    pub paid: u32,
 }
 
 /// Create or update one quota entity.

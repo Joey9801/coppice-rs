@@ -240,6 +240,19 @@ fn every_command() -> Vec<Command> {
             jobs: vec![jid(1), jid(2)],
             evicted_at: ts(),
         }),
+        Command::RenewIntervalCharges(RenewIntervalCharges {
+            renewals: vec![
+                IntervalRenewal {
+                    attempt: AttemptId(Uuid::from_u128(7)),
+                    paid: 1,
+                },
+                IntervalRenewal {
+                    attempt: AttemptId(Uuid::from_u128(8)),
+                    paid: 12,
+                },
+            ],
+            proposed_at: ts(),
+        }),
         Command::EvictNodes(EvictNodes {
             nodes: vec![node, NodeId(Uuid::from_u128(5))],
             evicted_at: ts(),
@@ -685,6 +698,7 @@ fn charge_record_refund_fraction_roundtrips() {
         amount: CostUnits(42_000),
         charged_at: ts(),
         refund_fraction_milli: 750,
+        interval: None,
     };
     let encoded: pb::core::v1::ChargeRecord = record.into();
     assert_eq!(encoded.refund_fraction_milli, Some(750));
@@ -700,9 +714,87 @@ fn charge_record_absent_refund_fraction_is_full_refund() {
         amount_ucu: 42_000,
         charged_at_us: ts().as_micros(),
         refund_fraction_milli: None,
+        interval: None,
     };
     let back: coppice_core::quota::ChargeRecord = encoded.try_into().expect("decodes");
     assert_eq!(back.refund_fraction_milli, 1000);
+}
+
+#[test]
+fn charge_record_interval_roundtrips() {
+    // ADR 0046: an unbounded job's interval-charging state survives the
+    // snapshot boundary unchanged, and a bounded job's absence stays absent.
+    use coppice_core::quota::{ChargeInterval, ChargeRecord};
+    for interval in [
+        None,
+        Some(ChargeInterval {
+            seconds: 1800,
+            paid: 7,
+            last_tranche: CostUnits(12_000),
+            prior_charged_at: Timestamp::from_micros(TS_US - 1_800_000_000)
+                .expect("fixture timestamp is in range"),
+        }),
+    ] {
+        let record = ChargeRecord {
+            amount: CostUnits(42_000),
+            charged_at: ts(),
+            refund_fraction_milli: 1000,
+            interval,
+        };
+        let encoded: pb::core::v1::ChargeRecord = record.into();
+        assert_eq!(encoded.interval.is_some(), interval.is_some());
+        if let Some(i) = &encoded.interval {
+            assert_eq!(i.last_tranche_ucu, 12_000);
+            assert_eq!(i.prior_charged_at_us, TS_US - 1_800_000_000);
+        }
+        let back: ChargeRecord = encoded.try_into().expect("decodes");
+        assert_eq!(back, record);
+    }
+}
+
+#[test]
+fn charge_record_rejects_a_degenerate_interval() {
+    for (seconds, paid, prior_charged_at_us, field) in [
+        (0, 1, TS_US, "ChargeInterval.seconds"),
+        (1800, 0, TS_US, "ChargeInterval.paid"),
+        (1800, 1, i64::MAX, "ChargeInterval.prior_charged_at_us"),
+    ] {
+        let encoded = pb::core::v1::ChargeRecord {
+            amount_ucu: 42_000,
+            charged_at_us: ts().as_micros(),
+            refund_fraction_milli: Some(1000),
+            interval: Some(pb::core::v1::ChargeInterval {
+                seconds,
+                paid,
+                last_tranche_ucu: 42_000,
+                prior_charged_at_us,
+            }),
+        };
+        match coppice_core::quota::ChargeRecord::try_from(encoded) {
+            Err(ConvertError::Invalid { field: f, .. }) => assert_eq!(f, field),
+            other => panic!("expected an invalid {field}, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn policy_config_unbounded_charge_interval_roundtrips() {
+    let policy = PolicyConfig {
+        unbounded_charge_interval_s: 600,
+        ..PolicyConfig::default()
+    };
+    let encoded: pb::core::v1::PolicyConfig = (&policy).into();
+    assert_eq!(encoded.unbounded_charge_interval_s, Some(600));
+    let back: PolicyConfig = encoded.try_into().expect("policy must convert");
+    assert_eq!(back, policy);
+}
+
+#[test]
+fn policy_config_absent_unbounded_charge_interval_is_the_documented_default() {
+    let mut encoded: pb::core::v1::PolicyConfig = (&PolicyConfig::default()).into();
+    encoded.unbounded_charge_interval_s = None;
+    let back: PolicyConfig = encoded.try_into().expect("policy must convert");
+    assert_eq!(back.unbounded_charge_interval_s, 1800);
 }
 
 #[test]

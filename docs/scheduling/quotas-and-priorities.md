@@ -70,6 +70,21 @@ cost (µCU)   = ⌊rate × runtime_seconds × priority_multiplier / 2³²⌋
   runtime; see
   [ADR 0029](../decisions/0029-runtime-declaration-incentives.md) for the
   break-even and the reasoning.
+- **Unbounded jobs are charged by interval, not for a synthetic runtime.**
+  With no `max_runtime` there is nothing to charge up front for, so
+  placement charges **one interval**: `rate × interval_s × m'`, where
+  `interval_s` is replicated policy `unbounded_charge_interval_s` (default
+  1800, i.e. 30 min; must be > 0). The interval is captured on the attempt's
+  charge record (`interval { seconds, paid = 1, .. }`), so a policy edit never
+  re-chunks an in-flight attempt. While the attempt is `Running`, leader
+  housekeeping proposes `RenewIntervalCharges`, which charges each further
+  interval (at the recorded `m'`) as it comes due; the record's `amount` is
+  cumulative, `charged_at` is the time of the latest charge, and the record
+  also keeps that charge's amount (`last_tranche`) and the charge time
+  before it (`prior_charged_at`) for the true-up below. A job that
+  runs for a day is thus charged for a day, not a fixed 24 h up front, and
+  a job that dies early holds at most one interval's unused charge. See
+  [ADR 0046](../decisions/0046-interval-charging-for-unbounded-jobs.md).
 
 ## Decayed usage
 
@@ -112,8 +127,18 @@ difference is settled:
   reached `Running`, whenever the outcome's `OutcomeClass` is `Platform`
   (`Revoked`, `NodeLost`, `AgentError`, platform-side pull/start failures),
   or when the job declared no `max_runtime` (the unbounded multiplier above
-  already prices that case; retaining against the synthetic
-  `default_charge_runtime_s` charge would price it twice). Otherwise — the
+  already prices that case; retaining against the interval charges would
+  price it twice). For an unbounded job the unused part — usually less
+  than one interval — is refunded in full: up to `last_tranche` of it
+  decays from `charged_at` (the latest charge), and any remainder from
+  `prior_charged_at`. The remainder appears when an attempt exits just
+  before a renewal but its outcome is applied after it, so the unused part
+  reaches back into the previous charge. This is exact unless the report
+  delay reaches back past the previous charge too, where the oldest part
+  slightly over-refunds; keeping every tranche's timestamp would grow the
+  record without bound for a long runner. If
+  the job ran past its paid intervals (renewal lag, at most one
+  housekeeping tick) the surcharge path below bills the excess. Otherwise — the
   attempt ran and ended in `Success`, `UserError`, or `UserRequest` — `f` is
   the recorded fraction, and the gap between bound and actual is priced as
   the user's own declaration error.

@@ -9,7 +9,7 @@
 
 use std::collections::BTreeSet;
 
-use coppice_core::quota::{CostUnits, PriorityMultiplier};
+use coppice_core::quota::{CostUnits, PriorityMultiplier, DEFAULT_UNBOUNDED_CHARGE_INTERVAL_S};
 use coppice_core::resource::Resources;
 use coppice_core::time::Duration;
 use coppice_state::authz::{Actor, Binding, Role, Subject};
@@ -17,12 +17,12 @@ use coppice_state::command::JobMetadataUpdate;
 use coppice_state::command::{
     AbortJob, AllocationSpec, BindMachineIdentity, BumpClusterVersion, Command, CommitPlacements,
     ConfigureQuotaEntity, ConfirmKeyPossession, ConfirmStagedKeyPossession, DeclareNodeLost,
-    DispatchAttempt, EvictNodes, EvictTerminalJobs, LostAttempt, MintEnrollToken, Placement,
-    RebindMachineAddress, ReconcileNode, RecordAttemptExited, RecordAttemptOutcome,
+    DispatchAttempt, EvictNodes, EvictTerminalJobs, IntervalRenewal, LostAttempt, MintEnrollToken,
+    Placement, RebindMachineAddress, ReconcileNode, RecordAttemptExited, RecordAttemptOutcome,
     RecordAttemptStarted, RecordCaCertificate, RecordEnrolledIdentity, RecordKeyTransferIntent,
-    RecordStagedKeyTransferIntent, RegisterNode, RetireMachineBinding, RevokeEnrollToken,
-    RevokeIdentity, SetNodeDraining, SetNodeSchedulable, SubmitJob, UpdateAuthorization,
-    UpdateJobMetadata, UpdatePolicy,
+    RecordStagedKeyTransferIntent, RegisterNode, RenewIntervalCharges, RetireMachineBinding,
+    RevokeEnrollToken, RevokeIdentity, SetNodeDraining, SetNodeSchedulable, SubmitJob,
+    UpdateAuthorization, UpdateJobMetadata, UpdatePolicy,
 };
 use coppice_state::{
     CaCertBundle, EnrollRole, PolicyConfig, RevokedIdentity, DEFAULT_GROUPS_CLAIM,
@@ -58,6 +58,7 @@ pub fn command_to_pb(command: &Command, cluster_version: u32) -> pb::Command {
         Command::SetNodeDraining(c) => Body::SetNodeDraining(c.into()),
         Command::EvictTerminalJobs(c) => Body::EvictTerminalJobs(c.into()),
         Command::EvictNodes(c) => Body::EvictNodes(c.into()),
+        Command::RenewIntervalCharges(c) => Body::RenewIntervalCharges(c.into()),
         Command::ConfigureQuotaEntity(c) => Body::ConfigureQuotaEntity(c.into()),
         Command::UpdatePolicy(c) => Body::UpdatePolicy(c.into()),
         Command::UpdateAuthorization(c) => Body::UpdateAuthorization(c.into()),
@@ -104,6 +105,7 @@ pub fn command_from_pb(command: pb::Command) -> Result<(u32, Command), ConvertEr
         Body::SetNodeDraining(c) => Command::SetNodeDraining(c.try_into()?),
         Body::EvictTerminalJobs(c) => Command::EvictTerminalJobs(c.try_into()?),
         Body::EvictNodes(c) => Command::EvictNodes(c.try_into()?),
+        Body::RenewIntervalCharges(c) => Command::RenewIntervalCharges(c.try_into()?),
         Body::ConfigureQuotaEntity(c) => Command::ConfigureQuotaEntity(c.try_into()?),
         Body::UpdatePolicy(c) => Command::UpdatePolicy(c.try_into()?),
         Body::UpdateAuthorization(c) => Command::UpdateAuthorization(c.try_into()?),
@@ -590,6 +592,42 @@ impl TryFrom<pb::EvictTerminalJobs> for EvictTerminalJobs {
                 .map(TryInto::try_into)
                 .collect::<Result<_, _>>()?,
             evicted_at: timestamp(c.evicted_at_us, "EvictTerminalJobs.evicted_at_us")?,
+        })
+    }
+}
+
+impl From<&RenewIntervalCharges> for pb::RenewIntervalCharges {
+    fn from(c: &RenewIntervalCharges) -> Self {
+        pb::RenewIntervalCharges {
+            renewals: c
+                .renewals
+                .iter()
+                .map(|r| pb::IntervalRenewal {
+                    attempt: Some(r.attempt.into()),
+                    paid: r.paid,
+                })
+                .collect(),
+            proposed_at_us: c.proposed_at.as_micros(),
+        }
+    }
+}
+
+impl TryFrom<pb::RenewIntervalCharges> for RenewIntervalCharges {
+    type Error = ConvertError;
+
+    fn try_from(c: pb::RenewIntervalCharges) -> Result<Self, ConvertError> {
+        Ok(RenewIntervalCharges {
+            renewals: c
+                .renewals
+                .into_iter()
+                .map(|r| {
+                    Ok(IntervalRenewal {
+                        attempt: req(r.attempt, "IntervalRenewal.attempt")?.try_into()?,
+                        paid: r.paid,
+                    })
+                })
+                .collect::<Result<_, ConvertError>>()?,
+            proposed_at: timestamp(c.proposed_at_us, "RenewIntervalCharges.proposed_at_us")?,
         })
     }
 }
@@ -1145,13 +1183,13 @@ impl From<&PolicyConfig> for pbcore::PolicyConfig {
             penalty_exponent_milli: policy.penalty_exponent_milli,
             priority_multipliers: multipliers_to_pb(&policy.priority_multipliers),
             accrual_limit: policy.accrual_limit,
-            default_charge_runtime_s: policy.default_charge_runtime_s,
             terminal_retention_us: policy.terminal_retention.as_micros(),
             node_retention_us: Some(policy.node_retention.as_micros()),
             abort_grace_us: policy.abort_grace.as_micros(),
             unbounded_runtime_multiplier_q32_32: Some(policy.unbounded_runtime_multiplier.0),
             refund_fraction_milli: Some(policy.refund_fraction_milli),
             groups_claim: Some(policy.groups_claim.clone()),
+            unbounded_charge_interval_s: Some(policy.unbounded_charge_interval_s),
         }
     }
 }
@@ -1166,7 +1204,12 @@ impl TryFrom<pbcore::PolicyConfig> for PolicyConfig {
             penalty_exponent_milli: policy.penalty_exponent_milli,
             priority_multipliers: multipliers_from_pb(policy.priority_multipliers)?,
             accrual_limit: policy.accrual_limit,
-            default_charge_runtime_s: policy.default_charge_runtime_s,
+            // Absent decodes to the documented 30-minute default, following
+            // fields 9–12. A zero interval is policy's to reject, not the
+            // codec's, like the retention windows below.
+            unbounded_charge_interval_s: policy
+                .unbounded_charge_interval_s
+                .unwrap_or(DEFAULT_UNBOUNDED_CHARGE_INTERVAL_S),
             // Signed on the wire and signed in the domain, so this is total;
             // a nonsensical (negative) retention is policy's to validate, not
             // the codec's.

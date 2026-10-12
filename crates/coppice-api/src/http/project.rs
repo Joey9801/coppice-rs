@@ -1172,10 +1172,21 @@ fn cost_report(state: &StateMachine, record: &JobRecord) -> dto::CostReport {
         (PriorityMultiplier::ONE, priority_multiplier)
     };
 
-    // The charge window: the declared bound, or the policy default when unset.
+    // The charge window: the declared bound, or — for a job with no bound —
+    // the renewal interval it is charged in (ADR 0046): the one captured on
+    // the latest attempt's charge, or before any placement what a placement
+    // now would capture.
     let (charge_window_seconds, charge_window_is_default) = match record.spec.max_runtime {
         Some(d) => (quota::runtime_seconds_ceil(d), false),
-        None => (policy.default_charge_runtime_s, true),
+        None => (
+            record
+                .attempts
+                .last()
+                .and_then(|id| state.attempts.get(id))
+                .and_then(|ar| ar.charge.interval)
+                .map_or(policy.unbounded_charge_interval_s, |i| i.seconds),
+            true,
+        ),
     };
 
     let effective_rate_ucu_per_second =
@@ -1565,7 +1576,8 @@ mod tests {
     use coppice_core::id::{AllocationId, AttemptId, JobId, QuotaEntityId};
     use coppice_core::node::Node;
     use coppice_core::quota::{
-        ChargeRecord, CostUnits, PriorityMultiplier, Settlement, TrueUp, FULL_REFUND_MILLI,
+        ChargeInterval, ChargeRecord, CostUnits, PriorityMultiplier, Settlement, TrueUp,
+        FULL_REFUND_MILLI,
     };
     use coppice_state::{AllocationRecord, AttemptRecord, NodeRecord};
 
@@ -1603,6 +1615,7 @@ mod tests {
                 amount: CostUnits(1000),
                 charged_at: ts(0),
                 refund_fraction_milli: FULL_REFUND_MILLI,
+                interval: None,
             },
             rate_ucu_per_second: 100,
             multiplier: PriorityMultiplier::ONE,
@@ -3361,7 +3374,7 @@ mod tests {
 
         let id = job_id(1);
         // No max_runtime: the default 2× unbounded multiplier folds in and the
-        // charge window is the policy default.
+        // charge window is the policy's renewal interval (ADR 0046).
         let mut rec = spec_job(id, "img", entity, cpu(1000), 1_000_000);
         rec.spec.max_runtime = None;
         state.jobs.insert(id, rec);
@@ -3372,11 +3385,50 @@ mod tests {
         assert_eq!(cost.effective_rate_ucu_per_second, 2_000_000);
         assert_eq!(
             cost.charge_window_seconds,
-            state.policy.default_charge_runtime_s
+            state.policy.unbounded_charge_interval_s
         );
         assert!(cost.charge_window_is_default);
+        // The estimate is the cost of one interval, not of the whole run.
+        assert_eq!(
+            cost.estimated_ucu,
+            2_000_000 * state.policy.unbounded_charge_interval_s
+        );
         // Unbounded jobs get a full refund fraction.
         assert_eq!(cost.refund_fraction, 1.0);
+    }
+
+    /// Once placed, an unbounded job's window is the interval captured on its
+    /// latest attempt's charge — a later policy edit does not re-chunk it, so
+    /// the report must not claim it does (ADR 0046).
+    #[test]
+    fn get_job_cost_report_uses_the_captured_interval() {
+        let now = ts(1_000_000);
+        let mut state = StateMachine::default();
+        state.policy.cost_weights = REFERENCE_WEIGHTS;
+        let entity = quota_id(1);
+        put_entity(&mut state, entity, None, "e", 1_000_000, 0, now);
+
+        let id = job_id(1);
+        let attempt = AttemptId::new();
+        let mut rec = spec_job(id, "img", entity, cpu(1000), 1_000_000);
+        rec.spec.max_runtime = None;
+        rec.attempts.push(attempt);
+        rec.state = JobState::Attempting(attempt);
+        state.jobs.insert(id, rec);
+        let mut a = test_attempt(attempt, id, NodeId::new(), AttemptState::Running);
+        a.charge.interval = Some(ChargeInterval {
+            seconds: 600,
+            paid: 3,
+            last_tranche: a.charge.amount,
+            prior_charged_at: a.charge.charged_at,
+        });
+        state.attempts.insert(attempt, a);
+        state.policy.unbounded_charge_interval_s = 3600;
+
+        let cost = get_job(&state, &id, now, &no_memos()).unwrap().cost;
+        assert_eq!(cost.charge_window_seconds, 600);
+        assert!(cost.charge_window_is_default);
+        assert_eq!(cost.estimated_ucu, 2_000_000 * 600);
     }
 
     #[test]

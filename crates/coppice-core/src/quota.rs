@@ -260,6 +260,10 @@ pub const FULL_REFUND_MILLI: u32 = 1000;
 /// unbounded up to 5× the expected runtime.
 pub const DEFAULT_REFUND_FRACTION_MILLI: u32 = 750;
 
+/// Default length of the intervals an unbounded job's runtime is charged in:
+/// 30 minutes (ADR 0046).
+pub const DEFAULT_UNBOUNDED_CHARGE_INTERVAL_S: u64 = 1800;
+
 /// Default unbounded-runtime multiplier: 2.0 in Q32.32 (ADR 0029).
 pub const DEFAULT_UNBOUNDED_RUNTIME_MULTIPLIER: PriorityMultiplier = PriorityMultiplier(2 << 32);
 
@@ -320,18 +324,77 @@ pub fn job_cost(
 
 /// The replicated record of a placement charge, kept on the attempt so its
 /// terminal resolution can true up against what was actually consumed.
+///
+/// A bounded job (declared `max_runtime`) is charged once, at placement, for
+/// its whole declared runtime. A job with no declared bound is charged in
+/// fixed intervals instead (ADR 0046): one interval at placement, then one
+/// more each time its runtime reaches the end of what it has paid for, each
+/// interval charged up front. Either way the true-up at terminal resolution
+/// settles the cumulative [`amount`](Self::amount) against the actual cost.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChargeRecord {
-    /// The full job cost charged to every ancestor at placement.
+    /// Everything charged to every ancestor so far: the full job cost for a
+    /// bounded job, or the sum of every interval charged for an unbounded
+    /// one.
     pub amount: CostUnits,
-    /// Timestamp of the placement command that charged it.
+    /// Timestamp of the most recent charge — the placement command, or the
+    /// latest interval renewal. The true-up's refund decays from here — for
+    /// interval charging, the part of it within the most recent tranche; see
+    /// [`ChargeInterval::prior_charged_at`] for the rest.
     pub charged_at: Timestamp,
     /// Parts-per-thousand of the unused charge that a retaining true-up
     /// refunds (ADR 0029). Captured from policy at charge time — a mid-flight
     /// policy edit never reprices — and recorded as [`FULL_REFUND_MILLI`]
-    /// when the job declared no `max_runtime`, since the synthetic default
-    /// runtime is the platform's estimate, not the user's claim.
+    /// when the job declared no `max_runtime`, since the interval it paid
+    /// ahead for is the platform's billing cadence, not the user's claim.
     pub refund_fraction_milli: u32,
+    /// Interval charging for a job with no declared `max_runtime`
+    /// (ADR 0046); `None` for a bounded job's single up-front charge.
+    pub interval: Option<ChargeInterval>,
+}
+
+/// How an unbounded job's runtime is being paid for (ADR 0046): in intervals
+/// of a fixed length, each charged up front.
+///
+/// Captured from `policy.unbounded_charge_interval_s` at placement, so a
+/// policy edit mid-flight never re-chunks an in-flight attempt — the same
+/// rule as the recorded rate, multiplier, and refund fraction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChargeInterval {
+    /// Interval length in seconds; always positive.
+    pub seconds: u64,
+    /// Intervals charged so far, placement's included: always ≥ 1. Also the
+    /// compare-and-set token a renewal proposal carries, so a duplicate
+    /// proposal across a leader change is a no-op.
+    pub paid: u32,
+    /// The amount the most recent charge added: the placement's one interval
+    /// at first, then each renewal's tranche (several intervals after a
+    /// catch-up). The true-up decays up to this much of the unused charge
+    /// from [`ChargeRecord::charged_at`].
+    pub last_tranche: CostUnits,
+    /// The charge timestamp in force before the most recent charge: equal to
+    /// [`ChargeRecord::charged_at`] at placement, then the previous charge's
+    /// timestamp after each renewal. The true-up decays any unused charge
+    /// beyond [`last_tranche`](Self::last_tranche) from here — the case of an
+    /// attempt that exited just before a renewal whose exit report arrived
+    /// after it.
+    pub prior_charged_at: Timestamp,
+}
+
+/// How many intervals of `interval_s` seconds should have been paid for once
+/// an attempt has been running for `elapsed`: every interval already begun,
+/// including the one now in progress — `⌊elapsed / interval⌋ + 1`, saturating
+/// at `u32::MAX` (ADR 0046).
+///
+/// A negative `elapsed` (clocks regress across a leader change) or a zero
+/// interval is "nothing due" and returns 0, which can never exceed an
+/// attempt's paid count.
+pub fn intervals_due(elapsed: Duration, interval_s: u64) -> u32 {
+    if interval_s == 0 || elapsed.as_micros() < 0 {
+        return 0;
+    }
+    let elapsed_s = elapsed.as_micros() as u64 / 1_000_000;
+    u32::try_from((elapsed_s / interval_s).saturating_add(1)).unwrap_or(u32::MAX)
 }
 
 /// A true-up adjustment, applied to every ancestor via [`UsageState::settle`].
@@ -371,6 +434,19 @@ pub struct Settlement {
 /// ran. With `retain == false`, or a recorded fraction of
 /// [`FULL_REFUND_MILLI`], the refund is the entire unused charge and the
 /// result is bit-identical to the pre-ADR 0029 arithmetic.
+///
+/// An interval-charged record (ADR 0046) splits the refund by when each part
+/// was charged: up to [`ChargeInterval::last_tranche`] of it decays from
+/// [`ChargeRecord::charged_at`], the remainder from
+/// [`ChargeInterval::prior_charged_at`]. That remainder is non-zero when an
+/// attempt exited before a renewal but its exit report applied after it, so
+/// the unused charge reaches back into the previous tranche. The split is
+/// exact whenever the report delay does not reach back beyond the previous
+/// charge; any portion older than that still decays from `prior_charged_at`,
+/// a bounded over-refund (it has decayed for less time than it really sat in
+/// the accumulator) that only a report delay spanning several renewals can
+/// produce. Exactness there would mean keeping every tranche's timestamp, an
+/// unbounded record for a long-running job.
 pub fn true_up(
     charge: &ChargeRecord,
     actual_cost: CostUnits,
@@ -387,7 +463,21 @@ pub fn true_up(
         };
         // Product ≤ u64::MAX × 1000 fits u128; the quotient fits u64.
         let refundable = CostUnits((unused.0 as u128 * f as u128 / 1000) as u64);
-        TrueUp::Refund(policy.decay_between(refundable, charge.charged_at, resolved_at))
+        let refund = match charge.interval {
+            None => policy.decay_between(refundable, charge.charged_at, resolved_at),
+            Some(interval) => {
+                let recent = refundable.min(interval.last_tranche);
+                let older = refundable.saturating_sub(recent);
+                policy
+                    .decay_between(recent, charge.charged_at, resolved_at)
+                    .saturating_add(policy.decay_between(
+                        older,
+                        interval.prior_charged_at,
+                        resolved_at,
+                    ))
+            }
+        };
+        TrueUp::Refund(refund)
     } else {
         TrueUp::Surcharge(actual_cost.saturating_sub(charge.amount))
     }
@@ -539,6 +629,7 @@ mod tests {
             amount: charged,
             charged_at,
             refund_fraction_milli: FULL_REFUND_MILLI,
+            interval: None,
         };
         let adjustment = true_up(
             &record,
@@ -556,6 +647,7 @@ mod tests {
             amount: CostUnits(1000),
             charged_at: ts(0),
             refund_fraction_milli: FULL_REFUND_MILLI,
+            interval: None,
         };
         let adjustment = true_up(
             &record,
@@ -576,6 +668,7 @@ mod tests {
             amount: CostUnits(1_000_000_000_000),
             charged_at: ts(0),
             refund_fraction_milli: FULL_REFUND_MILLI,
+            interval: None,
         };
         let resolved_at = ts(0) + Duration::from_days(1); // one half-life
         assert_eq!(
@@ -683,6 +776,7 @@ mod tests {
             amount: CostUnits(100),
             charged_at: ts(0),
             refund_fraction_milli: DEFAULT_REFUND_FRACTION_MILLI,
+            interval: None,
         };
         // unused = 100, ⌊100 × 750 / 1000⌋ = 75 refunded, 25 retained.
         assert_eq!(
@@ -694,6 +788,7 @@ mod tests {
             amount: CostUnits(7),
             charged_at: ts(0),
             refund_fraction_milli: 333,
+            interval: None,
         };
         assert_eq!(
             true_up(&odd, CostUnits::ZERO, ts(0), &DecayPolicy::DEFAULT, true),
@@ -708,6 +803,7 @@ mod tests {
             amount: CostUnits(100),
             charged_at: ts(0),
             refund_fraction_milli: 5000,
+            interval: None,
         };
         assert_eq!(
             true_up(&over, CostUnits::ZERO, ts(0), &DecayPolicy::DEFAULT, true),
@@ -718,6 +814,7 @@ mod tests {
             amount: CostUnits(100),
             charged_at: ts(0),
             refund_fraction_milli: DEFAULT_REFUND_FRACTION_MILLI,
+            interval: None,
         };
         assert_eq!(
             true_up(
@@ -728,6 +825,103 @@ mod tests {
                 false
             ),
             TrueUp::Refund(CostUnits(100))
+        );
+    }
+
+    #[test]
+    fn intervals_due_counts_every_interval_begun() {
+        let hour = 3600;
+        // Inside the first interval, at its very start too: one is due.
+        assert_eq!(intervals_due(Duration::ZERO, hour), 1);
+        assert_eq!(intervals_due(Duration::from_secs(3599), hour), 1);
+        // Sub-second remainders never round up into the next interval.
+        assert_eq!(intervals_due(Duration::from_micros(3_599_999_999), hour), 1);
+        // The boundary itself begins the next interval.
+        assert_eq!(intervals_due(Duration::from_secs(3600), hour), 2);
+        assert_eq!(intervals_due(Duration::from_secs(5 * 3600 + 1), hour), 6);
+        // Clock regression and a degenerate interval are "nothing due".
+        assert_eq!(intervals_due(Duration::from_secs(-1), hour), 0);
+        assert_eq!(intervals_due(Duration::from_secs(10), 0), 0);
+        // Saturates rather than wrapping.
+        assert_eq!(intervals_due(Duration::from_days(365 * 1000), 1), u32::MAX);
+    }
+
+    /// An interval-charged record (ADR 0046) trues up with the existing
+    /// arithmetic: the unused remainder of the cumulative amount comes back in
+    /// full, decayed from the *latest* charge, not from placement.
+    #[test]
+    fn multi_interval_true_up_refunds_fully_from_the_last_charge() {
+        let placed = ts(1_760_000_000_000_000);
+        let last_renewal = placed + Duration::from_secs(3 * 1800);
+        // Four 1800 s intervals at 1 CU/s, ran 6000 s: 1200 s unused.
+        let record = ChargeRecord {
+            amount: CostUnits(4 * 1800 * 1_000_000),
+            charged_at: last_renewal,
+            refund_fraction_milli: FULL_REFUND_MILLI,
+            interval: Some(ChargeInterval {
+                seconds: 1800,
+                paid: 4,
+                last_tranche: CostUnits(1800 * 1_000_000),
+                prior_charged_at: placed + Duration::from_secs(2 * 1800),
+            }),
+        };
+        let actual = CostUnits(6000 * 1_000_000);
+        let resolved = placed + Duration::from_secs(6000);
+        let unused = CostUnits(1200 * 1_000_000);
+        let expected = DecayPolicy::DEFAULT.decay_between(unused, last_renewal, resolved);
+        // Retention never shrinks it: the recorded fraction is full.
+        for retain in [false, true] {
+            assert_eq!(
+                true_up(&record, actual, resolved, &DecayPolicy::DEFAULT, retain),
+                TrueUp::Refund(expected)
+            );
+        }
+        // Running past the paid intervals (renewal lag) surcharges the excess.
+        let over = CostUnits(7300 * 1_000_000);
+        assert_eq!(
+            true_up(&record, over, resolved, &DecayPolicy::DEFAULT, true),
+            TrueUp::Surcharge(CostUnits(100 * 1_000_000))
+        );
+    }
+
+    /// An attempt that exited just before a renewal but whose exit report
+    /// applied after it: the unused charge is the whole new tranche plus the
+    /// tail of the previous one, and each part decays from its own charge.
+    #[test]
+    fn delayed_exit_report_splits_the_refund_by_tranche() {
+        let placed = ts(1_760_000_000_000_000);
+        let renewed = placed + Duration::from_secs(1800);
+        let resolved = placed + Duration::from_secs(1810);
+        let cu = |s: u64| CostUnits(s * 1_000_000);
+        // 1800 s intervals at 1 CU/s; exited at 1790 s, renewal at 1800 s
+        // paid the second interval, outcome reported at 1810 s.
+        let record = ChargeRecord {
+            amount: cu(2 * 1800),
+            charged_at: renewed,
+            refund_fraction_milli: FULL_REFUND_MILLI,
+            interval: Some(ChargeInterval {
+                seconds: 1800,
+                paid: 2,
+                last_tranche: cu(1800),
+                prior_charged_at: placed,
+            }),
+        };
+        let policy = DecayPolicy::DEFAULT;
+        let expected = policy
+            .decay_between(cu(1800), renewed, resolved)
+            .saturating_add(policy.decay_between(cu(10), placed, resolved));
+        assert_eq!(
+            true_up(&record, cu(1790), resolved, &policy, true),
+            TrueUp::Refund(expected)
+        );
+        // The older portion has decayed for longer than it would from the
+        // renewal: the single-timestamp arithmetic over-refunded it.
+        let naive = policy.decay_between(cu(1810), renewed, resolved);
+        assert!(expected < naive, "{expected:?} < {naive:?}");
+        // Unused within the most recent tranche alone decays only from it.
+        assert_eq!(
+            true_up(&record, cu(1805), resolved, &policy, true),
+            TrueUp::Refund(policy.decay_between(cu(1795), renewed, resolved))
         );
     }
 }

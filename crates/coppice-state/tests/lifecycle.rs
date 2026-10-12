@@ -15,14 +15,18 @@ use coppice_core::id::{AllocationId, GroupId, JobId};
 use coppice_core::job::{JobState, RetryPolicy};
 use coppice_core::metadata::{JobMetadata, MAX_VALUE_BYTES};
 use coppice_core::node::HostFacts;
-use coppice_core::quota::{CostUnits, PriorityMultiplier, Settlement, TrueUp, FULL_REFUND_MILLI};
+use coppice_core::quota::{
+    ChargeInterval, CostUnits, PriorityMultiplier, Settlement, TrueUp, FULL_REFUND_MILLI,
+};
 use coppice_core::time::Duration;
 use coppice_state::authz::{Actor, Role};
 use coppice_state::command::{
     BumpClusterVersion, CommitPlacements, ConfigureQuotaEntity, DeclareNodeLost, EvictTerminalJobs,
     JobMetadataUpdate, LostAttempt, ReconcileNode, SetNodeSchedulable, UpdateJobMetadata,
 };
-use coppice_state::{Applied, Command, Event, Rejection, RejectionReason, StateMachine};
+use coppice_state::{
+    Applied, Command, Event, PolicyConfig, Rejection, RejectionReason, StateMachine,
+};
 
 #[test]
 fn happy_path_submit_to_eviction() {
@@ -1776,10 +1780,10 @@ fn resubmission_stays_idempotent_after_abort_and_terminal_state() {
     assert_eq!(sm, expected);
 }
 
-/// ADR 0029: a job placed with no declared `max_runtime` prices at the folded
-/// (unbounded × base) multiplier over the synthetic `default_charge_runtime_s`,
-/// and its charge record carries a full refund fraction — the synthetic
-/// runtime is the platform's estimate, never a claim to retain against.
+/// ADR 0029 / ADR 0046: a job placed with no declared `max_runtime` pays one
+/// interval up front at the folded (unbounded × base) multiplier, and its
+/// charge record carries a full refund fraction — the interval is the
+/// platform's estimate, never a claim to retain against.
 #[test]
 fn unbounded_placement_charges_folded_rate_and_records_full_refund() {
     let mut sm = setup();
@@ -1794,9 +1798,9 @@ fn unbounded_placement_charges_folded_rate_and_records_full_refund() {
             base_ts(),
         ),
     );
-    // 1 core = 1_000_000 µCU/s; default_charge_runtime_s = 86_400; base 1× is
-    // folded with the default 2.0× unbounded multiplier.
-    let expected = CostUnits(1_000_000 * 86_400 * 2);
+    // 1 core = 1_000_000 µCU/s; one 1800 s interval; base 1× is folded with
+    // the default 2.0× unbounded multiplier.
+    let expected = CostUnits(1_000_000 * 1_800 * 2);
     assert_eq!(sm.attempts[&aid(11)].charge.amount, expected);
     assert_eq!(
         sm.attempts[&aid(11)].charge.refund_fraction_milli,
@@ -1809,6 +1813,382 @@ fn unbounded_placement_charges_folded_rate_and_records_full_refund() {
     );
     // Same tick as configure: no decay, so usage is exactly the charge.
     assert_eq!(sm.quota_entities[&ROOT].usage.usage, expected);
+}
+
+/// One interval at the folded multiplier, in µCU, for a 1-core job.
+const INTERVAL_COST: u64 = 1_000_000 * 1_800 * 2;
+
+/// A cluster with one unbounded 1-core attempt (`aid(11)`) placed,
+/// dispatched and started at the base instant.
+fn running_unbounded() -> StateMachine {
+    let mut sm = setup();
+    apply_ok(
+        &mut sm,
+        submit_cmd(jid(1), cpu(1_000), None, RetryPolicy::default()),
+    );
+    apply_ok(
+        &mut sm,
+        place_cmd(
+            placement(jid(1), aid(11), alid(111), nid(1), cpu(1_000)),
+            base_ts(),
+        ),
+    );
+    apply_ok(&mut sm, dispatch_cmd(aid(11), base_ts()));
+    apply_ok(&mut sm, started_cmd(aid(11), base_ts()));
+    assert_eq!(sm.attempts[&aid(11)].attempt.state, AttemptState::Running);
+    sm
+}
+
+/// Applying `cmd` must change nothing but the applied-entry counter.
+fn assert_noop_but_version(sm: &mut StateMachine, cmd: Command) {
+    let mut expected = sm.clone();
+    let applied = apply_ok(sm, cmd);
+    assert_eq!(applied.events, vec![]);
+    expected.version += 1;
+    assert_eq!(*sm, expected);
+}
+
+/// ADR 0046: a bounded job's charge is unchanged by interval charging — the
+/// whole declared bound up front, no interval, the policy refund fraction.
+#[test]
+fn bounded_placement_charge_is_unchanged_and_has_no_interval() {
+    let mut sm = setup();
+    apply_ok(
+        &mut sm,
+        submit_cmd(jid(1), cpu(1_000), Some(3_600), RetryPolicy::default()),
+    );
+    apply_ok(
+        &mut sm,
+        place_cmd(
+            placement(jid(1), aid(11), alid(111), nid(1), cpu(1_000)),
+            base_ts(),
+        ),
+    );
+    let charge = &sm.attempts[&aid(11)].charge;
+    assert_eq!(charge.amount, CostUnits(1_000_000 * 3_600));
+    assert_eq!(charge.interval, None);
+    assert_eq!(
+        charge.refund_fraction_milli,
+        sm.policy.refund_fraction_milli
+    );
+}
+
+/// ADR 0046: placement charges exactly one interval and records the
+/// interval length and a paid count of one.
+#[test]
+fn unbounded_placement_records_one_paid_interval() {
+    let mut sm = setup();
+    apply_ok(
+        &mut sm,
+        submit_cmd(jid(1), cpu(1_000), None, RetryPolicy::default()),
+    );
+    apply_ok(
+        &mut sm,
+        place_cmd(
+            placement(jid(1), aid(11), alid(111), nid(1), cpu(1_000)),
+            base_ts(),
+        ),
+    );
+    let charge = &sm.attempts[&aid(11)].charge;
+    assert_eq!(charge.amount, CostUnits(INTERVAL_COST));
+    assert_eq!(charge.charged_at, base_ts());
+    assert_eq!(
+        charge.interval,
+        Some(ChargeInterval {
+            seconds: 1_800,
+            paid: 1,
+            last_tranche: CostUnits(INTERVAL_COST),
+            prior_charged_at: base_ts(),
+        })
+    );
+    assert_eq!(
+        sm.quota_entities[&ROOT].usage.usage,
+        CostUnits(INTERVAL_COST)
+    );
+}
+
+/// ADR 0046: an attempt that has not started running is not consuming
+/// runtime, so a renewal naming it is skipped.
+#[test]
+fn renewal_before_start_is_skipped() {
+    let mut sm = setup();
+    apply_ok(
+        &mut sm,
+        submit_cmd(jid(1), cpu(1_000), None, RetryPolicy::default()),
+    );
+    apply_ok(
+        &mut sm,
+        place_cmd(
+            placement(jid(1), aid(11), alid(111), nid(1), cpu(1_000)),
+            base_ts(),
+        ),
+    );
+    let late = ts(TS_US + 10_000 * 1_000_000);
+    assert_noop_but_version(&mut sm, renew_cmd(vec![(aid(11), 1)], late));
+    apply_ok(&mut sm, dispatch_cmd(aid(11), base_ts()));
+    assert_noop_but_version(&mut sm, renew_cmd(vec![(aid(11), 1)], late));
+}
+
+/// ADR 0046: at `started_at + interval` the second interval is due; a repeat
+/// of the same proposal (stale `paid`) is a no-op.
+#[test]
+fn renewal_at_the_boundary_charges_one_more_interval_once() {
+    let mut sm = running_unbounded();
+    let before = sm.quota_entities[&ROOT].usage;
+    let at = ts(TS_US + 1_800 * 1_000_000);
+    let cmd = renew_cmd(vec![(aid(11), 1)], at);
+    let applied = apply_ok(&mut sm, cmd.clone());
+    assert_eq!(applied.events, vec![]);
+
+    let charge = &sm.attempts[&aid(11)].charge;
+    assert_eq!(charge.amount, CostUnits(2 * INTERVAL_COST));
+    assert_eq!(charge.charged_at, at);
+    assert_eq!(charge.interval.map(|i| i.paid), Some(2));
+    // The tranche is the one interval just charged; the placement's charge
+    // is now the prior one.
+    assert_eq!(
+        charge
+            .interval
+            .map(|i| (i.last_tranche, i.prior_charged_at)),
+        Some((CostUnits(INTERVAL_COST), base_ts()))
+    );
+    let decayed = sm
+        .policy
+        .decay
+        .decay_between(before.usage, before.last_update, at);
+    assert_eq!(
+        sm.quota_entities[&ROOT].usage.usage,
+        decayed.saturating_add(CostUnits(INTERVAL_COST))
+    );
+
+    assert_noop_but_version(&mut sm, cmd);
+}
+
+/// ADR 0046: after an outage several intervals are overdue; one renewal pays
+/// them all, and the current one, in a single step.
+#[test]
+fn renewal_catches_up_missed_intervals_in_one_step() {
+    let mut sm = running_unbounded();
+    let before = sm.quota_entities[&ROOT].usage;
+    let at = ts(TS_US + (3 * 1_800 + 5) * 1_000_000);
+    apply_ok(&mut sm, renew_cmd(vec![(aid(11), 1)], at));
+    let charge = &sm.attempts[&aid(11)].charge;
+    assert_eq!(charge.interval.map(|i| i.paid), Some(4));
+    assert_eq!(charge.amount, CostUnits(4 * INTERVAL_COST));
+    assert_eq!(charge.charged_at, at);
+    // One tranche covering all three intervals caught up on.
+    assert_eq!(
+        charge
+            .interval
+            .map(|i| (i.last_tranche, i.prior_charged_at)),
+        Some((CostUnits(3 * INTERVAL_COST), base_ts()))
+    );
+    let decayed = sm
+        .policy
+        .decay
+        .decay_between(before.usage, before.last_update, at);
+    assert_eq!(
+        sm.quota_entities[&ROOT].usage.usage,
+        decayed.saturating_add(CostUnits(3 * INTERVAL_COST))
+    );
+}
+
+/// ADR 0046: a renewal proposed while the paid interval still covers the
+/// runtime is skipped.
+#[test]
+fn renewal_not_yet_due_is_skipped() {
+    let mut sm = running_unbounded();
+    assert_noop_but_version(
+        &mut sm,
+        renew_cmd(vec![(aid(11), 1)], ts(TS_US + 100 * 1_000_000)),
+    );
+}
+
+/// ADR 0046: naming a bounded attempt is a proposer bug and rejects the
+/// whole batch, leaving state untouched; a missing attempt id in the batch
+/// does not reject.
+#[test]
+fn renewal_naming_a_bounded_attempt_rejects_the_batch() {
+    let mut sm = running_unbounded();
+    apply_ok(
+        &mut sm,
+        submit_cmd(jid(2), cpu(1_000), Some(3_600), RetryPolicy::default()),
+    );
+    apply_ok(
+        &mut sm,
+        place_cmd(
+            placement(jid(2), aid(22), alid(222), nid(1), cpu(1_000)),
+            base_ts(),
+        ),
+    );
+    let at = ts(TS_US + 5_000 * 1_000_000);
+    let mut expected = sm.clone();
+    let cmd = renew_cmd(vec![(aid(11), 1), (aid(22), 1), (aid(99), 1)], at);
+    let reason = sm
+        .apply(&cmd)
+        .expect_err("a bounded item rejects the batch");
+    assert_eq!(
+        reason,
+        RejectionReason::InvalidBatch(vec![Rejection {
+            item_index: 1,
+            reason: RejectionReason::AttemptNotIntervalCharged(aid(22)),
+        }])
+    );
+    expected.version += 1;
+    assert_eq!(sm, expected);
+
+    // A missing attempt alone is a silent skip.
+    assert_noop_but_version(&mut sm, renew_cmd(vec![(aid(99), 1)], at));
+}
+
+/// ADR 0046: ending mid-interval after a renewal refunds the unused part of
+/// the latest interval in full — no retention even though the exit is
+/// job-attributable — decayed from the renewal's instant.
+#[test]
+fn termination_mid_interval_refunds_unused_in_full_from_the_renewal() {
+    let mut sm = running_unbounded();
+    let renewed_at = ts(TS_US + 1_800 * 1_000_000);
+    apply_ok(&mut sm, renew_cmd(vec![(aid(11), 1)], renewed_at));
+    let end = ts(TS_US + 2_400 * 1_000_000);
+    apply_ok(&mut sm, exited_cmd(aid(11), end));
+    apply_ok(
+        &mut sm,
+        outcome_cmd(aid(11), AttemptOutcome::Exited { code: 0 }, 2_400, end),
+    );
+    assert_eq!(sm.jobs[&jid(1)].state, JobState::Succeeded);
+    let unused = CostUnits(1_000_000 * (3_600 - 2_400) * 2);
+    let refund = sm.policy.decay.decay_between(unused, renewed_at, end);
+    assert_eq!(
+        sm.attempts[&aid(11)].settlement,
+        Some(Settlement {
+            actual_cost: CostUnits(1_000_000 * 2_400 * 2),
+            true_up: TrueUp::Refund(refund),
+        })
+    );
+}
+
+/// A second renewal moves the prior charge timestamp on to the first
+/// renewal's, and its tranche is its own interval only.
+#[test]
+fn successive_renewals_track_the_previous_charge() {
+    let mut sm = running_unbounded();
+    let first = ts(TS_US + 1_800 * 1_000_000);
+    let second = ts(TS_US + 3_600 * 1_000_000);
+    apply_ok(&mut sm, renew_cmd(vec![(aid(11), 1)], first));
+    apply_ok(&mut sm, renew_cmd(vec![(aid(11), 2)], second));
+    let charge = &sm.attempts[&aid(11)].charge;
+    assert_eq!(charge.charged_at, second);
+    assert_eq!(
+        charge.interval,
+        Some(ChargeInterval {
+            seconds: 1_800,
+            paid: 3,
+            last_tranche: CostUnits(INTERVAL_COST),
+            prior_charged_at: first,
+        })
+    );
+}
+
+/// An attempt that exits just before a renewal whose exit report applies
+/// after it: the unused charge is the whole new tranche plus the tail of the
+/// previous interval. Each part decays from its own charge — the tranche
+/// from the renewal, the tail from placement — so the older part is not
+/// over-refunded and ancestor usage is not understated.
+#[test]
+fn exit_reported_after_a_renewal_decays_each_tranche_from_its_own_charge() {
+    let mut sm = running_unbounded();
+    // Exits at 1790 s, renewal at 1800 s, outcome reported at 1810 s.
+    let renewed_at = ts(TS_US + 1_800 * 1_000_000);
+    let reported = ts(TS_US + 1_810 * 1_000_000);
+    apply_ok(&mut sm, renew_cmd(vec![(aid(11), 1)], renewed_at));
+    apply_ok(&mut sm, exited_cmd(aid(11), reported));
+    let before = sm.quota_entities[&ROOT].usage;
+    apply_ok(
+        &mut sm,
+        outcome_cmd(aid(11), AttemptOutcome::Exited { code: 0 }, 1_790, reported),
+    );
+    assert_eq!(sm.jobs[&jid(1)].state, JobState::Succeeded);
+
+    let decay = sm.policy.decay;
+    let recent = CostUnits(INTERVAL_COST);
+    let older = CostUnits(1_000_000 * 10 * 2);
+    let refund = decay
+        .decay_between(recent, renewed_at, reported)
+        .saturating_add(decay.decay_between(older, base_ts(), reported));
+    assert_eq!(
+        sm.attempts[&aid(11)].settlement,
+        Some(Settlement {
+            actual_cost: CostUnits(1_000_000 * 1_790 * 2),
+            true_up: TrueUp::Refund(refund),
+        })
+    );
+    // Decaying the older part from the renewal instead would refund more.
+    assert!(refund < decay.decay_between(recent.saturating_add(older), renewed_at, reported));
+    assert_eq!(
+        sm.quota_entities[&ROOT].usage.usage,
+        decay
+            .decay_between(before.usage, before.last_update, reported)
+            .saturating_sub(refund)
+    );
+}
+
+/// ADR 0046: the interval is captured at placement; a later policy edit does
+/// not reprice an in-flight attempt.
+#[test]
+fn policy_interval_change_does_not_touch_an_in_flight_attempt() {
+    let mut sm = running_unbounded();
+    apply_ok(
+        &mut sm,
+        update_policy_cmd(PolicyConfig {
+            unbounded_charge_interval_s: 600,
+            ..test_policy(4)
+        }),
+    );
+    assert_eq!(sm.policy.unbounded_charge_interval_s, 600);
+    apply_ok(
+        &mut sm,
+        renew_cmd(vec![(aid(11), 1)], ts(TS_US + 1_800 * 1_000_000)),
+    );
+    let charge = &sm.attempts[&aid(11)].charge;
+    assert_eq!(
+        charge.interval.map(|i| (i.seconds, i.paid)),
+        Some((1_800, 2))
+    );
+    assert_eq!(charge.amount, CostUnits(2 * INTERVAL_COST));
+}
+
+/// ADR 0046: a zero interval would charge nothing and renew forever, so
+/// policy validation rejects it.
+#[test]
+fn zero_charge_interval_policy_is_rejected() {
+    let mut sm = setup();
+    let reason = sm
+        .apply(&update_policy_cmd(PolicyConfig {
+            unbounded_charge_interval_s: 0,
+            ..test_policy(4)
+        }))
+        .expect_err("zero interval must reject");
+    assert!(
+        matches!(reason, RejectionReason::InvalidPolicy(_)),
+        "{reason:?}"
+    );
+    assert_eq!(sm.policy.unbounded_charge_interval_s, 1_800);
+}
+
+/// ADR 0046: a `Finalizing` attempt has already exited; whatever it ran past
+/// its paid intervals is the true-up's surcharge, not a renewal's.
+#[test]
+fn finalizing_attempt_is_not_renewed() {
+    let mut sm = running_unbounded();
+    apply_ok(&mut sm, exited_cmd(aid(11), ts(TS_US + 1)));
+    assert_eq!(
+        sm.attempts[&aid(11)].attempt.state,
+        AttemptState::Finalizing
+    );
+    assert_noop_but_version(
+        &mut sm,
+        renew_cmd(vec![(aid(11), 1)], ts(TS_US + 5_000 * 1_000_000)),
+    );
 }
 
 /// ADR 0029: a bounded job that ends job-attributably before its declared

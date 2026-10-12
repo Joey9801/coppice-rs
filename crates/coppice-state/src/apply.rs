@@ -17,7 +17,9 @@ use coppice_core::id::{AllocationId, AttemptId, JobId, NodeId, QuotaEntityId};
 use coppice_core::job::{AbortRequest, Job, JobState};
 use coppice_core::metadata::{self, JobMetadata};
 use coppice_core::node::Node;
-use coppice_core::quota::{self, ChargeRecord, CostUnits, Settlement, TrueUp, UsageState};
+use coppice_core::quota::{
+    self, ChargeInterval, ChargeRecord, CostUnits, Settlement, TrueUp, UsageState,
+};
 use coppice_core::resource::Resources;
 use coppice_core::time::{Duration, Timestamp};
 
@@ -29,8 +31,8 @@ use crate::command::{
     EvictTerminalJobs, MintEnrollToken, Placement, RebindMachineAddress, ReconcileNode,
     RecordAttemptExited, RecordAttemptOutcome, RecordAttemptStarted, RecordCaCertificate,
     RecordEnrolledIdentity, RecordKeyTransferIntent, RecordStagedKeyTransferIntent, RegisterNode,
-    RetireMachineBinding, RevokeEnrollToken, RevokeIdentity, SetNodeDraining, SetNodeSchedulable,
-    SubmitJob, UpdateAuthorization, UpdateJobMetadata, UpdatePolicy,
+    RenewIntervalCharges, RetireMachineBinding, RevokeEnrollToken, RevokeIdentity, SetNodeDraining,
+    SetNodeSchedulable, SubmitJob, UpdateAuthorization, UpdateJobMetadata, UpdatePolicy,
 };
 use crate::{
     AllocationRecord, Applied, AttemptRecord, CaCertificate, Command, EnrollToken, Event,
@@ -64,6 +66,7 @@ impl StateMachine {
             Command::SetNodeDraining(c) => self.set_node_draining(c),
             Command::EvictTerminalJobs(c) => self.evict_terminal_jobs(c),
             Command::EvictNodes(c) => self.evict_nodes(c),
+            Command::RenewIntervalCharges(c) => self.renew_interval_charges(c),
             Command::ConfigureQuotaEntity(c) => self.configure_quota_entity(c),
             Command::UpdatePolicy(c) => self.update_policy(c),
             Command::UpdateAuthorization(c) => self.update_authorization(c),
@@ -413,34 +416,40 @@ impl StateMachine {
             let Some(spec) = p.allocations.first() else {
                 continue;
             };
-            let Some((entity, multiplier, bounded, runtime_s, requests)) =
+            let Some((entity, multiplier, max_runtime, requests)) =
                 self.jobs.get(&p.job).map(|j| {
                     (
                         j.spec.quota_entity,
                         j.multiplier,
-                        j.spec.max_runtime.is_some(),
-                        j.spec
-                            .max_runtime
-                            .map(quota::runtime_seconds_ceil)
-                            .unwrap_or(self.policy.default_charge_runtime_s),
+                        j.spec.max_runtime,
                         j.spec.requests,
                     )
                 })
             else {
                 continue;
             };
-            // ADR 0029: a job with no declared bound prices at the elevated
-            // rate everywhere (charge, true-up, surcharge) via the folded
-            // multiplier, and its synthetic charge refunds in full — the
-            // declared-bound retention never applies to the platform's own
-            // runtime estimate.
-            let (multiplier, refund_fraction_milli) = if bounded {
-                (multiplier, self.policy.refund_fraction_milli)
-            } else {
-                (
-                    multiplier.saturating_mul(self.policy.unbounded_runtime_multiplier),
-                    quota::FULL_REFUND_MILLI,
-                )
+            // A bounded job pays for its whole declared runtime up front. A job
+            // with no declared bound pays for one interval now and renews as it
+            // runs (ADR 0046); it prices at the elevated rate everywhere
+            // (charge, renewals, true-up, surcharge) via the folded multiplier
+            // (ADR 0029), and its charge refunds in full — the declared-bound
+            // retention never applies to the platform's own billing cadence.
+            let (runtime_s, multiplier, refund_fraction_milli, interval) = match max_runtime {
+                Some(bound) => (
+                    quota::runtime_seconds_ceil(bound),
+                    multiplier,
+                    self.policy.refund_fraction_milli,
+                    None,
+                ),
+                None => {
+                    let seconds = self.policy.unbounded_charge_interval_s;
+                    (
+                        seconds,
+                        multiplier.saturating_mul(self.policy.unbounded_runtime_multiplier),
+                        quota::FULL_REFUND_MILLI,
+                        Some(seconds),
+                    )
+                }
             };
             let seq = self.next_allocation_seq;
             self.next_allocation_seq += 1;
@@ -487,6 +496,14 @@ impl StateMachine {
             };
             let rate = quota::resource_rate(&requests, &self.policy.cost_weights);
             let charge = quota::cost_from_rate(rate, runtime_s, multiplier);
+            // The placement's interval is the first tranche, with nothing
+            // charged before it.
+            let interval = interval.map(|seconds| ChargeInterval {
+                seconds,
+                paid: 1,
+                last_tranche: charge,
+                prior_charged_at: c.proposed_at,
+            });
             self.attempts.insert(
                 p.attempt,
                 AttemptRecord {
@@ -502,6 +519,7 @@ impl StateMachine {
                         amount: charge,
                         charged_at: c.proposed_at,
                         refund_fraction_milli,
+                        interval,
                     },
                     rate_ucu_per_second: rate,
                     multiplier,
@@ -1106,6 +1124,85 @@ impl StateMachine {
         Ok(Applied::default())
     }
 
+    /// Charge running unbounded attempts for their next interval(s)
+    /// (ADR 0046).
+    ///
+    /// Validation only rejects a proposer bug — an item naming an attempt
+    /// that is not interval-charged. Every other mismatch between what the
+    /// proposer saw and what this log position shows is an expected race (the
+    /// attempt ended between propose and apply, or a duplicate proposal
+    /// crossed a leader change) and the item is skipped, which is what makes
+    /// the command idempotent: the `paid` count is a compare-and-set token,
+    /// and a renewal that applied moves it on.
+    fn renew_interval_charges(&mut self, c: &RenewIntervalCharges) -> ApplyResult {
+        let mut items: Vec<Rejection> = Vec::new();
+        for (i, r) in c.renewals.iter().enumerate() {
+            if let Some(a) = self.attempts.get(&r.attempt) {
+                if a.charge.interval.is_none() {
+                    items.push(Rejection {
+                        item_index: i as u32,
+                        reason: RejectionReason::AttemptNotIntervalCharged(r.attempt),
+                    });
+                }
+            }
+        }
+        if !items.is_empty() {
+            return Err(RejectionReason::InvalidBatch(items));
+        }
+        for r in &c.renewals {
+            let Some(a) = self.attempts.get(&r.attempt) else {
+                continue;
+            };
+            // Only a running attempt is consuming runtime. Before `Running`
+            // nothing has been used yet; `Finalizing` has already exited, and
+            // anything it ran past its paid intervals is the true-up's
+            // surcharge to settle.
+            if a.attempt.state != AttemptState::Running {
+                continue;
+            }
+            let (Some(started_at), Some(interval)) = (a.started_at, a.charge.interval) else {
+                continue;
+            };
+            if interval.paid != r.paid {
+                continue;
+            }
+            // Catch-up after a leader outage pays every missed interval and
+            // the current one in a single step; a proposer clock behind this
+            // attempt's own history (skew across a leader change) is simply
+            // not due yet.
+            let target = quota::intervals_due(c.proposed_at - started_at, interval.seconds);
+            if target <= interval.paid {
+                continue;
+            }
+            let charge = quota::cost_from_rate(
+                a.rate_ucu_per_second,
+                u64::from(target - interval.paid).saturating_mul(interval.seconds),
+                a.multiplier,
+            );
+            let job = a.attempt.job;
+            if let Some(a) = self.attempts.get_mut(&r.attempt) {
+                // The tranche just charged becomes the most recent one; the
+                // previous charge's timestamp is kept so a true-up whose
+                // unused charge reaches back into it decays that part from
+                // when it was really charged.
+                a.charge.amount = a.charge.amount.saturating_add(charge);
+                a.charge.interval = Some(ChargeInterval {
+                    seconds: interval.seconds,
+                    paid: target,
+                    last_tranche: charge,
+                    prior_charged_at: a.charge.charged_at,
+                });
+                a.charge.charged_at = c.proposed_at;
+            }
+            if let Some(entity) = self.jobs.get(&job).map(|j| j.spec.quota_entity) {
+                self.charge_ancestors(entity, charge, c.proposed_at);
+            }
+        }
+        // No events: a renewal changes what an attempt has paid, not any
+        // lifecycle state a subscriber watches.
+        Ok(Applied::default())
+    }
+
     // ---- Admin / policy ----
 
     fn configure_quota_entity(&mut self, c: &ConfigureQuotaEntity) -> ApplyResult {
@@ -1197,6 +1294,12 @@ impl StateMachine {
                 c.policy.unbounded_runtime_multiplier.0,
                 quota::PriorityMultiplier::ONE.0
             )));
+        }
+        // ADR 0046: a zero-length interval could never be renewed past.
+        if c.policy.unbounded_charge_interval_s == 0 {
+            return Err(RejectionReason::InvalidPolicy(
+                "unbounded_charge_interval_s must be positive".to_string(),
+            ));
         }
         if c.policy.refund_fraction_milli > quota::FULL_REFUND_MILLI {
             return Err(RejectionReason::InvalidPolicy(format!(

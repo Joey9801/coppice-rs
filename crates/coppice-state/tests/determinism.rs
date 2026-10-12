@@ -32,8 +32,9 @@ use coppice_proto::convert::{state_from_records, state_to_records, StateRecords}
 use coppice_state::authz::{Binding, Role, Subject};
 use coppice_state::command::{
     BumpClusterVersion, ConfigureQuotaEntity, DeclareNodeLost, EvictNodes, EvictTerminalJobs,
-    JobMetadataUpdate, LostAttempt, ReconcileNode, RegisterNode, SetNodeDraining,
-    SetNodeSchedulable, UpdateAuthorization, UpdateJobMetadata,
+    IntervalRenewal, JobMetadataUpdate, LostAttempt, ReconcileNode, RegisterNode,
+    RenewIntervalCharges, SetNodeDraining, SetNodeSchedulable, UpdateAuthorization,
+    UpdateJobMetadata,
 };
 use coppice_state::{Command, StateMachine};
 use proptest::prelude::*;
@@ -227,6 +228,18 @@ fn arb_global() -> impl Strategy<Value = Command> {
                 // A cluster verb, like the drain above: acceptance depends on
                 // whatever bindings an earlier command installed.
                 actor: with_who.then(|| actor("root")),
+            })
+        }),
+        (any::<u8>(), 0u32..4, arb_ts()).prop_map(|(mask, paid, ts)| {
+            Command::RenewIntervalCharges(RenewIntervalCharges {
+                renewals: (0..MAX_JOBS)
+                    .filter(|k| mask & (1 << k) != 0)
+                    .map(|k| IntervalRenewal {
+                        attempt: aid(2_000 + k as u128),
+                        paid,
+                    })
+                    .collect(),
+                proposed_at: ts,
             })
         }),
         (any::<u8>(), arb_ts()).prop_map(|(mask, ts)| {
