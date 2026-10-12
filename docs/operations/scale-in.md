@@ -4,13 +4,15 @@ How to take a compute node out of service without losing the work on it,
 how the agent behaves when its host is being retired, how departed node
 records are cleaned up, and which endpoints a supervisor or load balancer
 should probe. The design is
-[ADR 0041](../decisions/0041-graceful-scale-in-drain-and-node-eviction.md);
+[ADR 0041](../decisions/0041-graceful-scale-in-drain-and-node-eviction.md),
+as amended by the regular drain of
+[ADR 0044 §5](../decisions/0044-job-preemption-and-spot-capacity.md);
 this page is the operator's view of it.
 
 ## Two reasons a node stops taking work
 
-A node record carries two independent flags, and a placement lands on a
-node only when **both** allow it:
+A node record carries two independent flags, either of which takes the
+node out of ordinary service:
 
 | Flag | Set by | Cleared by | Survives an agent restart? |
 | --- | --- | --- | --- |
@@ -22,12 +24,49 @@ into a single `scheduling` label: `drained` when the node has a drain
 record (`drained, agent draining` if the agent is also draining),
 `agent draining` when the agent alone is shutting down, and `open` when
 neither flag is set.
-`coppice node show <id>` additionally reports the running and accruing
-counts.
+`coppice node show <id>` additionally shows the drain record (when it was
+requested and its status, below), the agent's announcement on its own
+line, and the running and accruing counts. A node whose host reported a
+provider interruption is also marked `interruption pending` in the list,
+and `show` prints the deadline the agent read. The API exposes the same as
+`drain: { requested_at, horizon, complete } | null`, `agent_draining`, and
+`interruption_deadline` on every node summary.
 
 Neither flag touches running work. Attempts already on the node run to
-completion and report normally; only *new* placements are refused, from
-the log position at which the flag lands.
+completion and report normally, and an accrual already there keeps
+funding until the scheduler re-plans it elsewhere. What changes is
+admission, from the log position at which the flag lands:
+
+- **Agent draining** admits nothing.
+- **Drained by an operator** admits only **bounded backfill** (below).
+
+## Horizon and bounded backfill
+
+A drained node keeps doing useful work for as long as that work is
+guaranteed to be gone in time. "In time" is the node's **horizon**: the
+latest *enforced* completion bound among the work still on it — for a
+running attempt, its start plus its `max_runtime` plus the policy's
+`abort_grace`, or, once its agent has delivered a termination notice
+(ADR 0044 §3), the notice deadline plus `abort_grace` if that is earlier.
+
+- If anything on the node has no enforced bound — a running job with no
+  `max_runtime` and no notice delivered, an attempt not yet started, an
+  accrual — the horizon is
+  **unbounded**: nothing says when the node will be empty, and nothing new
+  is admitted.
+- Otherwise the node takes a job as backfill only when the job has a
+  `max_runtime`, `now + max_runtime + abort_grace` lands at or before the
+  horizon, and it fits the node's free capacity right now (backfill is
+  always fully funded; no accrual ever opens on a drained node). The
+  attempt records the horizon as its cutoff, so backfill never moves the
+  horizon later: draining a node with backfill empties it no later than
+  draining it with nothing admitted would — it may just use the time.
+- Dispatch and image pulls take time, so the agent also refuses to start a
+  backfill container after `cutoff − max_runtime − abort_grace`, giving up
+  on an image pull still running at that point; such an attempt ends
+  `revoked` and requeues free of retry budget.
+- With no live allocation left the drain is **complete**. Admission stays
+  closed until `coppice node undrain`.
 
 ## Draining a node by hand
 
@@ -38,10 +77,13 @@ coppice node drain <node-id>                 # drain and return at once
 coppice node undrain <node-id>               # take it back into service
 ```
 
-`--wait` polls the node once a second and prints a line whenever the
-running or accruing counts change. It exits 0 once both are zero and
-non-zero, with the outstanding counts, at the deadline; the drain stays
-in place either way. Draining an already drained node succeeds.
+`--wait` polls the node once a second and prints a line to stderr
+whenever its progress changes: the horizon ("empty by <time>", or
+"horizon unbounded" while unbounded work runs) and the running and
+accruing counts. It exits 0 once the drain is complete and non-zero, with
+what is outstanding, at the deadline; the drain stays in place either
+way. Draining an already drained node succeeds and keeps the original
+drain (its `requested_at` does not move).
 
 The verbs are `POST /api/v1/nodes/{id}/drain`, `/undrain`, and `/remove`
 on the client API; they need an unscoped `operator` or `admin` binding
