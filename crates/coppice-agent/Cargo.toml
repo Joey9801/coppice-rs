@@ -26,6 +26,9 @@ coppice-enroll.workspace = true
 # dial?" on both sides. Consulted per reconnect, never authoritative.
 coppice-discovery.workspace = true
 anyhow.workspace = true
+# The `aws-imds` interruption source (ADR 0044 §5) polls EC2 instance metadata
+# through the SDK's IMDSv2 client, the same one `coppice-discovery` uses.
+aws-config.workspace = true
 # Serves the agent's optional Prometheus `/metrics` scrape endpoint (issue #46);
 # a single-route axum router in `metrics_server`, the same 0.7 stack the rest of
 # the workspace uses.

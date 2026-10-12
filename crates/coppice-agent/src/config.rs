@@ -169,22 +169,65 @@ pub struct Config {
 ///
 /// ```toml
 /// [preemption]
-/// preemptible_only = true   # this node takes only effectively preemptible work
+/// preemptible_only = true            # this node takes only effectively preemptible work
+/// interruption_source = "aws-imds"   # watch EC2 metadata for spot reclaim notices
 /// ```
 ///
 /// `preemptible_only` rides `Register` onto the replicated node record, where
 /// the scheduler and apply both gate placements on it: a job is placed here
 /// only if it declared `preemptible = true` and no quota entity on its path
 /// switched preemption off. It is a node fact, not a cluster one, so it lives
-/// in the node config file (ADR 0020). The interruption-notice source of the
-/// same table arrives with the termination mechanism.
-#[derive(Debug, Clone, Copy, Default, Deserialize)]
+/// in the node config file (ADR 0020).
+///
+/// `interruption_source` (ADR 0044 §5) names where this host learns it is
+/// about to be reclaimed. A notice from it starts the node's drain plan: every
+/// running attempt is notified at once and stopped before the provider's
+/// deadline ([`crate::interruption`]).
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PreemptionConfig {
     /// Accept only effectively preemptible work (spot capacity). Default
     /// `false`.
     #[serde(default)]
     pub preemptible_only: bool,
+    /// Where interruption notices come from. Default `"none"`.
+    #[serde(default)]
+    pub interruption_source: InterruptionSource,
+    /// Override of the instance-metadata endpoint `aws-imds` polls (default:
+    /// the SDK's resolution, normally `http://169.254.169.254`). A test seam
+    /// and an escape hatch for IPv6-only hosts.
+    #[serde(default)]
+    pub imds_endpoint: Option<String>,
+    /// How often `aws-imds` polls `spot/instance-action`. Default `5s`.
+    #[serde(default = "default_imds_poll_interval", with = "humantime_serde")]
+    pub imds_poll_interval: Duration,
+}
+
+impl Default for PreemptionConfig {
+    fn default() -> PreemptionConfig {
+        PreemptionConfig {
+            preemptible_only: false,
+            interruption_source: InterruptionSource::None,
+            imds_endpoint: None,
+            imds_poll_interval: default_imds_poll_interval(),
+        }
+    }
+}
+
+fn default_imds_poll_interval() -> Duration {
+    Duration::from_secs(5)
+}
+
+/// The `[preemption] interruption_source` enum (ADR 0044 §5). Other providers
+/// are further variants.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum InterruptionSource {
+    /// No source: the agent learns of no interruption.
+    #[default]
+    None,
+    /// EC2 instance metadata (IMDSv2) `spot/instance-action`.
+    AwsImds,
 }
 
 /// Bind/advertise addresses for the agent-hosted `NodeService` listener
@@ -1074,6 +1117,36 @@ token_path = "/etc/coppice/enroll-token"
         assert!(load(&path).expect("parses").preemption.preemptible_only);
 
         let (_guard, path) = write_config(&minimal_with("[preemption]\nspot = true\n"));
+        assert!(load(&path).is_err());
+    }
+
+    /// `interruption_source` (ADR 0044 §5): `none` by default, `aws-imds`
+    /// with its endpoint override and cadence, anything else fail-stops.
+    #[test]
+    fn interruption_source_parses() {
+        let (_guard, path) = write_config(&minimal_with(""));
+        let config = load(&path).expect("minimal parses");
+        assert_eq!(
+            config.preemption.interruption_source,
+            InterruptionSource::None
+        );
+        assert_eq!(config.preemption.imds_poll_interval, Duration::from_secs(5));
+
+        let (_guard, path) = write_config(&minimal_with(
+            "[preemption]\ninterruption_source = \"aws-imds\"\n\
+             imds_endpoint = \"http://127.0.0.1:1338\"\nimds_poll_interval = \"1s\"\n",
+        ));
+        let preemption = load(&path).expect("parses").preemption;
+        assert_eq!(preemption.interruption_source, InterruptionSource::AwsImds);
+        assert_eq!(
+            preemption.imds_endpoint.as_deref(),
+            Some("http://127.0.0.1:1338")
+        );
+        assert_eq!(preemption.imds_poll_interval, Duration::from_secs(1));
+
+        let (_guard, path) = write_config(&minimal_with(
+            "[preemption]\ninterruption_source = \"gcp\"\n",
+        ));
         assert!(load(&path).is_err());
     }
 

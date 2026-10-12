@@ -369,6 +369,35 @@ score the same. Because registration rewrites the flag, changing it takes
 effect when the agent restarts. It is a fact about the machine, not the
 cluster, so it is node config rather than policy.
 
+The same table names the host's **interruption source**
+([ADR 0044](../decisions/0044-job-preemption-and-spot-capacity.md) §5):
+
+```toml
+[preemption]
+interruption_source = "aws-imds"   # default "none"
+# imds_endpoint = "http://169.254.169.254"   # override; default the SDK's resolution
+# imds_poll_interval = "5s"                  # default 5s
+```
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `interruption_source` | `"none"` | `"aws-imds"` polls EC2 instance metadata (IMDSv2) `spot/instance-action` |
+| `imds_endpoint` | SDK resolution | Instance-metadata endpoint override (IPv6-only hosts, tests) |
+| `imds_poll_interval` | `5s` | How often `aws-imds` polls; a failing poll backs off up to 30 s and never stops the agent |
+
+A notice (`terminate`, `stop`, or `hibernate`, all treated alike) starts
+the node's drain plan with the provider's reclaim time as its deadline `D`:
+the agent announces `draining` and the deadline, admits nothing new, and
+notifies every running attempt at once, stopping each at `D − 30 s −
+abort_grace` so its exit is reported before the host goes. Each ends
+`Preempted { interruption }` with a free retry. This runs whether or not a
+coordinator is reachable. The agent logs at startup that the source is
+enabled, and warns at a job's start when its declared notice plus
+`abort_grace` plus the 30 s cleanup margin cannot fit EC2's two-minute
+window — the notice is then cut short, and the shortfall is reported. A
+deadline that has already passed when no plan is active is ignored as a
+stale record of an earlier reclaim.
+
 ## Replicated policy
 
 Policy is inspected and changed through the CLI, which converts
