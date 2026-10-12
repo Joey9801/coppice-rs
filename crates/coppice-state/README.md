@@ -42,7 +42,8 @@ grouped by proposer:
   `RecordAttemptOutcome` and `ReconcileNode`, all fed from the leader's
   normalized observed facts, never raw agent reports.
 - **Node lifecycle** — `RegisterNode`, `DeclareNodeLost`, `SetNodeSchedulable`.
-- **Housekeeping** — `EvictTerminalJobs`.
+- **Housekeeping** — `EvictTerminalJobs`, `EvictNodes` (retention GC),
+  `RenewIntervalCharges` (ADR 0046).
 - **Admin / policy** — `ConfigureQuotaEntity` (names grammar-checked and
   unique among siblings at apply; paths derived at read time by
   `StateMachine::quota_entity_path`, resolved by `resolve_quota_entity_path`,

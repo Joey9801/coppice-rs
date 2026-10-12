@@ -8,7 +8,7 @@
 
 use coppice_core::bytes::ByteSize;
 use coppice_core::quota::{
-    job_cost, penalty, true_up, ChargeRecord, CostUnits, CostWeights, DecayPolicy,
+    intervals_due, job_cost, penalty, true_up, ChargeRecord, CostUnits, CostWeights, DecayPolicy,
     PriorityMultiplier, TrueUp, UsageState, FULL_REFUND_MILLI,
 };
 use coppice_core::resource::Resources;
@@ -58,6 +58,7 @@ fn settled_undecayed(amount: u64, actual: u64, refund_fraction_milli: u32) -> u6
         amount: CostUnits(amount),
         charged_at: ts(0),
         refund_fraction_milli,
+        interval: None,
     };
     match true_up(
         &record,
@@ -185,6 +186,7 @@ proptest! {
             amount: cost,
             charged_at,
             refund_fraction_milli: refund_fraction,
+            interval: None,
         };
         let resolved_at = charged_at + Duration::from_micros(1);
         let adjustment = true_up(&record, CostUnits(charge2), resolved_at, &policy, retain);
@@ -258,20 +260,20 @@ proptest! {
         let charged_at = ts(charged_at_us);
         let resolved = charged_at + Duration::from_micros(elapsed);
         let reference = reference_full_refund(
-            &ChargeRecord { amount: CostUnits(amount), charged_at, refund_fraction_milli: FULL_REFUND_MILLI },
+            &ChargeRecord { amount: CostUnits(amount), charged_at, refund_fraction_milli: FULL_REFUND_MILLI, interval: None },
             actual,
             resolved,
             &policy,
         );
 
         // I3: retain = false ignores the recorded fraction entirely.
-        let any_fraction = ChargeRecord { amount: CostUnits(amount), charged_at, refund_fraction_milli: fraction };
+        let any_fraction = ChargeRecord { amount: CostUnits(amount), charged_at, refund_fraction_milli: fraction, interval: None };
         prop_assert_eq!(
             true_up(&any_fraction, actual, resolved, &policy, false),
             TrueUp::Refund(reference)
         );
         // I2: a recorded fraction of 1000 is a full refund even when retaining.
-        let full = ChargeRecord { amount: CostUnits(amount), charged_at, refund_fraction_milli: FULL_REFUND_MILLI };
+        let full = ChargeRecord { amount: CostUnits(amount), charged_at, refund_fraction_milli: FULL_REFUND_MILLI, interval: None };
         prop_assert_eq!(
             true_up(&full, actual, resolved, &policy, true),
             TrueUp::Refund(reference)
@@ -320,6 +322,24 @@ proptest! {
         prop_assert!(
             settled_undecayed(amount, a_lo, f) <= settled_undecayed(amount, a_hi, f),
             "earlier abort (actual {a_lo}) settled above later (actual {a_hi})"
+        );
+    }
+
+    /// ADR 0046: the intervals due always cover the elapsed runtime — paid
+    /// time runs strictly past `elapsed` — but never by a whole spare
+    /// interval, and the count never decreases as time moves on.
+    #[test]
+    fn intervals_due_covers_elapsed_by_less_than_one_interval(
+        elapsed_s in 0i64..=10_000_000,
+        later_s in 0i64..=10_000_000,
+        interval_s in 1u64..=100_000,
+    ) {
+        let due = intervals_due(Duration::from_secs(elapsed_s), interval_s);
+        let paid_s = due as u64 * interval_s;
+        prop_assert!(paid_s > elapsed_s as u64);
+        prop_assert!(paid_s - interval_s <= elapsed_s as u64);
+        prop_assert!(
+            intervals_due(Duration::from_secs(elapsed_s + later_s), interval_s) >= due
         );
     }
 }

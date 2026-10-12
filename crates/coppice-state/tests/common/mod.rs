@@ -14,9 +14,9 @@ use coppice_core::time::{Duration, Timestamp};
 use coppice_state::authz::{Actor, Binding, Role, Subject};
 use coppice_state::command::{
     AbortJob, AllocationSpec, BumpClusterVersion, CommitPlacements, ConfigureQuotaEntity,
-    DispatchAttempt, EvictNodes, Placement, RecordAttemptExited, RecordAttemptOutcome,
-    RecordAttemptStarted, RegisterNode, SetNodeDraining, SetNodeSchedulable, SubmitJob,
-    UpdateAuthorization, UpdatePolicy,
+    DispatchAttempt, EvictNodes, IntervalRenewal, Placement, RecordAttemptExited,
+    RecordAttemptOutcome, RecordAttemptStarted, RegisterNode, RenewIntervalCharges,
+    SetNodeDraining, SetNodeSchedulable, SubmitJob, UpdateAuthorization, UpdatePolicy,
 };
 use coppice_state::{Applied, Command, PolicyConfig, StateMachine};
 use uuid::Uuid;
@@ -263,6 +263,16 @@ pub fn outcome_cmd(
         outcome,
         actual_runtime: Duration::from_secs(runtime_s),
         observed_at: at,
+    })
+}
+
+pub fn renew_cmd(renewals: Vec<(AttemptId, u32)>, at: Timestamp) -> Command {
+    Command::RenewIntervalCharges(RenewIntervalCharges {
+        renewals: renewals
+            .into_iter()
+            .map(|(attempt, paid)| IntervalRenewal { attempt, paid })
+            .collect(),
+        proposed_at: at,
     })
 }
 

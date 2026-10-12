@@ -48,17 +48,45 @@ message UsageState {
 }
 
 // The replicated record of a placement charge, kept on the attempt so its
-// terminal resolution can true up against what was actually consumed.
+// terminal resolution can true up against what was actually consumed. A
+// bounded job is charged once at placement; a job with no declared
+// max_runtime is charged in intervals, one up front at placement and one more
+// each time its runtime reaches the end of what it has paid for (ADR 0046).
 message ChargeRecord {
-  // The full job cost charged to every ancestor at placement, µCU.
+  // Everything charged to every ancestor so far, µCU: the full job cost for a
+  // bounded job, the sum of every interval charged for an unbounded one.
   uint64 amount_ucu = 1;
-  // Timestamp of the placement command that charged it (Unix µs).
+  // Timestamp of the most recent charge — the placement command, or the
+  // latest interval renewal (Unix µs). The true-up's refund decays from here.
   int64 charged_at_us = 2;
   // Parts-per-thousand of the unused charge that true-up refunds, captured
   // at charge time so a mid-flight policy edit never reprices (ADR 0029).
   // Explicit presence: absent decodes to 1000 (full refund) — a charge
   // recorded before ADR 0029 trues up with a full refund, as it did then.
   optional uint32 refund_fraction_milli = 3;
+  // Interval charging for a job with no declared max_runtime (ADR 0046).
+  // Absent for a bounded job's single up-front charge.
+  ChargeInterval interval = 4;
+}
+
+// How an unbounded job's runtime is being paid for (ADR 0046): in intervals
+// of a fixed length, each charged up front. Captured from policy at
+// placement, so a policy edit never re-chunks an in-flight attempt.
+message ChargeInterval {
+  // Interval length in seconds; must be positive.
+  uint64 seconds = 1;
+  // Intervals charged so far, placement's included; must be at least 1. The
+  // compare-and-set token a RenewIntervalCharges item carries.
+  uint32 paid = 2;
+  // The amount the most recent charge added, µCU: the placement's one
+  // interval at first, then each renewal's tranche. The true-up decays up to
+  // this much of the unused charge from ChargeRecord.charged_at_us.
+  uint64 last_tranche_ucu = 3;
+  // The charge timestamp in force before the most recent charge (Unix µs):
+  // equal to ChargeRecord.charged_at_us at placement, then the previous
+  // charge's timestamp after each renewal. The true-up decays any unused
+  // charge beyond last_tranche_ucu from here.
+  int64 prior_charged_at_us = 4;
 }
 
 // What an attempt's charge settled to at terminal resolution: the actual
@@ -101,8 +129,10 @@ message PolicyConfig {
   repeated PriorityMultiplierEntry priority_multipliers = 4;
   // K: at most this many jobs hold accruing allocations at once (ADR 0014).
   uint32 accrual_limit = 5;
-  // Charge-time runtime for jobs with no enforced max_runtime, seconds.
-  uint64 default_charge_runtime_s = 6;
+  // Field 6 was default_charge_runtime_s, the synthetic one-off charge
+  // runtime for unbounded jobs, replaced by interval charging (ADR 0046).
+  reserved 6;
+  reserved "default_charge_runtime_s";
   // Terminal jobs are eligible for eviction this long after terminal state
   // (ADR 0012). Consulted by the proposer, never by apply.
   int64 terminal_retention_us = 7;
@@ -130,4 +160,8 @@ message PolicyConfig {
   // heard from it (ADR 0041). Consulted by the proposer, never by apply.
   // Explicit presence, following fields 9–11: absent decodes to 24 h.
   optional int64 node_retention_us = 12;
+  // Length of the intervals a job with no enforced max_runtime is charged
+  // in, seconds (ADR 0046). Validated > 0 at policy commit. Explicit
+  // presence, following fields 9–12: absent decodes to 1800 (30 minutes).
+  optional uint64 unbounded_charge_interval_s = 13;
 }

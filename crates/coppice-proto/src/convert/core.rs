@@ -11,8 +11,8 @@ use coppice_core::job::{AbortRequest, Job, JobState, RetryPolicy};
 use coppice_core::metadata::JobMetadata;
 use coppice_core::node::{HostFacts, Node};
 use coppice_core::quota::{
-    ChargeRecord, CostUnits, CostWeights, DecayPolicy, PriorityMultiplier, Settlement, TrueUp,
-    UsageState,
+    ChargeInterval, ChargeRecord, CostUnits, CostWeights, DecayPolicy, PriorityMultiplier,
+    Settlement, TrueUp, UsageState,
 };
 use coppice_core::resource::Resources;
 
@@ -728,6 +728,12 @@ impl From<ChargeRecord> for pb::ChargeRecord {
             amount_ucu: charge.amount.0,
             charged_at_us: charge.charged_at.as_micros(),
             refund_fraction_milli: Some(charge.refund_fraction_milli),
+            interval: charge.interval.map(|i| pb::ChargeInterval {
+                seconds: i.seconds,
+                paid: i.paid,
+                last_tranche_ucu: i.last_tranche.0,
+                prior_charged_at_us: i.prior_charged_at.as_micros(),
+            }),
         }
     }
 }
@@ -742,6 +748,38 @@ impl TryFrom<pb::ChargeRecord> for ChargeRecord {
             // Absent (a charge recorded before ADR 0029) trues up at full
             // refund, exactly as it did then.
             refund_fraction_milli: charge.refund_fraction_milli.unwrap_or(1000),
+            interval: charge.interval.map(TryInto::try_into).transpose()?,
+        })
+    }
+}
+
+impl TryFrom<pb::ChargeInterval> for ChargeInterval {
+    type Error = ConvertError;
+
+    /// A zero length or a zero paid count is a record no placement could
+    /// have written (ADR 0046): refused rather than carried into a state where
+    /// the attempt could never be renewed.
+    fn try_from(i: pb::ChargeInterval) -> Result<Self, ConvertError> {
+        if i.seconds == 0 {
+            return Err(ConvertError::Invalid {
+                field: "ChargeInterval.seconds",
+                reason: "interval length must be positive",
+            });
+        }
+        if i.paid == 0 {
+            return Err(ConvertError::Invalid {
+                field: "ChargeInterval.paid",
+                reason: "an interval-charged attempt has paid at least one interval",
+            });
+        }
+        Ok(ChargeInterval {
+            seconds: i.seconds,
+            paid: i.paid,
+            last_tranche: CostUnits(i.last_tranche_ucu),
+            prior_charged_at: timestamp(
+                i.prior_charged_at_us,
+                "ChargeInterval.prior_charged_at_us",
+            )?,
         })
     }
 }

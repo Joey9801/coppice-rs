@@ -274,12 +274,14 @@ pub struct CostReport {
     /// The µCU/second actually priced: rate × priority × unbounded.
     pub effective_rate_ucu_per_second: u64,
     /// Duration the upfront placement charge covers: the job's declared max
-    /// runtime, or the policy default charge runtime when unset.
+    /// runtime. For an unbounded job it is the renewal interval (ADR 0046).
     #[serde(rename = "charge_window_seconds", with = "crate::time::seconds")]
     pub charge_window: Duration,
-    /// True iff `charge_window` is the policy default (job unbounded).
+    /// True iff the job is unbounded, i.e. `charge_window` is the policy
+    /// renewal interval rather than the job's own max runtime.
     pub charge_window_is_default: bool,
-    /// Upfront charge for one placement: effective_rate × charge_window.
+    /// Upfront charge for one placement: effective_rate × charge_window. For
+    /// an unbounded job this is the cost of one interval (ADR 0046).
     pub estimated_ucu: u64,
     /// Gross µCU charged across attempts so far; 0 before the job is
     /// placed.

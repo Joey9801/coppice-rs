@@ -66,6 +66,7 @@ pub fn attempt_record(
             amount: CostUnits(0),
             charged_at: Timestamp::UNIX_EPOCH,
             refund_fraction_milli: FULL_REFUND_MILLI,
+            interval: None,
         },
         rate_ucu_per_second: 0,
         multiplier: PriorityMultiplier(0),

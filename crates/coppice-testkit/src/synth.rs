@@ -28,7 +28,8 @@ use coppice_core::id::{AllocationId, AttemptId, GroupId, JobId, NodeId, QuotaEnt
 use coppice_core::job::{AbortRequest, Job, JobState, RetryPolicy};
 use coppice_core::node::Node;
 use coppice_core::quota::{
-    self, ChargeRecord, CostUnits, DecayPolicy, PriorityMultiplier, Settlement, UsageState,
+    self, ChargeInterval, ChargeRecord, CostUnits, DecayPolicy, PriorityMultiplier, Settlement,
+    UsageState,
 };
 use coppice_core::resource::Resources;
 use coppice_core::time::{Duration, Timestamp};
@@ -120,11 +121,17 @@ pub fn synth_state(cfg: &SynthConfig) -> StateMachine {
             retry_user_errors: rng.chance(1, 3),
         };
         let rate = quota::resource_rate(&requested, &policy.cost_weights);
+        // A bounded job pays for its declared runtime; an unbounded one for
+        // its first interval (ADR 0046). Renewals are not modelled — every
+        // synthetic unbounded attempt shows exactly its placement charge.
+        let interval_s = max_runtime
+            .is_none()
+            .then_some(policy.unbounded_charge_interval_s);
         let charge_amount = quota::cost_from_rate(
             rate,
             max_runtime
                 .map(quota::runtime_seconds_ceil)
-                .unwrap_or(policy.default_charge_runtime_s),
+                .unwrap_or(policy.unbounded_charge_interval_s),
             multiplier,
         );
         let ctx = AttemptCtx {
@@ -133,6 +140,7 @@ pub fn synth_state(cfg: &SynthConfig) -> StateMachine {
             rate,
             multiplier,
             charge_amount,
+            interval_s,
             decay: policy.decay,
         };
 
@@ -464,6 +472,9 @@ struct AttemptCtx {
     rate: u64,
     multiplier: PriorityMultiplier,
     charge_amount: CostUnits,
+    /// The interval length an unbounded job is charged in; `None` when
+    /// bounded.
+    interval_s: Option<u64>,
     decay: DecayPolicy,
 }
 
@@ -607,6 +618,12 @@ fn build_attempt(
         amount: ctx.charge_amount,
         charged_at,
         refund_fraction_milli: quota::FULL_REFUND_MILLI,
+        interval: ctx.interval_s.map(|seconds| ChargeInterval {
+            seconds,
+            paid: 1,
+            last_tranche: ctx.charge_amount,
+            prior_charged_at: charged_at,
+        }),
     };
     // A terminal attempt carries what its charge settled to, priced the way
     // apply prices it: actual cost over the started..ended span (zero if it

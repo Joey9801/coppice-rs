@@ -31,7 +31,7 @@ use coppice_core::node::Node;
 use coppice_core::quota::{
     ChargeRecord, CostUnits, CostWeights, DecayPolicy, PriorityMultiplier, Settlement, UsageState,
     DEFAULT_PENALTY_EXPONENT_MILLI, DEFAULT_REFUND_FRACTION_MILLI,
-    DEFAULT_UNBOUNDED_RUNTIME_MULTIPLIER,
+    DEFAULT_UNBOUNDED_CHARGE_INTERVAL_S, DEFAULT_UNBOUNDED_RUNTIME_MULTIPLIER,
 };
 use coppice_core::time::{Duration, Timestamp};
 
@@ -781,8 +781,13 @@ pub struct PolicyConfig {
     /// K: at most this many jobs hold accruing allocations at once
     /// (ADR 0014, default 4).
     pub accrual_limit: u32,
-    /// Charge-time runtime for jobs with no enforced `max_runtime`, seconds.
-    pub default_charge_runtime_s: u64,
+    /// Length of the intervals a job with no enforced `max_runtime` is
+    /// charged in, seconds (ADR 0046): one interval up front at placement,
+    /// then one more each time the attempt's runtime reaches the end of what
+    /// it has paid for. Captured on the charge record at placement, so an
+    /// edit never re-chunks an in-flight attempt. Validated > 0 at policy
+    /// commit; 30 minutes by default.
+    pub unbounded_charge_interval_s: u64,
     /// Q32.32 multiplier folded into the effective priority multiplier of
     /// any job placed without an enforced `max_runtime` (ADR 0029).
     /// Validated ≥ 1.0 at policy commit; 1.0 disables the surcharge.
@@ -825,7 +830,7 @@ impl Default for PolicyConfig {
             penalty_exponent_milli: DEFAULT_PENALTY_EXPONENT_MILLI,
             priority_multipliers: BTreeMap::new(),
             accrual_limit: 4,
-            default_charge_runtime_s: 86_400,
+            unbounded_charge_interval_s: DEFAULT_UNBOUNDED_CHARGE_INTERVAL_S,
             unbounded_runtime_multiplier: DEFAULT_UNBOUNDED_RUNTIME_MULTIPLIER,
             refund_fraction_milli: DEFAULT_REFUND_FRACTION_MILLI,
             terminal_retention: Duration::from_hours(72),
@@ -882,6 +887,8 @@ pub enum RejectionReason {
     NodeAcceptsPlacements(NodeId),
     #[error("node {0} still holds a live allocation")]
     NodeNotEmpty(NodeId),
+    #[error("attempt {0} is not charged in intervals")]
+    AttemptNotIntervalCharged(AttemptId),
     #[error("observed set for node {node} carries epoch {got}, current is {current}")]
     StaleNodeEpoch {
         node: NodeId,

@@ -1520,12 +1520,17 @@ pub struct CostReport {
     pub unbounded_multiplier: f64,
     /// The µCU/second actually priced: rate × priority × unbounded.
     pub effective_rate_ucu_per_second: u64,
-    /// Duration the upfront placement charge covers: the job's `max_runtime`,
-    /// or the policy default charge runtime when unset.
+    /// Duration the upfront placement charge covers: the job's `max_runtime`.
+    /// For an unbounded job it is the renewal interval (captured on the latest
+    /// attempt's charge, else the current policy's
+    /// `unbounded_charge_interval_s`; ADR 0046).
     pub charge_window_seconds: u64,
-    /// True iff `charge_window_seconds` is the policy default (job unbounded).
+    /// True iff the job is unbounded, i.e. `charge_window_seconds` is the
+    /// policy renewal interval rather than the job's own `max_runtime`.
     pub charge_window_is_default: bool,
-    /// Upfront charge for one placement: effective_rate × charge_window.
+    /// Upfront charge for one placement: effective_rate × charge_window. For
+    /// an unbounded job this is the cost of one interval; later intervals are
+    /// charged as the attempt keeps running (ADR 0046).
     pub estimated_ucu: u64,
     /// Gross µCU charged across attempts so far; 0 before the job is placed.
     pub charged_ucu: u64,

@@ -228,7 +228,16 @@ the same apply resolves the job:
    is always 1000 (full refund) unless the attempt reached `Running`, the
    outcome's `OutcomeClass` is not `Platform`, and the job declared an
    enforced `max_runtime` — otherwise the recorded `refund_fraction_milli`
-   applies.
+   applies. For an interval-charged (unbounded) attempt the full refund
+   of the unused tail is split by when it was charged: up to
+   `last_tranche` of it decays from `charged_at` (the latest charge,
+   placement or renewal), and any remainder — an attempt that exited just
+   before a renewal whose outcome applied after it — decays from
+   `prior_charged_at`, the charge before that. This is exact unless the
+   report delay reaches back past the previous charge, where the oldest
+   part slightly over-refunds (per-tranche history would grow without
+   bound). A run past its paid intervals bills the excess through the
+   existing surcharge (ADR 0046).
 6. **Allocations release** in the same apply, running the pledge pass on
    each affected node.
 7. **Terminal timestamp.** A resolution that lands terminal stamps the
@@ -354,7 +363,7 @@ reachable through the API.
 | Proposer | Scheduler engine via the leader — one batch per scheduling pass |
 | Payload | `expected_version: u64` (audit record of the snapshot version; see contract), `proposed_at_us` (the charge timestamp), `revocations: AllocationId[]`, `placements: Placement[]` where `Placement = { job: JobId, attempt: AttemptId, group: GroupId, allocations: AllocationSpec[] }`, `AllocationSpec = { id: AllocationId, node: NodeId, requested: Resources }`. The proto field is repeated; **v1 writers emit exactly one allocation per placement and set `group` = the job's id** (singleton groups); apply rejects other shapes until the gang-scheduling ADR. |
 | Validation (all-or-nothing, per-item diagnostics) | Revocations: allocation exists and is `Accruing` (funded allocations are stable — revoking one is always a rejection). Placements: job exists and is `Queued`; attempt and allocation ids are fresh; node exists and accepts placements (`schedulable` and not `draining` — ADR 0041); `requested` fits within the node's total advertised capacity; exactly one allocation, `group` = job id. Batch-level: after simulating the batch (revocation frees → pledge pass → new placements in order), the number of distinct jobs holding accruing allocations must not exceed the replicated accrual cap K, and no node the batch touches may be left accruing for more than one job (ADR 0027 — hardcoded at one, so a same-batch swap on an occupied node passes and a second accrual on it does not). |
-| Apply effects | In order: **(1) Revocations** — each attempt `Terminal(Revoked)`, allocations `Released`, true-up (full decayed refund; the attempt never ran), job → `Queued` free of retry budget (or `Aborted` if an abort is pending), freed capacity pledged onward in commit order. **(2) Placements**, in payload order: assign the allocation the next `seq`; insert attempt + allocation; run the pledge from the node's current free capacity — fully covered → allocation `Funded`, attempt starts `Ready` (accrual skipped, the common case); partially or not covered → allocation `Accruing` in the accrual queue, attempt starts `Accruing`. Job → `Attempting(attempt)`. **(3) Quota charge**: a job with no *enforced* `max_runtime` first has its multiplier inflated, `m' = ⌊multiplier × unbounded_runtime_multiplier / 2³²⌋` (else `m' = multiplier`); the job's full cost `C = rate(requests, current weights) × ceil(max_runtime_s) × m'` (jobs with no `max_runtime` are charged the replicated `default_charge_runtime` at `m'`) is charged to every ancestor of its entity at `proposed_at_us`; the attempt records `(C, rate, m', proposed_at_us, refund_fraction_milli)` for true-up, where the recorded fraction is the replicated `refund_fraction_milli` for a bounded job or 1000 for an unbounded one (ADR 0029). |
+| Apply effects | In order: **(1) Revocations** — each attempt `Terminal(Revoked)`, allocations `Released`, true-up (full decayed refund; the attempt never ran), job → `Queued` free of retry budget (or `Aborted` if an abort is pending), freed capacity pledged onward in commit order. **(2) Placements**, in payload order: assign the allocation the next `seq`; insert attempt + allocation; run the pledge from the node's current free capacity — fully covered → allocation `Funded`, attempt starts `Ready` (accrual skipped, the common case); partially or not covered → allocation `Accruing` in the accrual queue, attempt starts `Accruing`. Job → `Attempting(attempt)`. **(3) Quota charge**: a job with no *enforced* `max_runtime` first has its multiplier inflated, `m' = ⌊multiplier × unbounded_runtime_multiplier / 2³²⌋` (else `m' = multiplier`); the job's cost `C = rate(requests, current weights) × ceil(max_runtime_s) × m'` is charged to every ancestor of its entity at `proposed_at_us`; a job with no `max_runtime` is charged **one interval**, `C = rate × unbounded_charge_interval_s × m'` (ADR 0046), and the record also captures `interval { seconds, paid = 1, last_tranche = C, prior_charged_at = proposed_at_us }` (renewed later by `RenewIntervalCharges`); the attempt records `(C, rate, m', proposed_at_us, refund_fraction_milli[, interval])` for true-up, where the recorded fraction is the replicated `refund_fraction_milli` for a bounded job or 1000 for an unbounded one (ADR 0029). |
 | Rejections | `InvalidBatch[(index, reason)]` wrapping `UnknownAllocation`, `AllocationNotAccruing`, `UnknownJob`, `JobNotQueued`, `DuplicateAttempt`, `DuplicateAllocation`, `UnknownNode`, `NodeNotSchedulable`, `RequestExceedsNodeCapacity`, `UnsupportedPlacementShape`, `UnknownQuotaEntity`; batch-level `AccrualLimitExceeded`, `PerNodeAccrualExceeded` |
 
 #### `DispatchAttempt`
@@ -473,6 +482,16 @@ reachable through the API.
 | Apply effects | Remove each listed node record, and any accrual-queue entries keyed by it (an evictable node has none — the range is cleared so no key can outlive the record it describes). **No events**: nothing downstream watches a node record disappear, and an empty node has no work whose fate an event would describe. A removed node whose agent is still alive re-registers as a genuinely new record — `epoch = 1`, schedulable — which is the honest outcome of removing a node that was not gone; `revoke-identity` is how you stop that. |
 | Rejections | `InvalidBatch` wrapping `NodeAcceptsPlacements` / `NodeNotEmpty`; `PermissionDenied` |
 
+#### `RenewIntervalCharges`
+
+| | |
+| --- | --- |
+| Proposer | Leader housekeeping loop, fourth pass on the 60 s tick (after terminal-job retention), no actor (ADR 0046). Lists every `Running` attempt whose charge record has an interval and for which `intervals_due(now − started_at) > paid`, where `intervals_due(elapsed) = ⌊elapsed_s / seconds⌋ + 1`; most-overdue first, in capped commands (`MAX_RENEWALS_PER_COMMAND` 512, at most `MAX_RENEWAL_BATCHES_PER_PASS` 16 per tick). Not reachable through the API. |
+| Payload | `renewals: [IntervalRenewal { attempt: AttemptId, paid: u32 }]`, `proposed_at_us` |
+| Validation | A listed attempt that exists but whose charge has no interval (a bounded job) is a proposer bug and rejects the whole command. Everything else is skipped silently, per item: attempt missing; not `Running` (before start — `Accruing`/`Ready`/`Dispatching` — or after exit — `Finalizing`/`Terminal`); the recorded `paid` ≠ `item.paid` (compare-and-set, so duplicate proposals across a leader change are no-ops); or `target = intervals_due(proposed_at − started_at, seconds) ≤ paid` (not due, e.g. clock skew). |
+| Apply effects | Per surviving item: charge `rate × (target − paid) × seconds × recorded m'` to every ancestor of the job's entity at `proposed_at_us`; `amount += it`; `prior_charged_at = charged_at` (the old value); `last_tranche = it`; `charged_at = proposed_at_us`; `paid = target`. Catch-up after a leader outage pays every missed interval plus the current one in a single item. **No events**: charge bookkeeping is invisible to job-event subscribers (ADR 0043 streams are unaffected). |
+| Rejections | `InvalidBatch` wrapping `AttemptNotIntervalCharged` |
+
 ### Admin / policy
 
 #### `ConfigureQuotaEntity`
@@ -490,9 +509,9 @@ reachable through the API.
 | | |
 | --- | --- |
 | Proposer | Admin API / CLI. The CLI converts human-facing forms (half-life → Q0.64 λ, rates → stocks) so no transcendental math ever runs in a replica (ADR 0019/0020). |
-| Payload | `policy: PolicyConfig` — full replacement: `cost_weights: CostWeights` (Q32.32 per dimension), `decay: DecayPolicy { tick_us, decay_per_tick }`, `penalty_exponent_milli: u32`, `priority_multipliers` (priority → `PriorityMultiplier`; on the wire, repeated key-sorted entries — proto maps are banned in replicated payloads, see [schema-style](schema-style.md)), `accrual_limit: u32` (K, default 4), `default_charge_runtime_s: u64`, `unbounded_runtime_multiplier: u64` (Q32.32, default 2.0 — ADR 0029), `refund_fraction_milli: u32` (default 750 — ADR 0029), `terminal_retention_us: i64` (72 h default), `node_retention_us: i64` (24 h default — ADR 0041), `abort_grace_us: i64` (30 s default), `groups_claim: string` (`"groups"` default — ADR 0023); plus `actor: Actor`, `updated_at_us` |
-| Validation | `decay.validate()` (positive tick, λ within the iteration bound); `unbounded_runtime_multiplier ≥ 2³²` (≥ 1.0); `refund_fraction_milli ≤ 1000`; actor holds unscoped `admin`; a full-replacement payload is otherwise self-consistent by construction |
-| Apply effects | Replace the replicated policy. In-flight charge records keep their recorded rate/multiplier/refund fraction (no retroactive repricing); decay re-times from each entity's next touch; quota-stock rescaling on half-life change is owned by the tooling that authored the command. |
+| Payload | `policy: PolicyConfig` — full replacement: `cost_weights: CostWeights` (Q32.32 per dimension), `decay: DecayPolicy { tick_us, decay_per_tick }`, `penalty_exponent_milli: u32`, `priority_multipliers` (priority → `PriorityMultiplier`; on the wire, repeated key-sorted entries — proto maps are banned in replicated payloads, see [schema-style](schema-style.md)), `accrual_limit: u32` (K, default 4), `unbounded_charge_interval_s: u64` (default 1800 — ADR 0046), `unbounded_runtime_multiplier: u64` (Q32.32, default 2.0 — ADR 0029), `refund_fraction_milli: u32` (default 750 — ADR 0029), `terminal_retention_us: i64` (72 h default), `node_retention_us: i64` (24 h default — ADR 0041), `abort_grace_us: i64` (30 s default), `groups_claim: string` (`"groups"` default — ADR 0023); plus `actor: Actor`, `updated_at_us` |
+| Validation | `decay.validate()` (positive tick, λ within the iteration bound); `unbounded_runtime_multiplier ≥ 2³²` (≥ 1.0); `refund_fraction_milli ≤ 1000`; `unbounded_charge_interval_s > 0`; actor holds unscoped `admin`; a full-replacement payload is otherwise self-consistent by construction |
+| Apply effects | Replace the replicated policy. In-flight charge records keep their recorded rate/multiplier/refund fraction/renewal interval (no retroactive repricing); decay re-times from each entity's next touch; quota-stock rescaling on half-life change is owned by the tooling that authored the command. |
 | Rejections | `InvalidPolicy`, `PermissionDenied` |
 
 A fresh cluster boots with an **empty** `priority_multipliers` table, so
@@ -660,6 +679,7 @@ key* never appears in any of these payloads or in replicated state (ADR 0037
 | `JobTerminal` | Job already reached a terminal state |
 | `JobNotQueued` | Placement target isn't `Queued` |
 | `JobNotTerminal` | Eviction listed a live job |
+| `AttemptNotIntervalCharged` | `RenewIntervalCharges` named an attempt whose charge record has no interval (a bounded job) — a proposer bug (ADR 0046) |
 | `StaleAttemptState` | Monotonicity dedupe: the attempt already passed this transition |
 | `AttemptNotOnNode` | Reconciliation verdict references an attempt on a different node |
 | `AllocationNotAccruing` | Revocation of a funded/active/released allocation |
