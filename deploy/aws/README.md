@@ -176,7 +176,7 @@ cluster is actually usable:
    idempotent — it reads the daemon's `/readyz` phase and skips `init` on an
    already-formed cluster — so `up.sh` always runs it;
 5. polls `https://<env>.coppice.jwjr.uk/readyz?require=healthy` for a 200,
-   then the API for three coordinator voters and three schedulable nodes.
+   then the API for three coordinator voters and three open nodes.
 
 **Changing the release means a new environment.** A launch-template change
 only shapes instances launched after it; the six that already exist keep
@@ -223,7 +223,7 @@ non-zero if any did.
 |---|---|
 | `authn` | a tokenless `GET /api/v1/overview` is 401, a garbage token is 401, and a Cognito ID token minted with `USER_PASSWORD_AUTH` for the seeded user is 200 |
 | `coordinators` | `GET /api/v1/coordinators` shows exactly three voters |
-| `nodes` | `GET /api/v1/nodes` shows exactly three schedulable agents that are not lost (issue #51's criterion). Health is a leader-only read (#133): a leader-served `healthy` verdict is reported as evidence when one is obtained, not asserted |
+| `nodes` | `GET /api/v1/nodes` shows exactly three open agents that are not lost (issue #51's criterion). Health is a leader-only read (#133): a leader-served `healthy` verdict is reported as evidence when one is obtained, not asserted |
 | `prometheus` | on the ops host, `count(up{job="coppice"} == 1)` is 6 with three of each role; every coordinator reports `coordinator_state_nodes` = 3 and all three agents expose `agent_running_jobs` |
 | `job` | `coppice job submit examples/jobs/stress-demo.toml` (with the quota entity swapped for the one formation seeded) reaches `succeeded`; the timeline from `GET /jobs/{id}/timeline` starts at `job_submitted` and ends in a transition to `succeeded`; `coppice job logs` prints real lines and `coppice job usage` real samples, and the API reports both sources as `available` |
 

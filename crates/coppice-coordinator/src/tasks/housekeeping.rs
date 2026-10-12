@@ -207,10 +207,10 @@ async fn declare_lost_nodes<C: Consensus>(
 }
 
 /// The nodes whose last report is older than [`AGENT_LIVENESS_DEADLINE`] and
-/// that still accept placements or hold a non-`Released` allocation.
+/// that are not draining or still hold a non-`Released` allocation.
 ///
 /// This guard stops us re-declaring an already-lost node every tick:
-/// `DeclareNodeLost` leaves it unschedulable with everything `Released`, and
+/// `DeclareNodeLost` leaves it drained with everything `Released`, and
 /// a drained agent (ADR 0041) that went quiet is the same case — its record
 /// is the retention GC's to collect. A node with no liveness mark at all is
 /// left alone; real nodes are always seeded on leadership gain and marked on
@@ -225,7 +225,7 @@ fn stale_nodes(view: &StateView, liveness: &NodeLiveness, now: Instant) -> Vec<N
         if !overdue {
             continue;
         }
-        if node_record.accepts_placements() || has_live_allocation(view, *node_id) {
+        if !node_record.is_draining() || has_live_allocation(view, *node_id) {
             out.push(*node_id);
         }
     }
@@ -289,7 +289,7 @@ async fn evict_silent_nodes<C: Consensus>(
 /// `still_silent` is asked about every node immediately before its batch is
 /// proposed. `due` was fixed before the first proposal, and the liveness map
 /// keeps moving while earlier batches replicate: a node that resumed
-/// reporting in that time must keep its record (and its cordon), so it is
+/// reporting in that time must keep its record (and its drain), so it is
 /// dropped from its batch here rather than evicted on a stale verdict. The
 /// race between this check and apply remains, as it always did for a single
 /// batch — apply cannot see leader-local liveness — but it no longer grows
@@ -344,9 +344,8 @@ async fn propose_node_evictions<C: Consensus>(
     }
 }
 
-/// The nodes eligible for `EvictNodes`: they have stopped accepting
-/// placements (an admin cordon, an agent's own drain announcement, or
-/// `DeclareNodeLost`), hold no live allocation, and have been silent for at
+/// The nodes eligible for `EvictNodes`: they are draining (an operator's
+/// drain, an agent's own drain announcement, or `DeclareNodeLost`'s drain), hold no live allocation, and have been silent for at
 /// least `policy.node_retention`.
 ///
 /// Silence is measured exactly as [`stale_nodes`] measures it, against the
@@ -374,7 +373,8 @@ fn due_for_node_eviction(
         .state()
         .nodes
         .iter()
-        .filter(|(_, record)| !record.accepts_placements())
+        // ADR 0044 §5: draining, by the record or by the announcement.
+        .filter(|(_, record)| record.is_draining())
         .filter_map(|(node_id, _)| {
             let seen = liveness.last_seen(*node_id)?;
             (now.saturating_duration_since(seen) >= retention).then_some((seen, *node_id))
@@ -706,21 +706,21 @@ mod tests {
     };
 
     #[test]
-    fn stale_nodes_picks_schedulable_and_live_but_not_already_lost_or_fresh() {
+    fn stale_nodes_picks_open_and_live_but_not_already_lost_or_fresh() {
         // Anchor arithmetic on `base` and add (never subtract) to avoid
         // underflowing the monotonic clock on a freshly started process.
         let base = Instant::now();
         let now = base + AGENT_LIVENESS_DEADLINE + StdDuration::from_secs(2);
         let overdue = base;
 
-        let schedulable_stale = NodeId::new();
+        let open_stale = NodeId::new();
         let drained_live = NodeId::new();
         let drained_lost = NodeId::new();
         let fresh = NodeId::new();
 
         let mut sm = StateMachine::default();
         sm.nodes
-            .insert(schedulable_stale, node_record(schedulable_stale, 1, true));
+            .insert(open_stale, node_record(open_stale, 1, true));
         sm.nodes
             .insert(drained_live, node_record(drained_live, 1, false));
         sm.nodes
@@ -742,20 +742,20 @@ mod tests {
         let view = view_of(sm);
 
         let liveness = NodeLiveness::new();
-        liveness.seed(1, [schedulable_stale, drained_live, drained_lost], overdue);
+        liveness.seed(1, [open_stale, drained_live, drained_lost], overdue);
         liveness.seed(1, [fresh], now);
 
         let stale: BTreeSet<NodeId> = stale_nodes(&view, &liveness, now).into_iter().collect();
-        assert!(stale.contains(&schedulable_stale));
+        assert!(stale.contains(&open_stale));
         assert!(stale.contains(&drained_live));
-        // Unschedulable with no live allocation: already lost, not re-declared.
+        // Drained with no live allocation: already lost, not re-declared.
         assert!(!stale.contains(&drained_lost));
         // Within its liveness grace window.
         assert!(!stale.contains(&fresh));
     }
 
     /// The retention GC's conditions, one node each (ADR 0041): silent past
-    /// the window and holding nothing is due; anything still schedulable,
+    /// the window and holding nothing is due; anything still open,
     /// still holding work, or still being heard from is not.
     #[test]
     fn nodes_are_evicted_only_once_drained_empty_and_silent() {
@@ -769,23 +769,23 @@ mod tests {
         let now = base + retention + StdDuration::from_secs(1);
 
         let drained_silent = NodeId::new();
-        let schedulable_silent = NodeId::new();
+        let open_silent = NodeId::new();
         let drained_busy = NodeId::new();
         let drained_recent = NodeId::new();
         let lost_silent = NodeId::new();
         let untracked = NodeId::new();
 
         let mut sm = StateMachine::default();
-        for (id, schedulable) in [
+        for (id, open) in [
             (drained_silent, false),
-            (schedulable_silent, true),
+            (open_silent, true),
             (drained_busy, false),
             (drained_recent, false),
             (untracked, false),
         ] {
-            sm.nodes.insert(id, node_record(id, 1, schedulable));
+            sm.nodes.insert(id, node_record(id, 1, open));
         }
-        // A node the health monitor already declared lost: unschedulable with
+        // A node the health monitor already declared lost: drained with
         // every allocation released. Its record is precisely what this GC is
         // for — a churning ASG would otherwise accumulate them forever.
         sm.nodes
@@ -821,12 +821,7 @@ mod tests {
         let liveness = NodeLiveness::new();
         liveness.seed(
             1,
-            [
-                drained_silent,
-                schedulable_silent,
-                drained_busy,
-                lost_silent,
-            ],
+            [drained_silent, open_silent, drained_busy, lost_silent],
             base,
         );
         liveness.seed(1, [drained_recent], now);
@@ -838,11 +833,11 @@ mod tests {
         assert!(due.contains(&drained_silent));
         assert!(due.contains(&lost_silent));
         // Still taking work: an operator undrained it, or it never drained.
-        assert!(!due.contains(&schedulable_silent));
+        assert!(!due.contains(&open_silent));
         // Still holding a live allocation: apply would reject the batch.
         assert!(!due.contains(&drained_busy));
         // Heard from inside the window: a node drained for maintenance whose
-        // agent is still up keeps its record (and its cordon).
+        // agent is still up keeps its record (and its drain).
         assert!(!due.contains(&drained_recent));
         // No mark at all — the same rule `stale_nodes` follows.
         assert!(!due.contains(&untracked));
@@ -859,7 +854,7 @@ mod tests {
 
     /// An agent that announced its own shutdown (ADR 0041) and then went away
     /// travels the same path: `draining` alone stops placements, so the record
-    /// becomes due without any admin cordon or `DeclareNodeLost`.
+    /// becomes due without any operator's drain or `DeclareNodeLost`.
     #[test]
     fn an_agent_announced_drain_is_enough_to_make_a_record_due() {
         let retention = PolicyConfig::default()

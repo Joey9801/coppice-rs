@@ -746,7 +746,7 @@ pub struct NodeRecord {
     pub epoch: u64,
     /// The agent's own announcement that it is shutting down (ADR 0041).
     ///
-    /// Distinct from the admin cordon [`Node::schedulable`]. Set from the
+    /// Distinct from the operator's drain [`Node::drain`]. Set from the
     /// agent's reports and **cleared by a re-registration whose report does
     /// not carry it**, so an agent restart never leaves a node permanently
     /// drained, while an operator's drain survives it.
@@ -759,13 +759,14 @@ pub struct NodeRecord {
 }
 
 impl NodeRecord {
-    /// The single placement gate (ADR 0041): the admin has not cordoned the
-    /// node *and* the agent has not announced that it is leaving. Everything
-    /// that decides "may this node take new work" asks this, so the two
-    /// flags can never disagree. Display surfaces that report the cordon
-    /// itself still read [`Node::schedulable`] directly.
-    pub fn accepts_placements(&self) -> bool {
-        self.node.schedulable && !self.draining
+    /// Whether the node is being emptied, by the operator's drain record or
+    /// by the agent's own announcement (ADR 0044 §5 amending ADR 0041).
+    /// Everything that decides "may this node take new work" asks this, so
+    /// the two flags can never disagree. Display surfaces that report either
+    /// flag on its own still read [`Node::drain`] or
+    /// [`draining`](Self::draining) directly.
+    pub fn is_draining(&self) -> bool {
+        self.node.drain.is_some() || self.draining
     }
 }
 
@@ -949,14 +950,17 @@ pub enum RejectionReason {
     AttemptNotOnNode { attempt: AttemptId, node: NodeId },
     #[error("allocation {0} is not accruing")]
     AllocationNotAccruing(AllocationId),
-    #[error("node {0} is not schedulable")]
-    NodeNotSchedulable(NodeId),
+    /// The node is draining — by the operator's record or the agent's
+    /// announcement — and does not admit this placement (ADR 0044 §5).
+    #[error("node {0} is draining")]
+    NodeDraining(NodeId),
     /// The node is `preemptible_only` and the job is not effectively
     /// preemptible (ADR 0044 §4).
     #[error("node {0} accepts only preemptible work")]
     NodeRequiresPreemptible(NodeId),
-    #[error("node {0} still accepts placements")]
-    NodeAcceptsPlacements(NodeId),
+    /// Eviction of a node that is not draining by either flag (ADR 0041).
+    #[error("node {0} is not draining")]
+    NodeNotDraining(NodeId),
     #[error("node {0} still holds a live allocation")]
     NodeNotEmpty(NodeId),
     #[error("attempt {0} is not charged in intervals")]

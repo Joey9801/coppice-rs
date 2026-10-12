@@ -1086,7 +1086,7 @@ async fn a_follower_reports_node_health_from_the_leaders_liveness_marks() {
     assert_eq!(nodes["total"], 1, "{overview}");
     assert_eq!(nodes["lost"], 0, "{overview}");
     assert_eq!(
-        nodes["schedulable"], 1,
+        nodes["open"], 1,
         "a healthy node's capacity is the cluster's to schedule against: {overview}"
     );
 

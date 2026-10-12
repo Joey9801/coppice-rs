@@ -93,7 +93,7 @@ checks the request's stamped cluster identity before touching Raft. See
 `.await` edge and keeps the blocking graph acyclic. Ingestion `mark`s a node on
 every inbound report; housekeeping `seed`s a grace window on gaining leadership
 and, on its 60 s tick, proposes `DeclareNodeLost` for any node silent past the
-liveness deadline that is still schedulable or holds live allocations. See
+liveness deadline that is not yet drained or holds live allocations. See
 [failure-handling](../../docs/operations/failure-handling.md).
 
 ## Boundaries

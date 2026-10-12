@@ -18,7 +18,7 @@ use coppice_core::env;
 use coppice_core::id::{AllocationId, AttemptId, JobId, NodeId, QuotaEntityId};
 use coppice_core::job::{AbortRequest, Job, JobState};
 use coppice_core::metadata::{self, JobMetadata};
-use coppice_core::node::Node;
+use coppice_core::node::{Drain, Node};
 use coppice_core::preemption;
 use coppice_core::quota::{
     self, ChargeInterval, ChargeRecord, CostUnits, Settlement, TrueUp, UsageState,
@@ -35,7 +35,7 @@ use crate::command::{
     RecordAttemptExited, RecordAttemptNotified, RecordAttemptOutcome, RecordAttemptStarted,
     RecordCaCertificate, RecordEnrolledIdentity, RecordKeyTransferIntent,
     RecordStagedKeyTransferIntent, RegisterNode, RenewIntervalCharges, RetireMachineBinding,
-    RevokeEnrollToken, RevokeIdentity, SetNodeDraining, SetNodeSchedulable, SubmitJob,
+    RevokeEnrollToken, RevokeIdentity, SetNodeDrain, SetNodeDraining, SubmitJob,
     UpdateAuthorization, UpdateJobMetadata, UpdatePolicy,
 };
 use crate::{
@@ -67,7 +67,7 @@ impl StateMachine {
             Command::RecordAttemptNotified(c) => self.record_attempt_notified(c),
             Command::RegisterNode(c) => self.register_node(c),
             Command::DeclareNodeLost(c) => self.declare_node_lost(c),
-            Command::SetNodeSchedulable(c) => self.set_node_schedulable(c),
+            Command::SetNodeDrain(c) => self.set_node_drain(c),
             Command::SetNodeDraining(c) => self.set_node_draining(c),
             Command::EvictTerminalJobs(c) => self.evict_terminal_jobs(c),
             Command::EvictNodes(c) => self.evict_nodes(c),
@@ -644,10 +644,10 @@ impl StateMachine {
         let Some(node) = self.nodes.get(&spec.node) else {
             return Some(RejectionReason::UnknownNode(spec.node));
         };
-        // One gate for both reasons a node refuses work (ADR 0041): the
-        // admin cordon and the agent's own shutdown announcement.
-        if !node.accepts_placements() {
-            return Some(RejectionReason::NodeNotSchedulable(spec.node));
+        // One gate for both reasons a node refuses work (ADR 0044 §5): the
+        // operator's drain and the agent's own shutdown announcement.
+        if node.is_draining() {
+            return Some(RejectionReason::NodeDraining(spec.node));
         }
         // ADR 0044 §4: a spot-only node takes only effectively preemptible
         // work, resolved exactly as the effects phase will record it.
@@ -1018,7 +1018,7 @@ impl StateMachine {
         match self.nodes.get_mut(&c.node) {
             Some(rec) => {
                 // Re-registration: the epoch bump fences every command issued
-                // under earlier epochs (ADR 0009). The admin cordon survives —
+                // under earlier epochs (ADR 0009). The operator's drain survives —
                 // desired state owned by the admin, not the agent's restart.
                 rec.epoch += 1;
                 // The agent's own announcement is rewritten from this report
@@ -1053,7 +1053,7 @@ impl StateMachine {
                             id: c.node,
                             capacity: c.capacity,
                             labels: c.labels.clone(),
-                            schedulable: true,
+                            drain: None,
                             service_addr: c.service_addr.clone(),
                             host_facts: c.host_facts.clone(),
                             detected_capacity: c.detected_capacity,
@@ -1081,7 +1081,14 @@ impl StateMachine {
             None => return Err(RejectionReason::UnknownNode(c.node)),
             Some(rec) => {
                 rec.epoch += 1;
-                rec.node.schedulable = false;
+                // A lost node is drained (ADR 0044 §5): nothing is admitted
+                // until an operator undrains it. An existing drain keeps its
+                // original stamp.
+                if rec.node.drain.is_none() {
+                    rec.node.drain = Some(Drain {
+                        requested_at: c.declared_at,
+                    });
+                }
                 events.push(Event::NodeEpochBumped {
                     node: c.node,
                     epoch: rec.epoch,
@@ -1119,7 +1126,7 @@ impl StateMachine {
         Ok(Applied { events })
     }
 
-    fn set_node_schedulable(&mut self, c: &SetNodeSchedulable) -> ApplyResult {
+    fn set_node_drain(&mut self, c: &SetNodeDrain) -> ApplyResult {
         // Existence first, then authority — the catalog's validation order,
         // so an actor-less command's rejections are exactly what they were.
         if !self.nodes.contains_key(&c.node) {
@@ -1130,9 +1137,17 @@ impl StateMachine {
         let Some(rec) = self.nodes.get_mut(&c.node) else {
             return Err(RejectionReason::UnknownNode(c.node));
         };
-        // Drain blocks new placements only: running work continues and
-        // existing accruals keep funding.
-        rec.node.schedulable = c.schedulable;
+        // Drain gates admission only: running work continues and existing
+        // accruals keep funding. Re-draining keeps the drain already on
+        // record, so `requested_at` never moves; undrain clears it.
+        match c.drain {
+            Some(drain) => {
+                if rec.node.drain.is_none() {
+                    rec.node.drain = Some(drain);
+                }
+            }
+            None => rec.node.drain = None,
+        }
         Ok(Applied::default())
     }
 
@@ -1144,8 +1159,8 @@ impl StateMachine {
         };
         // The announcement gates placements and nothing else: running work
         // continues and existing accruals keep funding, exactly as under an
-        // admin cordon. The cordon itself is untouched — the two flags have
-        // different owners.
+        // operator's drain. The drain record itself is untouched — the two
+        // flags have different owners.
         rec.draining = c.draining;
         // Display-only (ADR 0044 §5): the agent's reading of the provider's
         // deadline, carried by the same announcement.
@@ -1212,8 +1227,10 @@ impl StateMachine {
             let Some(rec) = self.nodes.get(node) else {
                 continue;
             };
-            let reason = if rec.accepts_placements() {
-                Some(RejectionReason::NodeAcceptsPlacements(*node))
+            // Retention GC's precondition (ADR 0044 §5): draining, by the
+            // record or by the announcement.
+            let reason = if !rec.is_draining() {
+                Some(RejectionReason::NodeNotDraining(*node))
             } else if self.allocations.values().any(|a| {
                 a.allocation.node == *node && a.allocation.state != AllocationState::Released
             }) {
@@ -1566,7 +1583,7 @@ impl StateMachine {
     // These commit administrative identity facts with no event subscribers in
     // v1 — the consuming flows (formation chunk 03, enrollment chunk 04, key
     // transfer chunk 06) read the replicated state directly, not the event
-    // fanout — so, like `SetNodeSchedulable`, they emit no events.
+    // fanout — so, like `SetNodeDrain`, they emit no events.
 
     fn record_ca_certificate(&mut self, c: &RecordCaCertificate) -> ApplyResult {
         // Bundle validity (certificate blocks only, never a key) is enforced

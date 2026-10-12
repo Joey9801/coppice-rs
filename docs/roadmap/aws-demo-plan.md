@@ -184,7 +184,7 @@ manual step in the whole design, done once. Every environment then gets
    a refusal, not a second cluster.
 3. Poll `https://<env>.demo.<domain>/readyz?require=healthy` until 200,
    then `coppice cluster status` until three voters, then `GET /nodes`
-   until three schedulable agents.
+   until three open agents.
 4. Print the URLs, the demo user, and an exported `COPPICE_API` /
    `COPPICE_TOKEN` snippet.
 
@@ -200,7 +200,7 @@ Maps onto #51's acceptance criteria:
 | # | Criterion | Check |
 |---|---|---|
 | 1 | one command creates six nodes + services | `up.sh` exits 0 |
-| 2 | three voters, three schedulable agents | `cluster status`, `GET /nodes` |
+| 2 | three voters, three open agents | `cluster status`, `GET /nodes` |
 | 3 | real Docker job, queryable afterwards | submit `examples/jobs/…`, wait terminal, `job logs` and `job usage` non-empty, `GET /jobs/{id}` shows transitions |
 | 4 | Prometheus scrapes all six | Prometheus API `count(up==1)` is 6, via SSM port-forward |
 | 4 | OAuth protects the client API | tokenless `GET /api/v1/overview` is 401; Cognito token succeeds |
@@ -265,7 +265,7 @@ four sessions because chunk 2 needs real-AWS iteration.
    from the stamp, and an agent that enrols, reaches Docker and registers.
 2. **Terraform env stack and `up.sh` / `down.sh`** (large, the risky one).
    Bootstrap stack, env stack, cloud-init templates, SSM-driven formation,
-   Cognito. Done when `up.sh` reaches three voters and three schedulable
+   Cognito. Done when `up.sh` reaches three voters and three open
    agents from nothing, twice in a row with different `env_name`s, and
    `down.sh` leaves no resources. Product findings from the first real
    multi-host run are spun out as their own PRs against `main`, not folded

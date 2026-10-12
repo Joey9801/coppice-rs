@@ -47,7 +47,7 @@ so a retry re-sends the identical request and resolves to the original job —
 `Unavailable` and `NotLeader` are safe to retry blindly.
 
 The API is the proposer for the `SubmitJob`, `AbortJob`, and admin commands
-(`SetNodeSchedulable`, `ConfigureQuotaEntity`, `UpdatePolicy`,
+(`SetNodeDrain`, `ConfigureQuotaEntity`, `UpdatePolicy`,
 `BumpClusterVersion`) in the catalog, and pre-validates them so apply-time
 rejections stay a backstop for races.
 

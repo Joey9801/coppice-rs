@@ -14,7 +14,7 @@ use coppice_core::env::{JobEnv, MAX_VALUE_BYTES as ENV_MAX_VALUE_BYTES, MAX_VARS
 use coppice_core::id::{AllocationId, GroupId, JobId};
 use coppice_core::job::{JobState, RetryPolicy};
 use coppice_core::metadata::{JobMetadata, MAX_VALUE_BYTES};
-use coppice_core::node::HostFacts;
+use coppice_core::node::{Drain, HostFacts};
 use coppice_core::quota::{
     ChargeInterval, CostUnits, PriorityMultiplier, Settlement, TrueUp, FULL_REFUND_MILLI,
 };
@@ -22,7 +22,7 @@ use coppice_core::time::Duration;
 use coppice_state::authz::{Actor, Role};
 use coppice_state::command::{
     BumpClusterVersion, CommitPlacements, ConfigureQuotaEntity, DeclareNodeLost, EvictTerminalJobs,
-    JobMetadataUpdate, LostAttempt, ReconcileNode, SetNodeSchedulable, UpdateJobMetadata,
+    JobMetadataUpdate, LostAttempt, ReconcileNode, SetNodeDrain, UpdateJobMetadata,
 };
 use coppice_state::{
     Applied, Command, Event, PolicyConfig, Rejection, RejectionReason, StateMachine,
@@ -968,7 +968,13 @@ fn node_lost_fails_attempts_and_fences() {
         }),
     );
     assert_eq!(sm.nodes[&nid(1)].epoch, epoch_before + 1);
-    assert!(!sm.nodes[&nid(1)].node.schedulable);
+    assert_eq!(
+        sm.nodes[&nid(1)].node.drain,
+        Some(Drain {
+            requested_at: ts(TS_US + 60_000_000)
+        }),
+        "a lost node is drained, stamped at the declaration"
+    );
     assert_eq!(
         sm.attempts[&aid(11)].attempt.state,
         AttemptState::Terminal(AttemptOutcome::NodeLost)
@@ -982,28 +988,63 @@ fn reregistration_bumps_epoch_and_preserves_drain() {
     let mut sm = setup();
     apply_ok(
         &mut sm,
-        Command::SetNodeSchedulable(SetNodeSchedulable {
+        Command::SetNodeDrain(SetNodeDrain {
             node: nid(1),
-            schedulable: false,
+            drain: Some(Drain {
+                requested_at: base_ts(),
+            }),
             updated_at: base_ts(),
             actor: None,
         }),
     );
     let epoch_before = sm.nodes[&nid(1)].epoch;
     // The re-registration reports no shutdown announcement of its own, which
-    // clears `draining` (ADR 0041) — and must still leave the admin cordon
-    // exactly where the operator put it.
+    // clears `draining` (ADR 0041) — and must still leave the operator's
+    // drain exactly where the operator put it.
     apply_ok(
         &mut sm,
         register_node_cmd_draining(nid(1), cpu(20_000), ts(TS_US + 1), false),
     );
     assert_eq!(sm.nodes[&nid(1)].epoch, epoch_before + 1);
     assert_eq!(sm.nodes[&nid(1)].node.capacity, cpu(20_000));
-    assert!(
-        !sm.nodes[&nid(1)].node.schedulable,
+    assert_eq!(
+        sm.nodes[&nid(1)].node.drain,
+        Some(Drain {
+            requested_at: base_ts()
+        }),
         "an agent restart must not undo a drain"
     );
-    assert!(!sm.nodes[&nid(1)].accepts_placements());
+    assert!(sm.nodes[&nid(1)].is_draining());
+}
+
+/// Re-draining is idempotent (ADR 0044 §5): a drain on a node already
+/// draining keeps the drain on record, so `requested_at` never moves; undrain
+/// clears it, and a loss declaration keeps an existing drain too.
+#[test]
+fn set_node_drain_keeps_the_original_drain_and_undrain_clears_it() {
+    let mut sm = setup();
+    let first = Drain {
+        requested_at: base_ts(),
+    };
+    apply_ok(&mut sm, drain_cmd_at(nid(1), base_ts()));
+    apply_ok(&mut sm, drain_cmd_at(nid(1), ts(TS_US + 5_000_000)));
+    assert_eq!(sm.nodes[&nid(1)].node.drain, Some(first));
+
+    apply_ok(
+        &mut sm,
+        Command::DeclareNodeLost(DeclareNodeLost {
+            node: nid(1),
+            declared_at: ts(TS_US + 9_000_000),
+        }),
+    );
+    assert_eq!(sm.nodes[&nid(1)].node.drain, Some(first));
+
+    apply_ok(&mut sm, undrain_cmd(nid(1)));
+    assert_eq!(sm.nodes[&nid(1)].node.drain, None);
+    assert!(!sm.nodes[&nid(1)].is_draining());
+    // Undraining an open node is a successful no-op.
+    apply_ok(&mut sm, undrain_cmd(nid(1)));
+    assert_eq!(sm.nodes[&nid(1)].node.drain, None);
 }
 
 /// `EvictNodes` removes a node record outright (ADR 0041): the retention GC
@@ -1012,21 +1053,21 @@ fn reregistration_bumps_epoch_and_preserves_drain() {
 #[test]
 fn evict_nodes_removes_an_empty_drained_node() {
     let mut sm = setup();
-    apply_ok(&mut sm, set_schedulable_cmd(nid(1), false));
+    apply_ok(&mut sm, drain_cmd(nid(1)));
     let applied = apply_ok(&mut sm, evict_nodes_cmd(vec![nid(1)]));
     assert!(applied.events.is_empty());
     assert!(!sm.nodes.contains_key(&nid(1)));
     assert!(sm.accrual_queue.is_empty());
 
     // An agent that was not actually gone re-registers as a genuinely new
-    // record: epoch restarts at 1, schedulable, and every command fenced by
+    // record: epoch restarts at 1, undrained, and every command fenced by
     // the old epoch is already dead.
     apply_ok(
         &mut sm,
         register_node_cmd(nid(1), cpu(10_000), ts(TS_US + 1)),
     );
     assert_eq!(sm.nodes[&nid(1)].epoch, 1);
-    assert!(sm.nodes[&nid(1)].accepts_placements());
+    assert!(!sm.nodes[&nid(1)].is_draining());
 }
 
 /// Idempotence across leader changes: a re-proposal listing an id that the
@@ -1039,13 +1080,13 @@ fn evict_nodes_skips_missing_ids() {
 }
 
 #[test]
-fn evict_nodes_rejects_a_node_that_still_accepts_placements() {
+fn evict_nodes_rejects_a_node_that_is_not_draining() {
     let mut sm = setup();
     assert_eq!(
         sm.apply(&evict_nodes_cmd(vec![nid(1)])).unwrap_err(),
         RejectionReason::InvalidBatch(vec![Rejection {
             item_index: 0,
-            reason: RejectionReason::NodeAcceptsPlacements(nid(1))
+            reason: RejectionReason::NodeNotDraining(nid(1))
         }])
     );
     assert!(sm.nodes.contains_key(&nid(1)));
@@ -1095,15 +1136,16 @@ fn evict_nodes_rejects_a_drained_node_that_still_holds_live_work() {
 }
 
 /// `SetNodeDraining` is the heartbeat half of the agent's announcement
-/// (ADR 0041): machine-proposed, no events, and it never writes the cordon.
+/// (ADR 0041): machine-proposed, no events, and it never writes the drain
+/// record.
 #[test]
-fn set_node_draining_gates_placements_and_leaves_the_cordon_alone() {
+fn set_node_draining_gates_placements_and_leaves_the_drain_record_alone() {
     let mut sm = setup();
     let applied = apply_ok(&mut sm, set_draining_cmd(nid(1), true));
     assert!(applied.events.is_empty());
     assert!(sm.nodes[&nid(1)].draining);
-    assert!(sm.nodes[&nid(1)].node.schedulable);
-    assert!(!sm.nodes[&nid(1)].accepts_placements());
+    assert_eq!(sm.nodes[&nid(1)].node.drain, None);
+    assert!(sm.nodes[&nid(1)].is_draining());
 
     apply_ok(
         &mut sm,
@@ -1119,7 +1161,7 @@ fn set_node_draining_gates_placements_and_leaves_the_cordon_alone() {
         rejection,
         RejectionReason::InvalidBatch(vec![Rejection {
             item_index: 0,
-            reason: RejectionReason::NodeNotSchedulable(nid(1))
+            reason: RejectionReason::NodeDraining(nid(1))
         }])
     );
 
@@ -1127,22 +1169,22 @@ fn set_node_draining_gates_placements_and_leaves_the_cordon_alone() {
     // on the next heartbeat.
     apply_ok(&mut sm, set_draining_cmd(nid(1), true));
     apply_ok(&mut sm, set_draining_cmd(nid(1), false));
-    assert!(sm.nodes[&nid(1)].accepts_placements());
+    assert!(!sm.nodes[&nid(1)].is_draining());
 }
 
-/// An admin cordon and the agent's announcement are independent: clearing
-/// one never clears the other.
+/// The operator's drain and the agent's announcement are independent:
+/// clearing one never clears the other.
 #[test]
-fn set_node_draining_and_the_admin_cordon_are_independent() {
+fn set_node_draining_and_the_operator_drain_are_independent() {
     let mut sm = setup();
-    apply_ok(&mut sm, set_schedulable_cmd(nid(1), false));
+    apply_ok(&mut sm, drain_cmd(nid(1)));
     apply_ok(&mut sm, set_draining_cmd(nid(1), true));
     apply_ok(&mut sm, set_draining_cmd(nid(1), false));
     assert!(
-        !sm.nodes[&nid(1)].node.schedulable,
-        "clearing the agent announcement must not lift the operator's cordon"
+        sm.nodes[&nid(1)].node.drain.is_some(),
+        "clearing the agent announcement must not lift the operator's drain"
     );
-    assert!(!sm.nodes[&nid(1)].accepts_placements());
+    assert!(sm.nodes[&nid(1)].is_draining());
 }
 
 #[test]
@@ -1155,19 +1197,20 @@ fn set_node_draining_rejects_an_unknown_node() {
 }
 
 /// The agent's own announcement gates placements on its own, without
-/// touching the admin cordon (ADR 0041): two flags, one gate.
+/// touching the operator's drain (ADR 0041): two flags, one gate.
 #[test]
-fn agent_announced_drain_blocks_placements_without_touching_the_cordon() {
+fn agent_announced_drain_blocks_placements_without_touching_the_drain_record() {
     let mut sm = setup();
     apply_ok(
         &mut sm,
         register_node_cmd_draining(nid(1), cpu(10_000), ts(TS_US + 1), true),
     );
-    assert!(
-        sm.nodes[&nid(1)].node.schedulable,
-        "an agent report never writes the admin cordon"
+    assert_eq!(
+        sm.nodes[&nid(1)].node.drain,
+        None,
+        "an agent report never writes the operator's drain"
     );
-    assert!(!sm.nodes[&nid(1)].accepts_placements());
+    assert!(sm.nodes[&nid(1)].is_draining());
 
     apply_ok(
         &mut sm,
@@ -1183,7 +1226,7 @@ fn agent_announced_drain_blocks_placements_without_touching_the_cordon() {
         rejection,
         RejectionReason::InvalidBatch(vec![Rejection {
             item_index: 0,
-            reason: RejectionReason::NodeNotSchedulable(nid(1))
+            reason: RejectionReason::NodeDraining(nid(1))
         }])
     );
 
@@ -1193,7 +1236,7 @@ fn agent_announced_drain_blocks_placements_without_touching_the_cordon() {
         &mut sm,
         register_node_cmd_draining(nid(1), cpu(10_000), ts(TS_US + 2), false),
     );
-    assert!(sm.nodes[&nid(1)].accepts_placements());
+    assert!(!sm.nodes[&nid(1)].is_draining());
     apply_ok(
         &mut sm,
         place_cmd(
@@ -1289,9 +1332,11 @@ fn drained_node_rejects_placements_but_keeps_funding() {
 
     apply_ok(
         &mut sm,
-        Command::SetNodeSchedulable(SetNodeSchedulable {
+        Command::SetNodeDrain(SetNodeDrain {
             node: nid(1),
-            schedulable: false,
+            drain: Some(Drain {
+                requested_at: base_ts(),
+            }),
             updated_at: base_ts(),
             actor: None,
         }),
@@ -1310,7 +1355,7 @@ fn drained_node_rejects_placements_but_keeps_funding() {
         rejection,
         RejectionReason::InvalidBatch(vec![Rejection {
             item_index: 0,
-            reason: RejectionReason::NodeNotSchedulable(nid(1))
+            reason: RejectionReason::NodeDraining(nid(1))
         }])
     );
 

@@ -453,7 +453,7 @@ of issue #47's chunk series), with the remaining OD-14/15(a) work limited to the
 chunk 07 test matrix and re-root runbook.
 
 **Half (b) resolved** (2026-09-13, issue #49) — [ADR 0041](../decisions/0041-graceful-scale-in-drain-and-node-eviction.md):
-the node record carries two flags — the admin cordon (`schedulable`,
+the node record carries two flags — the operator's drain record (`drain`,
 sticky across restarts) and the agent's own `draining` announcement
 (cleared by re-registration) — behind one placement gate; drain, undrain,
 and remove are ordinary HTTP writes (`coppice node drain --wait`); SIGTERM
@@ -480,7 +480,7 @@ relies on the 90 s `DeclareNodeLost` timeout, which kills running work —
 fine as a crash backstop, wrong as the *planned* path; and node records
 are currently immortal, so a churning ASG grows state forever.
 
-**Considerations.** `SetNodeSchedulable` already exists in the state
+**Considerations.** `SetNodeDrain` (then `SetNodeSchedulable`) already exists in the state
 machine with no production caller — the drain verb is mostly surface. The
 enrollment endpoint's protocol (token → CSR → leaf with CN = typed node
 id, renewal under the current cert) is identical for either signer, so the

@@ -27,7 +27,7 @@ use tokio::sync::watch;
 
 use coppice_api::http::dto::{
     AbortJobRequest, ConfigureQuotaEntityRequest, ConfigureQuotaEntityResponse, EvictNodeRequest,
-    PreemptionRequest, SetNodeSchedulableRequest, SubmitJobRequest, SubmitJobResponse,
+    PreemptionRequest, SetNodeDrainRequest, SubmitJobRequest, SubmitJobResponse,
     UpdateAuthorizationRequest, UpdateAuthorizationResponse, UpdateJobMetadataResponse,
 };
 use coppice_api::{
@@ -44,11 +44,12 @@ use coppice_core::id::{ClusterId, JobId, NodeId, QuotaEntityId};
 
 use crate::tasks::node_client::NodeClient;
 use coppice_core::job::Job;
+use coppice_core::node::Drain;
 use coppice_core::preemption::{NoticeSignal, PreemptionSpec};
 use coppice_core::quota::{CostUnits, PriorityMultiplier};
 use coppice_core::time::{Duration, Timestamp};
 use coppice_state::command::{
-    AbortJob, ConfigureQuotaEntity, EvictNodes, JobMetadataUpdate, SetNodeSchedulable, SubmitJob,
+    AbortJob, ConfigureQuotaEntity, EvictNodes, JobMetadataUpdate, SetNodeDrain, SubmitJob,
     UpdateAuthorization, UpdateJobMetadata,
 };
 use coppice_state::{Actor, Command};
@@ -113,13 +114,14 @@ pub trait LeaderWrites: Send + Sync + 'static {
         actor: &'a Actor,
     ) -> BoxFuture<'a, Result<UpdateAuthorizationResponse, ApiError>>;
 
-    /// The ADR 0041 admin cordon, either direction — `schedulable` is
-    /// assigned, so one method serves drain and undrain.
-    fn set_node_schedulable<'a>(
+    /// The operator's drain (ADR 0044 §5), either direction — the record is
+    /// assigned, so one method serves drain and undrain. The drain arrives
+    /// already stamped by the follower that took the HTTP request.
+    fn set_node_drain<'a>(
         &'a self,
         leader: CoordinatorId,
         node: NodeId,
-        schedulable: bool,
+        drain: Option<Drain>,
         actor: &'a Actor,
     ) -> BoxFuture<'a, Result<(), ApiError>>;
 
@@ -827,21 +829,22 @@ pub(crate) async fn update_authorization_here<C: Consensus>(
     Ok(UpdateAuthorizationResponse { log_index })
 }
 
-/// Propose one admin cordon on this replica, with no forwarding (ADR 0041).
+/// Propose one drain or undrain on this replica, with no forwarding
+/// (ADR 0044 §5).
 ///
-/// `schedulable` is assigned rather than toggled, so drain and undrain share
-/// this one function and re-proposing an already-applied value is a no-op.
-/// A node apply does not find rejects `UnknownNode`, which the HTTP layer
-/// reads as a 404.
-pub(crate) async fn set_node_schedulable_here<C: Consensus>(
+/// The record is assigned rather than toggled, so drain and undrain share
+/// this one function, and re-proposing is a no-op: a node already draining
+/// keeps its original drain. A node apply does not find rejects
+/// `UnknownNode`, which the HTTP layer reads as a 404.
+pub(crate) async fn set_node_drain_here<C: Consensus>(
     consensus: &C,
     node: NodeId,
-    schedulable: bool,
+    drain: Option<Drain>,
     actor: &Actor,
 ) -> Result<(), LocalWriteError> {
-    let command = Command::SetNodeSchedulable(SetNodeSchedulable {
+    let command = Command::SetNodeDrain(SetNodeDrain {
         node,
-        schedulable,
+        drain,
         actor: Some(actor.clone()),
         updated_at: Timestamp::now(),
     });
@@ -1158,18 +1161,19 @@ impl<C: Consensus> ControlPlane for CoordinatorControlPlane<C> {
         }
     }
 
-    async fn set_node_schedulable(
-        &self,
-        req: SetNodeSchedulableRequest,
-        actor: Actor,
-    ) -> Result<(), ApiError> {
-        match set_node_schedulable_here(&*self.consensus, req.node, req.schedulable, &actor).await {
+    async fn set_node_drain(&self, req: SetNodeDrainRequest, actor: Actor) -> Result<(), ApiError> {
+        // Stamped once, here, so a forwarded drain carries this replica's
+        // clock exactly as `updated_at` does on the direct path.
+        let drain = req.drain.then(|| Drain {
+            requested_at: Timestamp::now(),
+        });
+        match set_node_drain_here(&*self.consensus, req.node, drain, &actor).await {
             Ok(()) => Ok(()),
             Err(LocalWriteError::Api(e)) => Err(e),
             Err(LocalWriteError::NotLeader { leader }) => match self.forward_to(leader) {
                 Some((forwarder, leader)) => {
                     forwarder
-                        .set_node_schedulable(leader, req.node, req.schedulable, &actor)
+                        .set_node_drain(leader, req.node, drain, &actor)
                         .await
                 }
                 None => Err(no_leader_here(leader)),
@@ -2020,11 +2024,11 @@ mod tests {
             })
         }
 
-        fn set_node_schedulable<'a>(
+        fn set_node_drain<'a>(
             &'a self,
             leader: CoordinatorId,
             node: NodeId,
-            _schedulable: bool,
+            _drain: Option<Drain>,
             actor: &'a Actor,
         ) -> BoxFuture<'a, Result<(), ApiError>> {
             Box::pin(async move {
@@ -2453,10 +2457,10 @@ mod tests {
 
         let drained = NodeId::new();
         let removed = NodeId::new();
-        cp.set_node_schedulable(
-            SetNodeSchedulableRequest {
+        cp.set_node_drain(
+            SetNodeDrainRequest {
                 node: drained,
-                schedulable: false,
+                drain: true,
             },
             test_actor(),
         )
@@ -2483,10 +2487,10 @@ mod tests {
             .with_forwarder(Arc::clone(&forwarder) as Arc<dyn LeaderWrites>);
 
         let result = cp
-            .set_node_schedulable(
-                SetNodeSchedulableRequest {
+            .set_node_drain(
+                SetNodeDrainRequest {
                     node: NodeId::new(),
-                    schedulable: false,
+                    drain: true,
                 },
                 test_actor(),
             )

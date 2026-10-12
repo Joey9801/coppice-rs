@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use coppice_core::bytes::ByteSize;
 use coppice_core::id::{AllocationId, AttemptId, GroupId, JobId, NodeId, QuotaEntityId};
 use coppice_core::job::{Job, RetryPolicy};
+use coppice_core::node::Drain;
 use coppice_core::quota::{CostUnits, CostWeights, PriorityMultiplier};
 use coppice_core::resource::Resources;
 use coppice_core::time::{Duration, Timestamp};
@@ -15,8 +16,8 @@ use coppice_state::authz::{Actor, Binding, Role, Subject};
 use coppice_state::command::{
     AbortJob, AllocationSpec, BumpClusterVersion, CommitPlacements, ConfigureQuotaEntity,
     DispatchAttempt, EvictNodes, IntervalRenewal, Placement, RecordAttemptExited,
-    RecordAttemptOutcome, RecordAttemptStarted, RegisterNode, RenewIntervalCharges,
-    SetNodeDraining, SetNodeSchedulable, SubmitJob, UpdateAuthorization, UpdatePolicy,
+    RecordAttemptOutcome, RecordAttemptStarted, RegisterNode, RenewIntervalCharges, SetNodeDrain,
+    SetNodeDraining, SubmitJob, UpdateAuthorization, UpdatePolicy,
 };
 use coppice_state::{Applied, Command, PolicyConfig, StateMachine};
 use uuid::Uuid;
@@ -131,7 +132,7 @@ pub fn register_node_cmd(node: NodeId, capacity: Resources, at: Timestamp) -> Co
 
 /// [`register_node_cmd`] whose report carries the agent's own shutdown
 /// announcement (ADR 0041): `draining = true` blocks placements without
-/// touching the admin cordon, and `false` clears a previous announcement.
+/// touching the operator's drain, and `false` clears a previous announcement.
 pub fn register_node_cmd_draining(
     node: NodeId,
     capacity: Resources,
@@ -363,7 +364,7 @@ pub fn with_actor(command: Command, actor: Actor) -> Command {
             actor: Some(actor),
             ..c
         }),
-        Command::SetNodeSchedulable(c) => Command::SetNodeSchedulable(SetNodeSchedulable {
+        Command::SetNodeDrain(c) => Command::SetNodeDrain(SetNodeDrain {
             actor: Some(actor),
             ..c
         }),
@@ -411,10 +412,26 @@ pub fn update_authorization_cmd_with_claim(bindings: Vec<Binding>, claim: &str) 
     })
 }
 
-pub fn set_schedulable_cmd(node: NodeId, schedulable: bool) -> Command {
-    Command::SetNodeSchedulable(SetNodeSchedulable {
+/// Drain `node` (ADR 0044 §5), stamped at [`base_ts`].
+pub fn drain_cmd(node: NodeId) -> Command {
+    drain_cmd_at(node, base_ts())
+}
+
+/// Drain `node` with the drain and the command both stamped `at`.
+pub fn drain_cmd_at(node: NodeId, at: Timestamp) -> Command {
+    Command::SetNodeDrain(SetNodeDrain {
         node,
-        schedulable,
+        drain: Some(Drain { requested_at: at }),
+        actor: None,
+        updated_at: at,
+    })
+}
+
+/// Clear `node`'s drain.
+pub fn undrain_cmd(node: NodeId) -> Command {
+    Command::SetNodeDrain(SetNodeDrain {
+        node,
+        drain: None,
         actor: None,
         updated_at: base_ts(),
     })
@@ -431,7 +448,7 @@ pub fn evict_nodes_cmd(nodes: Vec<NodeId>) -> Command {
 }
 
 /// The agent's own shutdown announcement (ADR 0041), machine-proposed: no
-/// actor, and it never writes the admin cordon.
+/// actor, and it never writes the operator's drain.
 pub fn set_draining_cmd(node: NodeId, draining: bool) -> Command {
     Command::SetNodeDraining(SetNodeDraining {
         node,

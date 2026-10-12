@@ -24,13 +24,13 @@ use coppice_core::time::Timestamp;
 use coppice_state::ViewMemos;
 use http::dto::{
     AbortJobRequest, ConfigureQuotaEntityRequest, ConfigureQuotaEntityResponse, EvictNodeRequest,
-    SetNodeSchedulableRequest, SubmitJobRequest, SubmitJobResponse, UpdateAuthorizationRequest,
+    SetNodeDrainRequest, SubmitJobRequest, SubmitJobResponse, UpdateAuthorizationRequest,
     UpdateAuthorizationResponse, UpdateJobMetadataResponse,
 };
 
 /// The argument of [`ControlPlane::update_job_metadata`] (ADR 0042).
 ///
-/// **Not a wire body**, like [`SetNodeSchedulableRequest`]: the two HTTP
+/// **Not a wire body**, like [`SetNodeDrainRequest`]: the two HTTP
 /// routes have their own DTOs, and both map onto this. It carries the
 /// *domain* edit rather than the JSON one, so the conversion and the limit
 /// check happen once, at the edge, and everything below the seam — the
@@ -817,17 +817,18 @@ pub trait ControlPlane: Send + Sync + 'static {
         actor: coppice_state::Actor,
     ) -> impl Future<Output = Result<UpdateJobMetadataResponse, ApiError>> + Send;
 
-    /// Propose the admin cordon (ADR 0041) on behalf of `actor`: `schedulable
-    /// = false` drains the node, `true` undrains it. Same two-check
+    /// Propose the operator's drain (ADR 0044 §5) on behalf of `actor`:
+    /// `drain = true` drains the node, `false` undrains it. Same two-check
     /// arrangement as [`submit_job`](ControlPlane::submit_job), over the
-    /// cluster-scoped `Verb::Drain`.
+    /// cluster-scoped `Verb::Drain`. The implementation stamps the drain's
+    /// `requested_at` from its clock.
     ///
-    /// Assigns the flag rather than toggling it, so it is idempotent and
-    /// safe to retry. Unknown node rejects with
-    /// `RejectionReason::UnknownNode` (404).
-    fn set_node_schedulable(
+    /// Assigns the record rather than toggling it, and a node already
+    /// draining keeps its original drain, so it is idempotent and safe to
+    /// retry. Unknown node rejects with `RejectionReason::UnknownNode` (404).
+    fn set_node_drain(
         &self,
-        req: SetNodeSchedulableRequest,
+        req: SetNodeDrainRequest,
         actor: coppice_state::Actor,
     ) -> impl Future<Output = Result<(), ApiError>> + Send;
 
@@ -835,7 +836,7 @@ pub trait ControlPlane: Send + Sync + 'static {
     /// verb) on behalf of `actor` — an `EvictNodes` command naming the single
     /// node, the same command the leader's retention GC proposes in batches.
     ///
-    /// Refuses (409) a node that still accepts placements or holds a live
+    /// Refuses (409) a node that is not draining or holds a live
     /// allocation. A missing node is not a refusal: eviction skips missing
     /// ids, so a repeated `remove` is idempotent.
     fn evict_node(

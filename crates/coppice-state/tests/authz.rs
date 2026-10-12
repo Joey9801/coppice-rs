@@ -61,7 +61,7 @@ fn actor_less_commands_are_unaffected_by_bindings() {
 
     apply_ok(&mut sm, submit_to(1, qid(SQUAD)));
     apply_ok(&mut sm, abort_cmd(jid(1), base_ts()));
-    apply_ok(&mut sm, set_schedulable_cmd(nid(1), false));
+    apply_ok(&mut sm, drain_cmd(nid(1)));
     apply_ok(&mut sm, configure_entity_cmd(qid(0xC1), Some(ROOT)));
     apply_ok(&mut sm, update_policy_cmd(test_policy(5)));
     apply_ok(&mut sm, bump_version_cmd(2));
@@ -81,7 +81,7 @@ fn an_actor_with_no_binding_is_denied_every_verb() {
 
     let commands = vec![
         with_actor(submit_to(1, qid(SQUAD)), ana.clone()),
-        with_actor(set_schedulable_cmd(nid(1), false), ana.clone()),
+        with_actor(drain_cmd(nid(1)), ana.clone()),
         with_actor(
             configure_entity_cmd(qid(0xC1), Some(qid(TEAM_A))),
             ana.clone(),
@@ -238,19 +238,13 @@ fn drain_takes_an_unscoped_binding() {
         ],
     );
     let reason = sm
-        .apply(&with_actor(
-            set_schedulable_cmd(nid(1), false),
-            actor("lead"),
-        ))
+        .apply(&with_actor(drain_cmd(nid(1)), actor("lead")))
         .expect_err("a scoped admin holds no cluster verb");
     assert!(denied(&reason), "{reason:?}");
-    assert!(sm.nodes[&nid(1)].node.schedulable);
+    assert_eq!(sm.nodes[&nid(1)].node.drain, None);
 
-    apply_ok(
-        &mut sm,
-        with_actor(set_schedulable_cmd(nid(1), false), actor("ops")),
-    );
-    assert!(!sm.nodes[&nid(1)].node.schedulable);
+    apply_ok(&mut sm, with_actor(drain_cmd(nid(1)), actor("ops")));
+    assert!(sm.nodes[&nid(1)].node.drain.is_some());
 }
 
 /// Node removal is the same cluster verb as drain (ADR 0041), and — like
@@ -266,15 +260,15 @@ fn node_eviction_takes_the_same_cluster_verb_as_drain() {
             principal_binding("lead", Role::Admin, Some(ROOT)),
         ],
     );
-    // A node that still accepts placements rejects on validation, whoever
+    // A node that is not draining rejects on validation, whoever
     // asked: the batch check runs before the authorization check, so an
     // actor-less proposer's rejections are exactly what they always were.
     let reason = sm
         .apply(&with_actor(evict_nodes_cmd(vec![nid(1)]), actor("nobody")))
-        .expect_err("nid(1) still accepts placements");
+        .expect_err("nid(1) is not draining");
     assert!(!denied(&reason), "{reason:?}");
 
-    apply_ok(&mut sm, set_schedulable_cmd(nid(1), false));
+    apply_ok(&mut sm, drain_cmd(nid(1)));
     let reason = sm
         .apply(&with_actor(evict_nodes_cmd(vec![nid(1)]), actor("lead")))
         .expect_err("a scoped admin holds no cluster verb");
@@ -296,10 +290,7 @@ fn drain_of_an_unknown_node_rejects_before_authorization() {
     let mut sm = tree_setup();
     install(&mut sm, vec![principal_binding("ops", Role::Admin, None)]);
     let reason = sm
-        .apply(&with_actor(
-            set_schedulable_cmd(nid(99), false),
-            actor("nobody"),
-        ))
+        .apply(&with_actor(drain_cmd(nid(99)), actor("nobody")))
         .expect_err("unknown node");
     assert!(
         matches!(reason, RejectionReason::UnknownNode(_)),
@@ -385,10 +376,7 @@ fn an_operator_certificate_holds_every_verb() {
         &mut sm,
         with_actor(abort_cmd(jid(1), base_ts()), cert.clone()),
     );
-    apply_ok(
-        &mut sm,
-        with_actor(set_schedulable_cmd(nid(1), false), cert.clone()),
-    );
+    apply_ok(&mut sm, with_actor(drain_cmd(nid(1)), cert.clone()));
     apply_ok(
         &mut sm,
         with_actor(update_policy_cmd(test_policy(5)), cert.clone()),

@@ -25,6 +25,7 @@ use coppice_core::bytes::ByteSize;
 use coppice_core::env::JobEnv;
 use coppice_core::job::RetryPolicy;
 use coppice_core::metadata::JobMetadata;
+use coppice_core::node::Drain;
 use coppice_core::preemption::{NoticeSignal, PreemptionSpec};
 use coppice_core::quota::{CostUnits, PriorityMultiplier};
 use coppice_core::resource::Resources;
@@ -34,7 +35,7 @@ use coppice_state::authz::{Binding, Role, Subject};
 use coppice_state::command::{
     BumpClusterVersion, ConfigureQuotaEntity, DeclareNodeLost, EvictNodes, EvictTerminalJobs,
     IntervalRenewal, JobMetadataUpdate, LostAttempt, ReconcileNode, RecordAttemptNotified,
-    RegisterNode, RenewIntervalCharges, SetNodeDraining, SetNodeSchedulable, UpdateAuthorization,
+    RegisterNode, RenewIntervalCharges, SetNodeDrain, SetNodeDraining, UpdateAuthorization,
     UpdateJobMetadata,
 };
 use coppice_state::{Command, StateMachine};
@@ -276,10 +277,12 @@ fn arb_global() -> impl Strategy<Value = Command> {
             any::<bool>(),
             arb_ts()
         )
-            .prop_map(|(n, schedulable, with_who, ts)| {
-                Command::SetNodeSchedulable(SetNodeSchedulable {
+            .prop_map(|(n, drain, with_who, ts)| {
+                Command::SetNodeDrain(SetNodeDrain {
                     node: node_of(n),
-                    schedulable,
+                    // Re-draining a draining node keeps the original stamp, so
+                    // sequences exercise both the set and the no-op paths.
+                    drain: drain.then_some(Drain { requested_at: ts }),
                     updated_at: ts,
                     // A cluster verb: whether this is accepted depends on the
                     // bindings installed earlier in the same sequence.

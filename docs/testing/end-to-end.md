@@ -70,7 +70,7 @@ case pins rather than restating it.
 ### E2E-2 — Overview sums the registered agent's capacity
 
 - **Do:** `GET $API/overview` with only the dev agent registered.
-- **Expect:** `capacity.nodes` = `{total:1, schedulable:1, lost:0}`; `capacity.capacity`
+- **Expect:** `capacity.nodes` = `{total:1, open:1, lost:0}`; `capacity.capacity`
   is the agent's advertised capacity; `allocated` and `used` all zero.
 - **Guards:** capacity is projected from the node map, not fabricated.
 

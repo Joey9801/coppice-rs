@@ -132,9 +132,9 @@ pub struct QueueStats {
 pub struct NodeCounts {
     /// Total registered nodes.
     pub total: u32,
-    /// Nodes that accept placements: neither cordoned nor agent-draining,
-    /// and not lost.
-    pub schedulable: u32,
+    /// Nodes open to any placement: neither drained by an operator nor
+    /// announced draining by their agent, and not lost.
+    pub open: u32,
     /// Nodes reported lost. Leader-local like the health it counts: a
     /// follower — with no heartbeat marks to judge by — reports 0, never a
     /// fabricated count.
@@ -418,7 +418,7 @@ mod tests {
             capacity: ClusterCapacity {
                 nodes: NodeCounts {
                     total: 1,
-                    schedulable: 1,
+                    open: 1,
                     lost: 0,
                 },
                 capacity: Resources {
@@ -484,7 +484,7 @@ mod tests {
                     }],
                 },
                 "capacity": {
-                    "nodes": { "total": 1, "schedulable": 1, "lost": 0 },
+                    "nodes": { "total": 1, "open": 1, "lost": 0 },
                     "capacity": { "cpu_millis": 4000, "memory_bytes": 0, "disk_bytes": 0 },
                     "allocated": { "cpu_millis": 0, "memory_bytes": 0, "disk_bytes": 0 },
                     "used": null,

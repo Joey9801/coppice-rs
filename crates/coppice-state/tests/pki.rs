@@ -1,7 +1,7 @@
 //! Apply-contract tests for the cluster PKI / identity commands (ADR 0037 §4,
 //! §5, §7): the accept/reject matrix for each command, the query surface, and
 //! the enrollment-token TTL filter. These commands are administrative facts
-//! with no event subscribers in v1, so — like `SetNodeSchedulable` — an
+//! with no event subscribers in v1, so — like `SetNodeDrain` — an
 //! accepted apply emits no events.
 
 mod common;

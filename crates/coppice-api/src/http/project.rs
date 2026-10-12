@@ -123,8 +123,10 @@ fn node_summary(
             .get(node_id)
             .map(|sample| (&sample.used).into()),
         labels: record.node.labels.clone(),
-        schedulable: record.node.schedulable,
-        draining: record.draining,
+        drain: record.node.drain.map(|drain| dto::NodeDrain {
+            requested_at: drain.requested_at,
+        }),
+        agent_draining: record.draining,
         preemptible_only: record.node.preemptible_only,
         interruption_deadline: record.interruption_deadline,
         health: node_health(mark),
@@ -276,7 +278,7 @@ fn cluster_capacity(
 
     let mut nodes = dto::NodeCounts {
         total: 0,
-        schedulable: 0,
+        open: 0,
         lost: 0,
     };
     let mut capacity = Resources::ZERO;
@@ -290,8 +292,8 @@ fn cluster_capacity(
             nodes.lost += 1;
         } else {
             capacity = capacity.saturating_add(&record.node.capacity);
-            if record.accepts_placements() {
-                nodes.schedulable += 1;
+            if !record.is_draining() {
+                nodes.open += 1;
             }
         }
         // Allocations on a lost node still hold their funding until the loss
@@ -1642,7 +1644,7 @@ mod tests {
                     disk: ByteSize::from_bytes(100_000_000_000),
                 },
                 labels: BTreeMap::new(),
-                schedulable: true,
+                drain: None,
                 service_addr: None,
                 host_facts: None,
                 detected_capacity: None,
@@ -1899,7 +1901,7 @@ mod tests {
         assert_eq!(by_id[&stepped_back].health, dto::NodeHealth::Lost);
     }
 
-    /// A lost node leaves the cluster's schedulable capacity — the read-side
+    /// A lost node leaves the cluster's open capacity — the read-side
     /// half of the `DeclareNodeLost` the monitor reaches from the same marks
     /// — while its allocations keep counting until the loss is reconciled.
     #[test]
@@ -1938,7 +1940,7 @@ mod tests {
 
         assert_eq!(capacity.nodes.total, 2);
         assert_eq!(capacity.nodes.lost, 1);
-        assert_eq!(capacity.nodes.schedulable, 1);
+        assert_eq!(capacity.nodes.open, 1);
         // Only the live node's capacity; the lost node's allocation still
         // holds its funding.
         assert_eq!(capacity.capacity.cpu_millis, 4000);
@@ -2242,7 +2244,9 @@ mod tests {
         let mut state = StateMachine::default();
         state.nodes.insert(n1, test_node(n1));
         let mut draining = test_node(n2);
-        draining.node.schedulable = false;
+        draining.node.drain = Some(coppice_core::node::Drain {
+            requested_at: ts(0),
+        });
         state.nodes.insert(n2, draining);
         state.allocations.insert(
             alloc,
@@ -2252,8 +2256,8 @@ mod tests {
         let capacity = overview(&state, ts(0)).capacity;
 
         assert_eq!(capacity.nodes.total, 2);
-        // A draining node is registered capacity but not schedulable.
-        assert_eq!(capacity.nodes.schedulable, 1);
+        // A draining node is registered capacity but not open.
+        assert_eq!(capacity.nodes.open, 1);
         assert_eq!(capacity.nodes.lost, 0);
         assert_eq!(capacity.capacity.cpu_millis, 8000);
         assert_eq!(capacity.allocated.cpu_millis, 1000);
@@ -2266,23 +2270,23 @@ mod tests {
     }
 
     #[test]
-    fn overview_excludes_an_agent_draining_node_from_schedulable_even_though_not_cordoned() {
+    fn overview_excludes_an_agent_draining_node_from_open_even_though_not_drained() {
         let n1 = NodeId::new();
         let n2 = NodeId::new();
 
         let mut state = StateMachine::default();
         state.nodes.insert(n1, test_node(n1));
         let mut agent_draining = test_node(n2);
-        // Not cordoned: the admin never asked for this. The agent announced
-        // its own shutdown, which must still exclude it from `schedulable`.
-        assert!(agent_draining.node.schedulable);
+        // Not drained: the admin never asked for this. The agent announced
+        // its own shutdown, which must still exclude it from `open`.
+        assert_eq!(agent_draining.node.drain, None);
         agent_draining.draining = true;
         state.nodes.insert(n2, agent_draining);
 
         let capacity = overview(&state, ts(0)).capacity;
 
         assert_eq!(capacity.nodes.total, 2);
-        assert_eq!(capacity.nodes.schedulable, 1);
+        assert_eq!(capacity.nodes.open, 1);
         assert!(capacity.history.is_empty());
     }
 

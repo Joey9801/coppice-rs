@@ -178,11 +178,11 @@ error rather than a runtime panic.
 
 1. **A drain verb**: `coppice node drain <node-id> [--wait]` over
    `POST /api/v1/nodes/{id}/drain` (plus `undrain` and `remove`),
-   proposing `SetNodeSchedulable{false}` with the caller's actor; `--wait`
+   proposing `SetNodeDrain{Some}` with the caller's actor; `--wait`
    polls `GET /nodes/{id}` until running and accruing counts reach zero.
 2. **Agent-initiated drain on shutdown**: SIGTERM → the agent's reports
    carry `draining`, which the leader replicates as a second flag on the
-   node record (distinct from the admin cordon, and cleared by
+   node record (distinct from the operator's drain record, and cleared by
    re-registration so a restart never leaves a node drained); the agent
    waits for its accountable work up to `shutdown_grace` (5 m), then
    exits, leaving overrun work to the `NodeLost` backstop. Cloud wiring —

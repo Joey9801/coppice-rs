@@ -102,12 +102,12 @@ pub fn node_utilization(node: NodeId) -> String {
     format!("/nodes/{node}/utilization")
 }
 
-/// `POST /nodes/{node}/drain` — cordon the node.
+/// `POST /nodes/{node}/drain` — drain the node.
 pub fn node_drain(node: NodeId) -> String {
     format!("/nodes/{node}/drain")
 }
 
-/// `POST /nodes/{node}/undrain` — lift the cordon.
+/// `POST /nodes/{node}/undrain` — clear the node's drain.
 pub fn node_undrain(node: NodeId) -> String {
     format!("/nodes/{node}/undrain")
 }

@@ -188,8 +188,8 @@ fn render_status(
         &mut out,
         "nodes",
         &format!(
-            "{} total, {} schedulable, {} lost",
-            capacity.nodes.total, capacity.nodes.schedulable, capacity.nodes.lost
+            "{} total, {} open, {} lost",
+            capacity.nodes.total, capacity.nodes.open, capacity.nodes.lost
         ),
     );
     kv(&mut out, "capacity", &resources(&capacity.capacity));
@@ -368,7 +368,7 @@ mod tests {
             capacity: dto::ClusterCapacity {
                 nodes: dto::NodeCounts {
                     total: 2,
-                    schedulable: 1,
+                    open: 1,
                     lost: 0,
                 },
                 capacity: dto::Resources {

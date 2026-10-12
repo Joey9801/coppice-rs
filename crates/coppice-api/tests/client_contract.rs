@@ -594,8 +594,10 @@ fn node_read_models_round_trip_through_the_client() {
         allocated: resources(1000, 1_000_000, 2_000_000),
         used: Some(resources(2500, 3_000_000_000, 50_000_000_000)),
         labels: BTreeMap::from([("zone".to_string(), "a".to_string())]),
-        schedulable: true,
-        draining: true,
+        drain: Some(dto::NodeDrain {
+            requested_at: ts(3_000_000),
+        }),
+        agent_draining: true,
         health: dto::NodeHealth::Healthy,
         epoch: 3,
         last_heartbeat: Some(ts(4_000_000)),
@@ -774,7 +776,7 @@ fn cluster_read_models_round_trip_through_the_client() {
         capacity: dto::ClusterCapacity {
             nodes: dto::NodeCounts {
                 total: 3,
-                schedulable: 2,
+                open: 2,
                 lost: 1,
             },
             capacity: resources(12_000, 24_000_000_000, 0),

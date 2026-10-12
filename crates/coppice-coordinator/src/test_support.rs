@@ -27,14 +27,17 @@ pub fn view_of(state: StateMachine) -> StateView {
     views.latest()
 }
 
-/// A node record at `epoch`, with the given schedulability and no labels.
-pub fn node_record(id: NodeId, epoch: u64, schedulable: bool) -> NodeRecord {
+/// A node record at `epoch`, open or drained, with no labels. A drained
+/// record carries a drain stamped at the epoch.
+pub fn node_record(id: NodeId, epoch: u64, open: bool) -> NodeRecord {
     NodeRecord {
         node: Node {
             id,
             capacity: Resources::ZERO,
             labels: BTreeMap::new(),
-            schedulable,
+            drain: (!open).then_some(coppice_core::node::Drain {
+                requested_at: coppice_core::time::Timestamp::UNIX_EPOCH,
+            }),
             service_addr: None,
             host_facts: None,
             detected_capacity: None,

@@ -271,7 +271,7 @@ followers, which is what lets followers serve reads and event streams.
    [command-catalog.md](command-catalog.md#declarenodelost): it seeds the
    liveness map on gaining leadership (grace) and proposes `DeclareNodeLost`
    for any node silent past `AGENT_LIVENESS_DEADLINE` that is still
-   schedulable or holds live allocations (the guard that stops re-declaring
+   not yet drained (no `drain` record) or holds live allocations (the guard that stops re-declaring
    an already-lost node every tick). The deadline is a node-local constant
    today; [configuration.md](../operations/configuration.md) records it as
    replicated policy, where it migrates once the policy schema grows it.

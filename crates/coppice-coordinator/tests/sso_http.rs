@@ -542,7 +542,7 @@ async fn missing_expired_and_forged_tokens_are_refused_on_reads_and_writes() {
 /// ordinary bootstrap path rather than as an emergency.
 ///
 /// Not covered here because they are not on the HTTP surface at all:
-/// `UpdatePolicy`, `SetNodeSchedulable` (node drain/undrain) and
+/// `UpdatePolicy`, `SetNodeDrain` (node drain/undrain) and
 /// `BumpClusterVersion` are actor-carrying commands with no route in
 /// `routes.rs`; `Verb::Drain` and `Verb::UpdatePolicy` are reachable only from
 /// the internal planes. The sibling

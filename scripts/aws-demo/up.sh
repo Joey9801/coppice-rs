@@ -275,17 +275,17 @@ wait_for_voters() {
 
 wait_for_nodes() {
   local body count deadline
-  say "waiting for three schedulable compute nodes"
+  say "waiting for three open compute nodes"
   deadline=$((SECONDS + timeout_secs))
   while :; do
     body="$(api_get "$fqdn" /api/v1/nodes)"
-    count="$(jq -r '[.nodes[]? | select(.schedulable and .health != "lost")] | length' \
+    count="$(jq -r '[.nodes[]? | select(.drain == null and (.agent_draining | not) and .health != "lost")] | length' \
       <<<"$body" 2>/dev/null || echo 0)"
     if [ "${count:-0}" -ge 3 ]; then
-      say "nodes: $count schedulable"
+      say "nodes: $count open"
       return 0
     fi
-    [ "$SECONDS" -lt "$deadline" ] || die "only ${count:-0} schedulable nodes after ${timeout_secs}s"
+    [ "$SECONDS" -lt "$deadline" ] || die "only ${count:-0} open nodes after ${timeout_secs}s"
     printf '  nodes: %s/3\n' "${count:-0}"
     sleep 10
   done

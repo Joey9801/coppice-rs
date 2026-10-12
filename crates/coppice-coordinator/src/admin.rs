@@ -1737,35 +1737,33 @@ impl<C: Consensus> RaftAdminService for AdminService<C> {
         }))
     }
 
-    /// The leader-side half of a forwarded admin cordon (ADR 0041). As the
-    /// four above, through the same
-    /// [`api_server::set_node_schedulable_here`] the direct path runs.
-    async fn forward_set_node_schedulable(
+    /// The leader-side half of a forwarded drain (ADR 0044 §5). As the
+    /// four above, through the same [`api_server::set_node_drain_here`] the
+    /// direct path runs. The follower stamped the drain's `requested_at`.
+    async fn forward_set_node_drain(
         &self,
-        request: Request<pb::ForwardSetNodeSchedulableRequest>,
-    ) -> Result<Response<pb::ForwardSetNodeSchedulableResponse>, Status> {
-        self.require_operator_or_machine(&request, "ForwardSetNodeSchedulable")?;
+        request: Request<pb::ForwardSetNodeDrainRequest>,
+    ) -> Result<Response<pb::ForwardSetNodeDrainResponse>, Status> {
+        self.require_operator_or_machine(&request, "ForwardSetNodeDrain")?;
         let req = request.into_inner();
         let (consensus, handle) = self.formed()?;
         Self::check_cluster(&req.history_id, &handle)?;
 
         let node: coppice_core::id::NodeId = req
             .node
-            .ok_or_else(|| {
-                Status::invalid_argument("missing ForwardSetNodeSchedulableRequest.node")
-            })?
+            .ok_or_else(|| Status::invalid_argument("missing ForwardSetNodeDrainRequest.node"))?
             .try_into()
             .map_err(|e| Status::invalid_argument(format!("{e}")))?;
-        let actor = crate::clientwrite::set_node_schedulable_actor_from_pb(req.actor)
+        let drain: Option<coppice_core::node::Drain> = req
+            .drain
+            .map(TryInto::try_into)
+            .transpose()
             .map_err(|e| Status::invalid_argument(format!("{e}")))?;
-        let outcome = api_server::set_node_schedulable_here(
-            consensus.as_ref(),
-            node,
-            req.schedulable,
-            &actor,
-        )
-        .await;
-        Ok(Response::new(pb::ForwardSetNodeSchedulableResponse {
+        let actor = crate::clientwrite::set_node_drain_actor_from_pb(req.actor)
+            .map_err(|e| Status::invalid_argument(format!("{e}")))?;
+        let outcome =
+            api_server::set_node_drain_here(consensus.as_ref(), node, drain, &actor).await;
+        Ok(Response::new(pb::ForwardSetNodeDrainResponse {
             // As the abort's: the DTO response is empty, so the applied index
             // has no client-visible use, but the outcome message is shared.
             outcome: Some(forwarded_outcome(outcome.map(|()| 0))?),
@@ -1802,7 +1800,7 @@ impl<C: Consensus> RaftAdminService for AdminService<C> {
     /// so one handler serves both routes. As the writes above, through the
     /// same [`api_server::update_job_metadata_here`] the direct path runs.
     ///
-    /// Unlike the abort/cordon/eviction outcomes, the log index here is real
+    /// Unlike the abort/drain/eviction outcomes, the log index here is real
     /// client-visible data — the HTTP response is `{ job, log_index }`, not
     /// an empty body — so it is threaded through rather than zeroed.
     async fn forward_update_job_metadata(
