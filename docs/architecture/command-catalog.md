@@ -140,6 +140,19 @@ a pending abort's `StopJob` when a session opens: the live send at
 diff stops any running allocation whose attempt is the job's current one and
 whose job has `abort_requested` set.
 
+A **delivered notice** (ADR 0044 §3) is not an attempt state, so it rides
+its own report arm, `AttemptNotice`, rather than a repeated `Running`
+status (which the dedupe above drops), and is repeated as
+`ObservedAllocation.notice` in the ObservedSet after a reconnect. Both
+normalize to `RecordAttemptNotified`, carrying the time *remaining* as a
+duration: the leader stamps `observed_at` with its own receive time and the
+deadline is `observed_at + remaining`, so no agent wall-clock time enters
+the log. The normalizer proposes it only when it would change the record
+(none yet, unacknowledged, or an earlier deadline), and for an attempt
+still `Dispatching` in the view it proposes the `Running` transition first
+(`RecordAttemptStarted`, or the ObservedSet's `ReconcileNode` adoption),
+since apply records a notice only for a `Running` attempt.
+
 ### The funding algorithm
 
 Funding is deterministic bookkeeping in the apply loop (ADR 0014). Exactly:
@@ -202,11 +215,15 @@ the same apply resolves the job:
    truth-wins case above, or `Aborted` job state when a revocation raced
    the abort — a combination the ordered log makes unreachable, specified
    for completeness.)
-3. **`Revoked` requeues free.** Job returns to `Queued`; `retries_used` is
-   not incremented. `Revoked` is pre-`Running` and `Platform`-class, so
-   true-up's refund fraction (ADR 0029) is 1000 either way: the attempt
-   never ran and true-up returns the full (decayed) charge, exactly as
-   under ADR 0019.
+3. **`Revoked` and `Preempted` requeue free.** Job returns to `Queued`;
+   `retries_used` is not incremented, for every `PreemptReason`, and there
+   is no cap on how often a job is preempted (ADR 0044 §2). Both are
+   `Platform`-class, so true-up's refund fraction (ADR 0029) is 1000:
+   `Revoked` is pre-`Running` and returns the full (decayed) charge, and a
+   `Preempted` attempt that ran is refunded its unused charge in full. A
+   pending abort still wins (rule 2): a preempted attempt that raced an
+   abort ends the job `Aborted`, the attempt keeping its `Preempted`
+   outcome.
 4. **Retry policy** for everything else:
    - `Success` → job `Succeeded`.
    - `UserError` outcomes (including all three limit breaches, ADR 0033) →
@@ -215,7 +232,7 @@ the same apply resolves the job:
      otherwise `Failed`.
    - `Platform` outcomes → retried while `retries_used < max_retries`;
      otherwise `Failed`.
-   - A retry is: `retries_used += 1` (except `Revoked`), job → `Queued` —
+   - A retry is: `retries_used += 1` (except `Revoked` and `Preempted`), job → `Queued` —
      the state transition drops the attempt id. The next attempt is created
      by a future `CommitPlacements`.
 5. **Quota true-up** (ADR 0019, refund fraction per ADR 0029) runs in the
@@ -276,7 +293,7 @@ Replay safety follows from purity plus explicit idempotency points:
 
 Each accepted command returns the list of change events it produced
 (`JobStateChanged`, `AttemptStateChanged`, `AllocationFunded`,
-`StopRequested`, …). Events are **derived output, not state**: they feed the
+`StopRequested`, `AttemptNotified`, …). Events are **derived output, not state**: they feed the
 ADR 0008 event fanout and the coordinator runtime (dispatch and stop
 signals), are produced deterministically, and are never read back by apply.
 `StopRequested` is how apply tells the runtime "this abort needs a `StopJob`
@@ -408,6 +425,16 @@ reachable through the API.
 | Apply effects | Attempt → `Terminal(outcome)` (legal from any non-terminal state — early endings arrive without prior started/exited commands); allocations `Released` + pledge pass; quota true-up (actual cost 0 if the attempt never reached `Running`, else from recorded rate × `ceil(actual_runtime_s)` × recorded multiplier; refund is the recorded `refund_fraction_milli` of the unused portion, or the full unused portion whenever the attempt never reached `Running` or `outcome`'s `OutcomeClass` is `Platform` — ADR 0029); job resolution per the rules above (retry / terminal / abort-wins / truth-wins), moving `Attempting(id)` directly to a terminal state or back to `Queued`. |
 | Rejections | `UnknownAttempt`, `StaleAttemptState`, `InvalidCommand` (outcome `Revoked`) |
 
+#### `RecordAttemptNotified`
+
+| | |
+| --- | --- |
+| Proposer | Ingestion, from an `AttemptNotice` report or a notice mark repeated on a running `ObservedAllocation` (ADR 0044 §3) |
+| Payload | `attempt: AttemptId`, `reason: PreemptReason` (`priority { for_job }` / `relocation { for_job }` / `drain` / `interruption`), `remaining_us: uint64` (time from the report to the agent's stop time), `shortfall_us: uint64` (declared notice minus notice given), `observed_at_us` (the leader's receive time) |
+| Validation | Attempt exists and is `Running` (the termination record exists only for a running attempt; a mark for one that has not been observed running, or has exited, is a stale report) |
+| Apply effects | Let `deadline = observed_at + remaining`. **No record**: create `AttemptRecord.preemption = { reason, requested_at: observed_at, acknowledged: { notified_at: observed_at, deadline, notice_shortfall: shortfall } }`. **Unacknowledged record** (a scheduler preemption): acknowledge it with those values, keeping its own `reason` and `requested_at`. **Acknowledged record**: the deadline only ever moves earlier — if `deadline` is earlier, replace it and `notice_shortfall`; otherwise an accepted no-op with no event. `notified_at` and `reason` never change once set. No allocation phase changes: the allocation stays `Active` until the attempt ends, and the scheduler publishes `deadline + abort_grace` as its release bound. Emits `AttemptNotified { attempt, job, node }` when the record changed. |
+| Rejections | `UnknownAttempt`, `StaleAttemptState` |
+
 #### `ReconcileNode`
 
 | | |
@@ -425,9 +452,9 @@ reachable through the API.
 | | |
 | --- | --- |
 | Proposer | Leader, on agent (re)registration |
-| Payload | `node: Node` (id, `capacity: Resources`, labels), `registered_at_us`, `service_addr`, `host_facts`, `detected_capacity`, `draining: bool` (the agent's own shutdown announcement, from its `Register` report — ADR 0041), `preemptible_only: bool` (the agent's `[preemption] preemptible_only`, spot capacity — ADR 0044 §4) |
+| Payload | `node: Node` (id, `capacity: Resources`, labels), `registered_at_us`, `service_addr`, `host_facts`, `detected_capacity`, `draining: bool` (the agent's own shutdown announcement, from its `Register` report — ADR 0041), `preemptible_only: bool` (the agent's `[preemption] preemptible_only`, spot capacity — ADR 0044 §4), `interruption_deadline_us: optional int64` (the provider's interruption deadline as the agent's clock read it, display-only — ADR 0044 §5) |
 | Validation | None beyond shape — registration is always legal |
-| Apply effects | New node: insert with `epoch = 1`, `schedulable = true`, `draining` from the command. Existing node: **bump `node_epoch`** (invalidating all commands issued under earlier epochs, per ADR 0009), update capacity, labels, `preemptible_only`, `service_addr`, and the display-only `host_facts` / `detected_capacity` (overwritten wholesale — a re-imaged host must not leave half the previous machine's story behind); the admin cordon `schedulable` is **not** touched — it is desired state owned by the admin, and an agent restart must not undo it, while `draining` **is** rewritten from the report, so an agent that comes back voids its earlier "I am leaving" at the same log position that bumps the epoch. Live allocations are untouched (the ObservedSet reconciliation that follows registration settles them). If capacity grew, run a pledge pass. |
+| Apply effects | New node: insert with `epoch = 1`, `schedulable = true`, `draining` from the command. Existing node: **bump `node_epoch`** (invalidating all commands issued under earlier epochs, per ADR 0009), update capacity, labels, `preemptible_only`, `interruption_deadline` (rewritten with `draining`), `service_addr`, and the display-only `host_facts` / `detected_capacity` (overwritten wholesale — a re-imaged host must not leave half the previous machine's story behind); the admin cordon `schedulable` is **not** touched — it is desired state owned by the admin, and an agent restart must not undo it, while `draining` **is** rewritten from the report, so an agent that comes back voids its earlier "I am leaving" at the same log position that bumps the epoch. Live allocations are untouched (the ObservedSet reconciliation that follows registration settles them). If capacity grew, run a pledge pass. |
 | Rejections | — (structurally infallible) |
 
 #### `DeclareNodeLost`
@@ -454,10 +481,10 @@ reachable through the API.
 
 | | |
 | --- | --- |
-| Proposer | Leader ingestion, when an agent's `Heartbeat` report carries a `draining` that differs from the replicated record (ADR 0041). A `Register` carries the same fact on `RegisterNode` instead, so this command never competes with a registration. Machine-proposed: no actor, like `DeclareNodeLost` |
-| Payload | `node: NodeId`, `draining: bool`, `at_us` |
+| Proposer | Leader ingestion, when an agent's `Heartbeat` report carries a `draining` or an `interruption_deadline_us` that differs from the replicated record (ADR 0041, ADR 0044 §5). A `Register` carries the same fact on `RegisterNode` instead, so this command never competes with a registration. Machine-proposed: no actor, like `DeclareNodeLost` |
+| Payload | `node: NodeId`, `draining: bool`, `interruption_deadline_us: optional int64` (agent wall-clock, display-only; absent clears it), `at_us` |
 | Validation | Node exists |
-| Apply effects | Set `NodeRecord.draining`. Gates placements through `accepts_placements()` and nothing else: running work continues and existing accruing allocations keep funding, exactly as under an admin cordon. `schedulable` is **not** touched — the cordon is the admin's flag and this one is the agent's. No events. |
+| Apply effects | Set `NodeRecord.draining` and `NodeRecord.interruption_deadline` (shown on the node view; nothing plans against it). Gates placements through `accepts_placements()` and nothing else: running work continues and existing accruing allocations keep funding, exactly as under an admin cordon. `schedulable` is **not** touched — the cordon is the admin's flag and this one is the agent's. No events. |
 | Rejections | `UnknownNode` |
 
 ### Housekeeping

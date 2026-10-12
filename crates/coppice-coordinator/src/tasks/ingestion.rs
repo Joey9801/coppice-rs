@@ -22,15 +22,15 @@ use tokio::sync::{mpsc, watch};
 
 use coppice_consensus::{Consensus, ConsensusStatus, StateView, StateViews};
 use coppice_core::allocation::AllocationState;
-use coppice_core::attempt::{AttemptOutcome, AttemptState};
+use coppice_core::attempt::{AttemptOutcome, AttemptState, PreemptReason};
 use coppice_core::id::{AllocationId, AttemptId, NodeId};
 use coppice_core::resource::Resources;
 use coppice_core::time::{Duration, Timestamp};
 use coppice_state::command::{
-    LostAttempt, ReconcileNode, RecordAttemptExited, RecordAttemptOutcome, RecordAttemptStarted,
-    RegisterNode, SetNodeDraining,
+    LostAttempt, ReconcileNode, RecordAttemptExited, RecordAttemptNotified, RecordAttemptOutcome,
+    RecordAttemptStarted, RegisterNode, SetNodeDraining,
 };
-use coppice_state::Command;
+use coppice_state::{AttemptRecord, Command};
 
 use crate::leadership;
 use crate::liveness::NodeLiveness;
@@ -331,6 +331,8 @@ fn normalize(view: &StateView, report: &InboundReport, now: Timestamp) -> Normal
                 // ADR 0044 §4: the agent's `[preemption] preemptible_only`,
                 // rewritten by every registration like capacity and labels.
                 preemptible_only: reg.preemptible_only,
+                // ADR 0044 §5, display-only: rewritten with `draining`.
+                interruption_deadline: reported_instant(reg.interruption_deadline_us),
             }));
         }
 
@@ -374,9 +376,124 @@ fn normalize(view: &StateView, report: &InboundReport, now: Timestamp) -> Normal
             let stale = report_epoch != node_record.epoch;
             observed_set_diff(view, node, report_epoch, set, now, stale, &mut out);
         }
+
+        // A delivered notice (ADR 0044 §3), fenced like an attempt status: a
+        // stale-epoch notice describes work the re-registration's
+        // ObservedSet will report again, with its mark, under the new epoch.
+        Body::AttemptNotice(notice) => {
+            let Some(node_record) = view.state().nodes.get(&node) else {
+                tracing::debug!(%node, "ingestion: attempt notice for unknown node, dropping");
+                return out;
+            };
+            if report_epoch != node_record.epoch {
+                tracing::debug!(%node, "ingestion: stale-epoch attempt notice dropped");
+                return out;
+            }
+            let Some(attempt_id) = notice
+                .attempt
+                .clone()
+                .and_then(|a| AttemptId::try_from(a).ok())
+            else {
+                tracing::debug!("ingestion: attempt notice with malformed attempt id, dropping");
+                return out;
+            };
+            let Some(reason) = notice
+                .reason
+                .clone()
+                .and_then(|r| PreemptReason::try_from(r).ok())
+            else {
+                tracing::debug!(
+                    ?attempt_id,
+                    "ingestion: attempt notice with bad reason, dropping"
+                );
+                return out;
+            };
+            let mark = Notice {
+                reason,
+                remaining: reported_runtime(notice.remaining_us),
+                shortfall: reported_runtime(notice.shortfall_us),
+            };
+            notice_diff(view, node, attempt_id, mark, now, &mut out.commands);
+        }
     }
 
     out
+}
+
+/// A display-only agent wall-clock instant (`int64` µs): out-of-range reads
+/// as absent rather than failing the report it rides.
+fn reported_instant(micros: Option<i64>) -> Option<Timestamp> {
+    micros.and_then(Timestamp::from_micros)
+}
+
+/// A delivered notice as the agent reported it, from either an
+/// `AttemptNotice` or a mark repeated in an `ObservedSet`.
+#[derive(Debug, Clone, Copy)]
+struct Notice {
+    reason: PreemptReason,
+    remaining: Duration,
+    shortfall: Duration,
+}
+
+/// Whether `RecordAttemptNotified` would change the attempt's record. Deduping
+/// keeps the post-reconnect ObservedSet repeat from writing a log entry per
+/// reconnect.
+fn notice_changes_record(record: &AttemptRecord, notice: &Notice, now: Timestamp) -> bool {
+    let deadline = now.saturating_add(notice.remaining);
+    match record.preemption.and_then(|p| p.acknowledged) {
+        Some(ack) => deadline < ack.deadline,
+        None => true,
+    }
+}
+
+/// Normalize a delivered notice (ADR 0044 §3) into `RecordAttemptNotified`,
+/// stamped with the leader's receive time.
+///
+/// A notice for a `Dispatching` attempt proves the container is running (the
+/// agent only signals running containers), so `RecordAttemptStarted` is
+/// proposed first: apply only records a notice for a `Running` attempt.
+fn notice_diff(
+    view: &StateView,
+    node: NodeId,
+    attempt_id: AttemptId,
+    notice: Notice,
+    now: Timestamp,
+    commands: &mut Vec<Command>,
+) {
+    let Some(record) = view.state().attempts.get(&attempt_id) else {
+        tracing::debug!(?attempt_id, "ingestion: attempt notice for unknown attempt");
+        return;
+    };
+    if record.attempt.node != node {
+        tracing::warn!(?attempt_id, %node, "ingestion: attempt notice from a node the attempt is not on, dropping");
+        return;
+    }
+    match record.attempt.state {
+        AttemptState::Dispatching => {
+            commands.push(Command::RecordAttemptStarted(RecordAttemptStarted {
+                attempt: attempt_id,
+                observed_at: now,
+            }));
+        }
+        AttemptState::Running => {
+            if !notice_changes_record(record, &notice, now) {
+                return;
+            }
+        }
+        // Exited, ended, or never started: nothing a notice can still change.
+        _ => return,
+    }
+    commands.push(notice_command(attempt_id, notice, now));
+}
+
+fn notice_command(attempt: AttemptId, notice: Notice, now: Timestamp) -> Command {
+    Command::RecordAttemptNotified(RecordAttemptNotified {
+        attempt,
+        reason: notice.reason,
+        remaining: notice.remaining,
+        shortfall: notice.shortfall,
+        observed_at: now,
+    })
 }
 
 /// Linear rank of an attempt phase, for the monotonic dedupe checks.
@@ -426,7 +543,11 @@ fn attempt_status_diff(
         tracing::debug!("ingestion: attempt status with malformed attempt id, dropping");
         return;
     };
-    let observed = match status.observed.and_then(|o| AttemptState::try_from(o).ok()) {
+    let observed = match status
+        .observed
+        .clone()
+        .and_then(|o| AttemptState::try_from(o).ok())
+    {
         Some(o) => o,
         None => {
             tracing::debug!(
@@ -512,15 +633,17 @@ fn heartbeat_diff(
     // owns. The diff reads the latest applied view like every other
     // ingestion dedupe; apply is idempotent, so losing a proposal race
     // under latency costs at most one redundant log entry.
-    if view
-        .state()
-        .nodes
-        .get(&node)
-        .is_some_and(|record| record.draining != hb.draining)
-    {
+    //
+    // The provider's interruption deadline (ADR 0044 §5) is the same
+    // announcement's display-only companion, diffed the same way.
+    let interruption_deadline = reported_instant(hb.interruption_deadline_us);
+    if view.state().nodes.get(&node).is_some_and(|record| {
+        record.draining != hb.draining || record.interruption_deadline != interruption_deadline
+    }) {
         out.commands.push(Command::SetNodeDraining(SetNodeDraining {
             node,
             draining: hb.draining,
+            interruption_deadline,
             at: now,
         }));
     }
@@ -598,6 +721,9 @@ fn observed_set_diff(
     out: &mut Normalized,
 ) {
     let mut adopted: Vec<AttemptId> = Vec::new();
+    // Notice marks repeated for running work (ADR 0044 §3), proposed after
+    // the `ReconcileNode` so an adopted attempt is `Running` by then.
+    let mut notices: Vec<Command> = Vec::new();
     let mut mentioned_alloc: BTreeSet<AllocationId> = BTreeSet::new();
     let mut mentioned_attempt: BTreeSet<AttemptId> = BTreeSet::new();
 
@@ -662,6 +788,30 @@ fn observed_set_diff(
         }
 
         if obs.running {
+            if let Some(mark) = obs.notice.as_ref() {
+                match observed_notice(mark) {
+                    Some(notice) => match attempt_state {
+                        AttemptState::Dispatching => {
+                            notices.push(notice_command(attempt_id, notice, now));
+                        }
+                        AttemptState::Running => {
+                            let changes = view
+                                .state()
+                                .attempts
+                                .get(&attempt_id)
+                                .is_some_and(|r| notice_changes_record(r, &notice, now));
+                            if changes {
+                                notices.push(notice_command(attempt_id, notice, now));
+                            }
+                        }
+                        _ => {}
+                    },
+                    None => tracing::debug!(
+                        ?attempt_id,
+                        "ingestion: observed notice with bad reason, ignoring"
+                    ),
+                }
+            }
             match attempt_state {
                 AttemptState::Dispatching => adopted.push(attempt_id),
                 AttemptState::Running => {} // already running, benign
@@ -674,6 +824,7 @@ fn observed_set_diff(
             // Observed exit: record the outcome (attempt is non-terminal here).
             let outcome = obs
                 .outcome
+                .clone()
                 .and_then(|o| AttemptOutcome::try_from(o).ok())
                 .filter(|o| !matches!(o, AttemptOutcome::Revoked))
                 .unwrap_or_else(|| {
@@ -731,6 +882,17 @@ fn observed_set_diff(
             observed_at: now,
         }));
     }
+    out.commands.extend(notices);
+}
+
+/// An `ObservedSet`'s repeated notice mark, or `None` with a bad reason.
+fn observed_notice(mark: &coppice_proto::pb::agent::v1::ObservedNotice) -> Option<Notice> {
+    let reason = PreemptReason::try_from(mark.reason.clone()?).ok()?;
+    Some(Notice {
+        reason,
+        remaining: reported_runtime(mark.remaining_us),
+        shortfall: reported_runtime(mark.shortfall_us),
+    })
 }
 
 #[cfg(test)]
@@ -781,6 +943,7 @@ mod tests {
             image_cache: None,
             used: None,
             draining: false,
+            interruption_deadline_us: None,
         })
     }
 
@@ -792,6 +955,7 @@ mod tests {
             image_cache: None,
             used: None,
             draining,
+            interruption_deadline_us: None,
         })
     }
 
@@ -803,6 +967,7 @@ mod tests {
             image_cache: None,
             used: Some(coppice_proto::convert::node_usage_to_pb(used, sampled_at)),
             draining: false,
+            interruption_deadline_us: None,
         })
     }
 
@@ -830,6 +995,7 @@ mod tests {
             running,
             outcome: outcome.map(|o| o.into()),
             runtime_us,
+            notice: None,
         }
     }
 
@@ -853,6 +1019,7 @@ mod tests {
             detected_capacity: Some((&requested()).into()),
             draining: false,
             preemptible_only: false,
+            interruption_deadline_us: None,
         });
 
         let out = normalize(&view, &report(node, 0, reg), now());
@@ -892,6 +1059,7 @@ mod tests {
                 detected_capacity: None,
                 draining,
                 preemptible_only: false,
+                interruption_deadline_us: None,
             })
         };
 
@@ -1522,6 +1690,7 @@ mod tests {
             detected_capacity: None,
             draining: false,
             preemptible_only: false,
+            interruption_deadline_us: None,
         });
         let inbound = report(node, 0, reg);
 
@@ -1549,6 +1718,345 @@ mod tests {
         assert!(matches!(
             routed.command.body,
             Some(coppice_proto::pb::agent::v1::agent_command::Body::RegisterAccepted(_))
+        ));
+    }
+
+    // ---- Delivered notices (ADR 0044 §3) ----
+
+    /// One attempt in `state` on a node at epoch 3, with its allocation and
+    /// job, and an optional termination record already in the view.
+    fn notice_fixture(
+        state: AttemptState,
+        preemption: Option<coppice_core::attempt::Preemption>,
+    ) -> (StateView, NodeId, AllocationId, AttemptId) {
+        let node = NodeId::new();
+        let job = JobId::new();
+        let alloc = AllocationId::new();
+        let attempt = AttemptId::new();
+        let mut sm = StateMachine::default();
+        sm.nodes.insert(node, node_record(node, 3, true));
+        sm.jobs
+            .insert(job, job_record(job, "img", requested(), None));
+        sm.allocations.insert(
+            alloc,
+            allocation_record(
+                alloc,
+                job,
+                attempt,
+                node,
+                requested(),
+                AllocationState::Active,
+            ),
+        );
+        let started = (state == AttemptState::Running).then_some(Timestamp::UNIX_EPOCH);
+        let mut record = attempt_record(attempt, job, alloc, node, state, started);
+        record.preemption = preemption;
+        sm.attempts.insert(attempt, record);
+        (view_of(sm), node, alloc, attempt)
+    }
+
+    fn attempt_notice(
+        alloc: AllocationId,
+        attempt: AttemptId,
+        remaining_s: i64,
+        shortfall_s: i64,
+    ) -> Body {
+        Body::AttemptNotice(coppice_proto::pb::agent::v1::AttemptNotice {
+            allocation: Some(alloc.into()),
+            attempt: Some(attempt.into()),
+            job: Some(JobId::new().into()),
+            reason: Some(PreemptReason::Interruption.into()),
+            remaining_us: Duration::from_secs(remaining_s).as_micros() as u64,
+            shortfall_us: Duration::from_secs(shortfall_s).as_micros() as u64,
+        })
+    }
+
+    fn acknowledged(deadline: Timestamp) -> coppice_core::attempt::Preemption {
+        coppice_core::attempt::Preemption {
+            reason: PreemptReason::Interruption,
+            requested_at: Timestamp::UNIX_EPOCH,
+            acknowledged: Some(coppice_core::attempt::Acknowledged {
+                notified_at: Timestamp::UNIX_EPOCH,
+                deadline,
+                notice_shortfall: Duration::ZERO,
+            }),
+        }
+    }
+
+    fn running_with_notice(
+        alloc: AllocationId,
+        attempt: AttemptId,
+        remaining_s: i64,
+    ) -> ObservedAllocation {
+        ObservedAllocation {
+            notice: Some(coppice_proto::pb::agent::v1::ObservedNotice {
+                reason: Some(PreemptReason::Drain.into()),
+                remaining_us: Duration::from_secs(remaining_s).as_micros() as u64,
+                shortfall_us: 0,
+            }),
+            ..observed(alloc, attempt, true, None, 0)
+        }
+    }
+
+    #[test]
+    fn an_attempt_notice_becomes_record_attempt_notified_stamped_now() {
+        let (view, node, alloc, attempt) = notice_fixture(AttemptState::Running, None);
+        let out = normalize(
+            &view,
+            &report(node, 3, attempt_notice(alloc, attempt, 90, 4)),
+            now(),
+        );
+        match &out.commands[..] {
+            [Command::RecordAttemptNotified(c)] => {
+                assert_eq!(c.attempt, attempt);
+                assert_eq!(c.reason, PreemptReason::Interruption);
+                assert_eq!(c.remaining, Duration::from_secs(90));
+                assert_eq!(c.shortfall, Duration::from_secs(4));
+                // The leader's receive time, never an agent clock.
+                assert_eq!(c.observed_at, now());
+            }
+            other => panic!("expected one RecordAttemptNotified, got {other:?}"),
+        }
+        assert!(out.liveness);
+    }
+
+    /// A mark that cannot move the acknowledged deadline earlier proposes
+    /// nothing; one that can still does.
+    #[test]
+    fn an_attempt_notice_is_deduped_against_the_acknowledged_deadline() {
+        let deadline = now() + Duration::from_secs(60);
+        let (view, node, alloc, attempt) =
+            notice_fixture(AttemptState::Running, Some(acknowledged(deadline)));
+        for remaining in [60, 600] {
+            let out = normalize(
+                &view,
+                &report(node, 3, attempt_notice(alloc, attempt, remaining, 0)),
+                now(),
+            );
+            assert!(
+                out.commands.is_empty(),
+                "remaining {remaining}s is not earlier"
+            );
+        }
+        let out = normalize(
+            &view,
+            &report(node, 3, attempt_notice(alloc, attempt, 59, 1)),
+            now(),
+        );
+        assert!(matches!(
+            &out.commands[..],
+            [Command::RecordAttemptNotified(c)] if c.remaining == Duration::from_secs(59)
+        ));
+
+        // An unacknowledged request is always acknowledged.
+        let requested = coppice_core::attempt::Preemption {
+            acknowledged: None,
+            ..acknowledged(deadline)
+        };
+        let (view, node, alloc, attempt) = notice_fixture(AttemptState::Running, Some(requested));
+        let out = normalize(
+            &view,
+            &report(node, 3, attempt_notice(alloc, attempt, 600, 0)),
+            now(),
+        );
+        assert!(matches!(
+            &out.commands[..],
+            [Command::RecordAttemptNotified(_)]
+        ));
+    }
+
+    /// A notice for an attempt the view still has `Dispatching` proves it is
+    /// running: the `Running` transition is proposed first, in order.
+    #[test]
+    fn a_notice_for_a_dispatching_attempt_follows_its_start() {
+        let (view, node, alloc, attempt) = notice_fixture(AttemptState::Dispatching, None);
+        let out = normalize(
+            &view,
+            &report(node, 3, attempt_notice(alloc, attempt, 30, 0)),
+            now(),
+        );
+        match &out.commands[..] {
+            [Command::RecordAttemptStarted(s), Command::RecordAttemptNotified(n)] => {
+                assert_eq!(s.attempt, attempt);
+                assert_eq!(n.attempt, attempt);
+            }
+            other => panic!("expected started then notified, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stale_or_misdirected_notices_propose_nothing() {
+        // Stale epoch.
+        let (view, node, alloc, attempt) = notice_fixture(AttemptState::Running, None);
+        let out = normalize(
+            &view,
+            &report(node, 2, attempt_notice(alloc, attempt, 30, 0)),
+            now(),
+        );
+        assert!(out.commands.is_empty());
+
+        // From a node the attempt is not on.
+        let other = NodeId::new();
+        let mut sm = view.state().clone();
+        sm.nodes.insert(other, node_record(other, 1, true));
+        let out = normalize(
+            &view_of(sm),
+            &report(other, 1, attempt_notice(alloc, attempt, 30, 0)),
+            now(),
+        );
+        assert!(out.commands.is_empty());
+
+        // Already ended, or exited and finalizing.
+        for state in [
+            AttemptState::Finalizing,
+            AttemptState::Terminal(AttemptOutcome::Exited { code: 0 }),
+        ] {
+            let (view, node, alloc, attempt) = notice_fixture(state, None);
+            let out = normalize(
+                &view,
+                &report(node, 3, attempt_notice(alloc, attempt, 30, 0)),
+                now(),
+            );
+            assert!(out.commands.is_empty());
+        }
+    }
+
+    /// The ObservedSet repeat of a mark (after a reconnect) is the same
+    /// command, deduped the same way, and follows the adoption that makes a
+    /// `Dispatching` attempt `Running`.
+    #[test]
+    fn an_observed_notice_is_recorded_after_the_adoption() {
+        let (view, node, alloc, attempt) = notice_fixture(AttemptState::Dispatching, None);
+        let set = Body::ObservedSet(ObservedSet {
+            allocations: vec![running_with_notice(alloc, attempt, 45)],
+        });
+        let out = normalize(&view, &report(node, 3, set), now());
+        match &out.commands[..] {
+            [Command::ReconcileNode(rn), Command::RecordAttemptNotified(n)] => {
+                assert_eq!(rn.adopted, vec![attempt]);
+                assert_eq!(n.attempt, attempt);
+                assert_eq!(n.reason, PreemptReason::Drain);
+                assert_eq!(n.remaining, Duration::from_secs(45));
+                assert_eq!(n.observed_at, now());
+            }
+            other => panic!("expected adopt then notified, got {other:?}"),
+        }
+
+        // Running and already acknowledged no later than this: nothing.
+        let (view, node, alloc, attempt) = notice_fixture(
+            AttemptState::Running,
+            Some(acknowledged(now() + Duration::from_secs(45))),
+        );
+        let set = Body::ObservedSet(ObservedSet {
+            allocations: vec![running_with_notice(alloc, attempt, 45)],
+        });
+        let out = normalize(&view, &report(node, 3, set), now());
+        assert!(out.commands.is_empty(), "got {:?}", out.commands);
+
+        // Under a stale epoch the repeat is demoted with everything else.
+        let (view, node, alloc, attempt) = notice_fixture(AttemptState::Running, None);
+        let set = Body::ObservedSet(ObservedSet {
+            allocations: vec![running_with_notice(alloc, attempt, 45)],
+        });
+        let out = normalize(&view, &report(node, 2, set), now());
+        assert!(out.commands.is_empty());
+    }
+
+    /// The agent classifies a platform kill as `Preempted`, and ingestion
+    /// passes it through like `Aborted` (only `Revoked` is filtered).
+    #[test]
+    fn a_reported_preempted_outcome_passes_through() {
+        let (view, node, alloc, attempt) = notice_fixture(AttemptState::Running, None);
+        let outcome = AttemptOutcome::Preempted {
+            reason: PreemptReason::Interruption,
+        };
+        let out = normalize(
+            &view,
+            &report(
+                node,
+                3,
+                attempt_status(attempt, &AttemptState::Terminal(outcome.clone()), 5),
+            ),
+            now(),
+        );
+        assert!(matches!(
+            &out.commands[..],
+            [Command::RecordAttemptOutcome(o)] if o.outcome == outcome
+        ));
+
+        let set = Body::ObservedSet(ObservedSet {
+            allocations: vec![observed(alloc, attempt, false, Some(&outcome), 5)],
+        });
+        let out = normalize(&view, &report(node, 3, set), now());
+        assert!(out.commands.iter().any(|c| matches!(
+            c,
+            Command::RecordAttemptOutcome(o) if o.outcome == outcome
+        )));
+    }
+
+    /// The provider's interruption deadline rides the draining announcement:
+    /// a heartbeat proposes `SetNodeDraining` when either differs, and a
+    /// registration carries it outright.
+    #[test]
+    fn the_interruption_deadline_rides_the_draining_announcement() {
+        let node = NodeId::new();
+        let mut sm = StateMachine::default();
+        sm.nodes.insert(node, node_record(node, 1, true));
+        let view = view_of(sm.clone());
+        let deadline = now() + Duration::from_secs(120);
+        let hb = |deadline: Option<Timestamp>| {
+            Body::Heartbeat(Heartbeat {
+                capacity: None,
+                running: Vec::new(),
+                image_cache: None,
+                used: None,
+                draining: true,
+                interruption_deadline_us: deadline.map(Timestamp::as_micros),
+            })
+        };
+
+        let out = normalize(&view, &report(node, 1, hb(Some(deadline))), now());
+        match &out.commands[..] {
+            [Command::SetNodeDraining(c)] => {
+                assert!(c.draining);
+                assert_eq!(c.interruption_deadline, Some(deadline));
+            }
+            other => panic!("expected one SetNodeDraining, got {other:?}"),
+        }
+
+        // Draining already recorded, deadline new: still a change.
+        sm.nodes.get_mut(&node).unwrap().draining = true;
+        let view = view_of(sm.clone());
+        let out = normalize(&view, &report(node, 1, hb(Some(deadline))), now());
+        assert!(matches!(
+            &out.commands[..],
+            [Command::SetNodeDraining(c)] if c.interruption_deadline == Some(deadline)
+        ));
+
+        // Both agree with the record: nothing.
+        sm.nodes.get_mut(&node).unwrap().interruption_deadline = Some(deadline);
+        let view = view_of(sm);
+        let out = normalize(&view, &report(node, 1, hb(Some(deadline))), now());
+        assert!(out.commands.is_empty());
+
+        let reg = Body::Register(Register {
+            capacity: Some((&requested()).into()),
+            labels: Vec::new(),
+            service_addr: None,
+            host_facts: None,
+            detected_capacity: None,
+            draining: true,
+            preemptible_only: true,
+            interruption_deadline_us: Some(deadline.as_micros()),
+        });
+        let out = normalize(
+            &view_of(StateMachine::default()),
+            &report(node, 0, reg),
+            now(),
+        );
+        assert!(matches!(
+            &out.commands[..],
+            [Command::RegisterNode(rn)] if rn.interruption_deadline == Some(deadline)
         ));
     }
 }

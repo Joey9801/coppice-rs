@@ -103,6 +103,9 @@ pub struct NodeSummary {
     /// The node takes only effectively preemptible work (ADR 0044 §4) —
     /// spot capacity, from the agent's `[preemption] preemptible_only`.
     pub preemptible_only: bool,
+    /// The provider's interruption deadline (ADR 0044 §5), by the agent's wall
+    /// clock: display only, never a scheduling input.
+    pub interruption_deadline: Option<Timestamp>,
     /// Liveness verdict.
     pub health: NodeHealth,
     /// Bumps on (re)registration or loss; fences stale agent commands.
@@ -260,6 +263,7 @@ mod tests {
             schedulable: true,
             draining: false,
             preemptible_only: true,
+            interruption_deadline: None,
             health: NodeHealth::Unreported,
             epoch: 3,
             last_heartbeat: None,
@@ -279,6 +283,7 @@ mod tests {
                 "schedulable": true,
                 "draining": false,
                 "preemptible_only": true,
+                "interruption_deadline": null,
                 "health": "unknown",
                 "epoch": 3,
                 "last_heartbeat": null,

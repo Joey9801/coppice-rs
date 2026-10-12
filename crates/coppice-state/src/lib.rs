@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use imbl::OrdMap;
 
 use coppice_core::allocation::Allocation;
-use coppice_core::attempt::{Attempt, AttemptState};
+use coppice_core::attempt::{Attempt, AttemptState, Preemption};
 use coppice_core::entity_ref::{QuotaEntityPath, QuotaEntityRef};
 use coppice_core::id::{
     AllocationId, AttemptId, EnrollTokenId, GroupId, JobId, MachineId, NodeId, QuotaEntityId,
@@ -721,6 +721,10 @@ pub struct AttemptRecord {
     /// already placed. When `true`, the policy's `preemptible_multiplier` is
     /// already folded into [`multiplier`](Self::multiplier).
     pub effective_preemptible: bool,
+    /// The attempt's termination record (ADR 0044 §3), created at most once,
+    /// while `Running`, by [`RecordAttemptNotified`](crate::command::RecordAttemptNotified).
+    /// Its acknowledged `deadline` only ever moves earlier.
+    pub preemption: Option<Preemption>,
 }
 
 /// An allocation's replicated record plus its commit-order sequence.
@@ -747,6 +751,11 @@ pub struct NodeRecord {
     /// not carry it**, so an agent restart never leaves a node permanently
     /// drained, while an operator's drain survives it.
     pub draining: bool,
+    /// The provider's interruption deadline the agent reported (ADR 0044
+    /// §5), by its wall clock, so display-only. Rewritten with
+    /// [`draining`](Self::draining) by registration and by
+    /// [`SetNodeDraining`](crate::command::SetNodeDraining).
+    pub interruption_deadline: Option<Timestamp>,
 }
 
 impl NodeRecord {
@@ -1098,6 +1107,13 @@ pub enum Event {
         allocation: AllocationId,
         job: JobId,
     },
+    /// A running attempt's termination record was created or its
+    /// acknowledged deadline moved earlier (ADR 0044 §3).
+    AttemptNotified {
+        attempt: AttemptId,
+        job: JobId,
+        node: NodeId,
+    },
     NodeEpochBumped {
         node: NodeId,
         epoch: u64,
@@ -1151,6 +1167,7 @@ impl Event {
             | Event::AttemptStateChanged { job, .. }
             | Event::AllocationFunded { job, .. }
             | Event::StopRequested { job, .. }
+            | Event::AttemptNotified { job, .. }
             | Event::JobEvicted { job, .. }
             | Event::JobMetadataUpdated { job, .. } => Some(*job),
             Event::NodeEpochBumped { .. }

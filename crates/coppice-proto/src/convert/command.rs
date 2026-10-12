@@ -21,11 +21,11 @@ use coppice_state::command::{
     AbortJob, AllocationSpec, BindMachineIdentity, BumpClusterVersion, Command, CommitPlacements,
     ConfigureQuotaEntity, ConfirmKeyPossession, ConfirmStagedKeyPossession, DeclareNodeLost,
     DispatchAttempt, EvictNodes, EvictTerminalJobs, IntervalRenewal, LostAttempt, MintEnrollToken,
-    Placement, RebindMachineAddress, ReconcileNode, RecordAttemptExited, RecordAttemptOutcome,
-    RecordAttemptStarted, RecordCaCertificate, RecordEnrolledIdentity, RecordKeyTransferIntent,
-    RecordStagedKeyTransferIntent, RegisterNode, RenewIntervalCharges, RetireMachineBinding,
-    RevokeEnrollToken, RevokeIdentity, SetNodeDraining, SetNodeSchedulable, SubmitJob,
-    UpdateAuthorization, UpdateJobMetadata, UpdatePolicy,
+    Placement, RebindMachineAddress, ReconcileNode, RecordAttemptExited, RecordAttemptNotified,
+    RecordAttemptOutcome, RecordAttemptStarted, RecordCaCertificate, RecordEnrolledIdentity,
+    RecordKeyTransferIntent, RecordStagedKeyTransferIntent, RegisterNode, RenewIntervalCharges,
+    RetireMachineBinding, RevokeEnrollToken, RevokeIdentity, SetNodeDraining, SetNodeSchedulable,
+    SubmitJob, UpdateAuthorization, UpdateJobMetadata, UpdatePolicy,
 };
 use coppice_state::{
     CaCertBundle, EnrollRole, PolicyConfig, RevokedIdentity, DEFAULT_GROUPS_CLAIM,
@@ -56,6 +56,7 @@ pub fn command_to_pb(command: &Command, cluster_version: u32) -> pb::Command {
         Command::RecordAttemptExited(c) => Body::RecordAttemptExited(c.into()),
         Command::RecordAttemptOutcome(c) => Body::RecordAttemptOutcome(c.into()),
         Command::ReconcileNode(c) => Body::ReconcileNode(c.into()),
+        Command::RecordAttemptNotified(c) => Body::RecordAttemptNotified(c.into()),
         Command::RegisterNode(c) => Body::RegisterNode(c.into()),
         Command::DeclareNodeLost(c) => Body::DeclareNodeLost(c.into()),
         Command::SetNodeSchedulable(c) => Body::SetNodeSchedulable(c.into()),
@@ -103,6 +104,7 @@ pub fn command_from_pb(command: pb::Command) -> Result<(u32, Command), ConvertEr
         Body::RecordAttemptExited(c) => Command::RecordAttemptExited(c.try_into()?),
         Body::RecordAttemptOutcome(c) => Command::RecordAttemptOutcome(c.try_into()?),
         Body::ReconcileNode(c) => Command::ReconcileNode(c.try_into()?),
+        Body::RecordAttemptNotified(c) => Command::RecordAttemptNotified(c.try_into()?),
         Body::RegisterNode(c) => Command::RegisterNode(c.try_into()?),
         Body::DeclareNodeLost(c) => Command::DeclareNodeLost(c.try_into()?),
         Body::SetNodeSchedulable(c) => Command::SetNodeSchedulable(c.try_into()?),
@@ -414,6 +416,32 @@ impl TryFrom<pb::RecordAttemptOutcome> for RecordAttemptOutcome {
     }
 }
 
+impl From<&RecordAttemptNotified> for pb::RecordAttemptNotified {
+    fn from(c: &RecordAttemptNotified) -> Self {
+        pb::RecordAttemptNotified {
+            attempt: Some(c.attempt.into()),
+            reason: Some(c.reason.into()),
+            remaining_us: c.remaining.as_micros().max(0) as u64,
+            shortfall_us: c.shortfall.as_micros().max(0) as u64,
+            observed_at_us: c.observed_at.as_micros(),
+        }
+    }
+}
+
+impl TryFrom<pb::RecordAttemptNotified> for RecordAttemptNotified {
+    type Error = ConvertError;
+
+    fn try_from(c: pb::RecordAttemptNotified) -> Result<Self, ConvertError> {
+        Ok(RecordAttemptNotified {
+            attempt: req(c.attempt, "RecordAttemptNotified.attempt")?.try_into()?,
+            reason: req(c.reason, "RecordAttemptNotified.reason")?.try_into()?,
+            remaining: nonnegative_duration(c.remaining_us, "RecordAttemptNotified.remaining_us")?,
+            shortfall: nonnegative_duration(c.shortfall_us, "RecordAttemptNotified.shortfall_us")?,
+            observed_at: timestamp(c.observed_at_us, "RecordAttemptNotified.observed_at_us")?,
+        })
+    }
+}
+
 impl From<&ReconcileNode> for pb::ReconcileNode {
     fn from(c: &ReconcileNode) -> Self {
         pb::ReconcileNode {
@@ -487,6 +515,7 @@ impl From<&RegisterNode> for pb::RegisterNode {
             detected_capacity: c.detected_capacity.as_ref().map(Into::into),
             draining: c.draining,
             preemptible_only: c.preemptible_only,
+            interruption_deadline_us: c.interruption_deadline.map(|t| t.as_micros()),
         }
     }
 }
@@ -506,6 +535,10 @@ impl TryFrom<pb::RegisterNode> for RegisterNode {
             detected_capacity: c.detected_capacity.map(Resources::try_from).transpose()?,
             draining: c.draining,
             preemptible_only: c.preemptible_only,
+            interruption_deadline: c
+                .interruption_deadline_us
+                .map(|us| timestamp(us, "RegisterNode.interruption_deadline_us"))
+                .transpose()?,
         })
     }
 }
@@ -559,6 +592,7 @@ impl From<&SetNodeDraining> for pb::SetNodeDraining {
         pb::SetNodeDraining {
             node: Some(c.node.into()),
             draining: c.draining,
+            interruption_deadline_us: c.interruption_deadline.map(|t| t.as_micros()),
             at_us: c.at.as_micros(),
         }
     }
@@ -571,6 +605,10 @@ impl TryFrom<pb::SetNodeDraining> for SetNodeDraining {
         Ok(SetNodeDraining {
             node: req(c.node, "SetNodeDraining.node")?.try_into()?,
             draining: c.draining,
+            interruption_deadline: c
+                .interruption_deadline_us
+                .map(|us| timestamp(us, "SetNodeDraining.interruption_deadline_us"))
+                .transpose()?,
             at: timestamp(c.at_us, "SetNodeDraining.at_us")?,
         })
     }

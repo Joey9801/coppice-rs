@@ -152,6 +152,10 @@ message AttemptRecord {
   // exposes nor protects work already placed. When true, the policy's
   // preemptible multiplier is already folded into `multiplier_q32_32`.
   bool effective_preemptible = 9;
+  // The attempt's termination record (ADR 0044 §3), created at most once
+  // while it is Running. Absent for an attempt the platform never asked to
+  // stop.
+  coppice.core.v1.Preemption preemption = 10;
 }
 
 // An allocation's replicated record plus its commit-order sequence. Keyed
@@ -174,6 +178,9 @@ message NodeRecord {
   // cleared by a re-registration that does not carry it. Placements are
   // gated on both.
   bool draining = 3;
+  // The provider's interruption deadline the agent last reported (ADR 0044
+  // §5), agent wall-clock µs; display-only. Set and cleared with `draining`.
+  optional int64 interruption_deadline_us = 4;
 }
 
 // One node of the quota-entity tree, keyed by `entity` (the map key made

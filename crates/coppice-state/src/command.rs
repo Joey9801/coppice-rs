@@ -33,7 +33,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use coppice_core::attempt::AttemptOutcome;
+use coppice_core::attempt::{AttemptOutcome, PreemptReason};
 use coppice_core::id::{
     AllocationId, AttemptId, EnrollTokenId, GroupId, JobId, MachineId, NodeId, QuotaEntityId,
 };
@@ -63,6 +63,7 @@ pub enum Command {
     RecordAttemptExited(RecordAttemptExited),
     RecordAttemptOutcome(RecordAttemptOutcome),
     ReconcileNode(ReconcileNode),
+    RecordAttemptNotified(RecordAttemptNotified),
     // Node lifecycle.
     RegisterNode(RegisterNode),
     DeclareNodeLost(DeclareNodeLost),
@@ -112,6 +113,7 @@ impl Command {
             Command::RecordAttemptExited(c) => c.observed_at,
             Command::RecordAttemptOutcome(c) => c.observed_at,
             Command::ReconcileNode(c) => c.observed_at,
+            Command::RecordAttemptNotified(c) => c.observed_at,
             Command::RegisterNode(c) => c.registered_at,
             Command::DeclareNodeLost(c) => c.declared_at,
             Command::SetNodeSchedulable(c) => c.updated_at,
@@ -291,6 +293,23 @@ pub struct RecordAttemptOutcome {
     pub observed_at: Timestamp,
 }
 
+/// A notice was delivered to a running attempt (ADR 0044 §3), normalized by
+/// the leader from the agent's `AttemptNotice` or an `ObservedSet`'s repeated
+/// mark. Creates or acknowledges the termination record; a no-op unless the
+/// attempt is `Running`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordAttemptNotified {
+    pub attempt: AttemptId,
+    pub reason: PreemptReason,
+    /// Time from the agent's report to its stop time. The deadline is
+    /// `observed_at + remaining`, so no agent wall-clock time reaches state.
+    pub remaining: Duration,
+    /// Declared notice minus notice actually given.
+    pub shortfall: Duration,
+    /// The leader's receive time.
+    pub observed_at: Timestamp,
+}
+
 /// Verdicts from the leader's ObservedSet diff (ADR 0009).
 ///
 /// "Stop" verdicts never appear: an unknown running container has nothing
@@ -348,6 +367,10 @@ pub struct RegisterNode {
     /// [`Node::preemptible_only`](coppice_core::node::Node::preemptible_only)
     /// on every registration.
     pub preemptible_only: bool,
+    /// The provider's interruption deadline from the agent's `Register`
+    /// (ADR 0044 §5), display-only. Written to
+    /// [`crate::NodeRecord::interruption_deadline`] with `draining`.
+    pub interruption_deadline: Option<Timestamp>,
 }
 
 /// Node missed the replicated heartbeat deadline: epoch bump, unschedulable,
@@ -382,6 +405,9 @@ pub struct SetNodeSchedulable {
 pub struct SetNodeDraining {
     pub node: NodeId,
     pub draining: bool,
+    /// The provider's interruption deadline the agent reported (ADR 0044
+    /// §5), display-only; `None` clears it.
+    pub interruption_deadline: Option<Timestamp>,
     pub at: Timestamp,
 }
 

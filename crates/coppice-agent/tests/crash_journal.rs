@@ -32,7 +32,9 @@ use std::io;
 use coppice_agent::executor::{
     classify_exit, ContainerState, ExitCause, ExitInfo, ObservedContainer,
 };
-use coppice_agent::journal::{ExitRec, IntentRec, Journal, JournalState, Watermark};
+use coppice_agent::journal::{
+    ExitRec, IntentRec, Journal, JournalState, TombstoneReason, Watermark,
+};
 use coppice_agent::observed::{build_observed_set, ObservedAllocation};
 use coppice_core::attempt::AttemptOutcome;
 use coppice_core::id::{AllocationId, AttemptId, JobId};
@@ -116,6 +118,9 @@ fn drive(fs: SimFs, runtime: &mut RuntimeModel, ids: &[Ids]) -> io::Result<()> {
             job: ids[i].job,
             node_epoch: 1,
             max_runtime: None,
+            notice_signal: Default::default(),
+            notice: Default::default(),
+            abort_grace: Default::default(),
         };
         journal.journal_intent(&intent)?;
         runtime.start(&ids[i]);
@@ -150,6 +155,9 @@ fn drive(fs: SimFs, runtime: &mut RuntimeModel, ids: &[Ids]) -> io::Result<()> {
         job: ids[2].job,
         node_epoch: 2,
         max_runtime: None,
+        notice_signal: Default::default(),
+        notice: Default::default(),
+        abort_grace: Default::default(),
     };
     journal.journal_intent(&intent2)?;
     runtime.start(&ids[2]);
@@ -159,7 +167,7 @@ fn drive(fs: SimFs, runtime: &mut RuntimeModel, ids: &[Ids]) -> io::Result<()> {
     // disagreeing with the container's bare 137, so recovery must prefer the
     // journaled classification (a crash before this journal_exit ⇒ runtime
     // evidence still wins on recovery).
-    journal.journal_tombstone(ids[1].allocation)?;
+    journal.journal_tombstone(ids[1].allocation, TombstoneReason::Abort)?;
     let exit1 = ExitInfo {
         code: 137,
         cause: ExitCause::Natural,

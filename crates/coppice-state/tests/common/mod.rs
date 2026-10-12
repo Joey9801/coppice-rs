@@ -125,6 +125,7 @@ pub fn register_node_cmd(node: NodeId, capacity: Resources, at: Timestamp) -> Co
         detected_capacity: None,
         draining: false,
         preemptible_only: false,
+        interruption_deadline: None,
     })
 }
 
@@ -163,6 +164,7 @@ pub fn register_node_cmd_with_host(
         host_facts,
         draining: false,
         preemptible_only: false,
+        interruption_deadline: None,
     })
 }
 
@@ -435,6 +437,7 @@ pub fn set_draining_cmd(node: NodeId, draining: bool) -> Command {
         node,
         draining,
         at: base_ts(),
+        interruption_deadline: None,
     })
 }
 

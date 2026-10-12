@@ -427,13 +427,20 @@ fn health_label(health: &NodeHealth) -> String {
 
 /// The list table's scheduling cell: [`schedulable_label`], marked when the
 /// node takes only effectively preemptible work (ADR 0044 §4).
-fn scheduling_cell(schedulable: bool, draining: bool, preemptible_only: bool) -> String {
-    let label = schedulable_label(schedulable, draining);
+fn scheduling_cell(
+    schedulable: bool,
+    draining: bool,
+    preemptible_only: bool,
+    interrupted: bool,
+) -> String {
+    let mut cell = schedulable_label(schedulable, draining).to_string();
     if preemptible_only {
-        format!("{label}, preemptible only")
-    } else {
-        label.to_string()
+        cell.push_str(", preemptible only");
     }
+    if interrupted {
+        cell.push_str(", interruption pending");
+    }
+    cell
 }
 
 /// The scheduling posture, derived from the two independent flags on
@@ -489,7 +496,12 @@ fn render_list(response: &ListNodesResponse) -> String {
             vec![
                 node.id.to_string(),
                 health_label(&node.health),
-                scheduling_cell(node.schedulable, node.draining, node.preemptible_only),
+                scheduling_cell(
+                    node.schedulable,
+                    node.draining,
+                    node.preemptible_only,
+                    node.interruption_deadline.is_some(),
+                ),
                 resources_cell(&node.capacity),
                 resources_cell(&node.allocated),
                 node.running_count.to_string(),
@@ -545,6 +557,10 @@ fn render_detail(response: &GetNodeResponse) -> String {
             "any work"
         },
     );
+    if let Some(deadline) = summary.interruption_deadline {
+        // ADR 0044 §5: the provider is reclaiming this node's host.
+        kv(&mut out, "interruption", &format!("deadline {deadline}"));
+    }
     kv(&mut out, "epoch", &summary.epoch.to_string());
     kv(&mut out, "capacity", &resources(&summary.capacity));
     kv(&mut out, "allocated", &resources(&summary.allocated));
@@ -688,6 +704,7 @@ mod tests {
             running_count: 1,
             accruing_count: 2,
             preemptible_only: false,
+            interruption_deadline: None,
         }
     }
 
@@ -728,6 +745,7 @@ mod tests {
         assert!(rendered.contains("schedulable"), "{rendered}");
         assert!(rendered.contains("4000m"), "{rendered}");
         assert!(!rendered.contains("preemptible only"), "{rendered}");
+        assert!(!rendered.contains("interruption"), "{rendered}");
 
         // A spot-only node says so in its scheduling cell (ADR 0044 §4).
         let mut spot = sample_summary();
@@ -830,6 +848,35 @@ mod tests {
         assert!(rendered.contains("labels          zone=a"), "{rendered}");
         assert!(rendered.contains("attempts:       (none)"), "{rendered}");
         assert!(rendered.contains("accruing:       (none)"), "{rendered}");
+    }
+
+    #[test]
+    fn detail_shows_the_interruption_deadline_only_when_present() {
+        let none = render_detail(&to_client(dto::GetNodeResponse {
+            summary: sample_summary(),
+            host: None,
+            detected_capacity: None,
+            active_attempts: Vec::new(),
+            accrual_queue: Vec::new(),
+        }));
+        assert!(!none.contains("interruption"), "{none}");
+
+        let mut summary = sample_summary();
+        summary.interruption_deadline = Some(
+            coppice_core::time::Timestamp::from_micros(1_700_000_000_000_000).expect("in range"),
+        );
+        let listed = render_list(&to_client(dto::ListNodesResponse {
+            nodes: vec![summary.clone()],
+        }));
+        assert!(listed.contains("interruption pending"), "{listed}");
+        let shown = render_detail(&to_client(dto::GetNodeResponse {
+            summary,
+            host: None,
+            detected_capacity: None,
+            active_attempts: Vec::new(),
+            accrual_queue: Vec::new(),
+        }));
+        assert!(shown.contains("interruption    deadline 2023-"), "{shown}");
     }
 
     #[test]

@@ -42,6 +42,7 @@ pub fn node_record(id: NodeId, epoch: u64, schedulable: bool) -> NodeRecord {
         },
         epoch,
         draining: false,
+        interruption_deadline: None,
     }
 }
 
@@ -75,6 +76,7 @@ pub fn attempt_record(
         ended_at: None,
         settlement: None,
         effective_preemptible: false,
+        preemption: None,
     }
 }
 

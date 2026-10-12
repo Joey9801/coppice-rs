@@ -82,6 +82,12 @@ message AttemptOutcome {
   message NodeLost {}
   // The agent failed in a way not attributable to the workload.
   message AgentError {}
+  // Terminated by the platform after a notice (ADR 0044 §2). Requeued
+  // without consuming retry budget, whatever the reason. Classified by the
+  // agent from its journaled notice intent.
+  message Preempted {
+    PreemptReason reason = 1;
+  }
 
   oneof outcome {
     Exited exited = 1;
@@ -94,5 +100,50 @@ message AttemptOutcome {
     NodeLost node_lost = 8;
     AgentError agent_error = 9;
     DiskLimitExceeded disk_limit_exceeded = 10;
+    Preempted preempted = 11;
   }
+}
+
+// Why the platform terminated a running attempt (ADR 0044 §2).
+message PreemptReason {
+  // Chosen by the scheduler for a higher-class job.
+  message Priority {
+    JobId for_job = 1;
+  }
+  // Moved off a persistent node because spot capacity could take it.
+  message Relocation {
+    JobId for_job = 1;
+  }
+  // The node was drained with a deadline by an operator.
+  message Drain {}
+  // The node's host reported an external interruption.
+  message Interruption {}
+
+  oneof reason {
+    Priority priority = 1;
+    Relocation relocation = 2;
+    Drain drain = 3;
+    Interruption interruption = 4;
+  }
+}
+
+// The one termination record a running attempt may carry (ADR 0044 §3).
+// There is no allocation phase for it; "preempting" is a display status
+// derived from this record.
+message Preemption {
+  PreemptReason reason = 1;
+  // When the coordinator committed to, or first learned of, the termination.
+  int64 requested_at_us = 2;
+  // Set from the agent's reported notice mark; absent until then.
+  Acknowledged acknowledged = 3;
+}
+
+// The agent's reported notice mark, as the leader stamped it.
+message Acknowledged {
+  int64 notified_at_us = 1;
+  // The attempt's stop time as the coordinator plans against it (leader
+  // receive time plus reported remaining notice). Only ever moves earlier.
+  int64 deadline_us = 2;
+  // Declared notice minus notice actually given; zero when none was lost.
+  uint64 notice_shortfall_us = 3;
 }

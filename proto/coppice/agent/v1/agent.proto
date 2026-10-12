@@ -106,6 +106,10 @@ message StartJob {
   // The job's declared notice contract (ADR 0044 §1).
   coppice.core.v1.NoticeSignal notice_signal = 14;
   uint64 notice_us = 15;
+  // The replicated policy's `abort_grace` at dispatch (ADR 0044 §3), so the
+  // agent can run its own stop path (drain plan or interruption) without the
+  // coordinator.
+  uint64 abort_grace_us = 16;
 }
 
 // Stop the work under an allocation (SIGTERM, grace, SIGKILL). Idempotent,
@@ -147,6 +151,7 @@ message AgentReport {
     Heartbeat heartbeat = 9;
     AttemptStatus attempt_status = 10;
     ObservedSet observed_set = 11;
+    AttemptNotice attempt_notice = 12;
   }
 }
 
@@ -185,6 +190,10 @@ message Register {
   // capacity. Registration rewrites the replicated flag, so changing the
   // config and restarting the agent changes the node.
   bool preemptible_only = 7;
+  // The provider's interruption deadline D (ADR 0044 §5), agent wall-clock µs;
+  // display-only. Rewritten with `draining`, so a `Register` without it clears
+  // it.
+  optional int64 interruption_deadline_us = 8;
 }
 
 // Periodic liveness, inventory, and running-set signal. The coordinator
@@ -205,6 +214,8 @@ message Heartbeat {
   // it on every subsequent heartbeat, and the leader turns a value that
   // differs from the replicated record into a `SetNodeDraining`.
   bool draining = 5;
+  // Same fact as `Register.interruption_deadline_us`, announced mid-session.
+  optional int64 interruption_deadline_us = 6;
 }
 
 // Job-attributable resource usage observed on a node, folded by the agent from
@@ -238,6 +249,22 @@ message AttemptStatus {
   uint64 runtime_us = 5;
 }
 
+// A notice was delivered to an attempt's container (ADR 0044 §3), reported
+// once its mark is journaled. Its own report arm, not a field on
+// AttemptStatus, because ingestion drops a repeated Running status.
+// `remaining_us` is a duration so no agent wall-clock time reaches replicated
+// state.
+message AttemptNotice {
+  coppice.core.v1.AllocationId allocation = 1;
+  coppice.core.v1.AttemptId attempt = 2;
+  coppice.core.v1.JobId job = 3;
+  coppice.core.v1.PreemptReason reason = 4;
+  // Time from the report to the stop time, saturating at zero.
+  uint64 remaining_us = 5;
+  // Declared notice minus notice actually given; zero when none was lost.
+  uint64 shortfall_us = 6;
+}
+
 // The full observed set, sent after (re)registration: everything the agent
 // found in its journal and container runtime. The coordinator diffs it
 // against replicated intent and commits adopt / lost verdicts
@@ -255,6 +282,18 @@ message ObservedAllocation {
   bool running = 4;
   coppice.core.v1.AttemptOutcome outcome = 5;
   uint64 runtime_us = 6;
+  // The notice mark in force for a running allocation, repeated after a
+  // reconnect so the coordinator learns of a notice whose AttemptNotice was
+  // lost. Absent when the attempt was never notified.
+  optional ObservedNotice notice = 7;
+}
+
+// An AttemptNotice's payload, as the ObservedSet repeats it. `remaining_us`
+// is recomputed at report time, saturating at zero.
+message ObservedNotice {
+  coppice.core.v1.PreemptReason reason = 1;
+  uint64 remaining_us = 2;
+  uint64 shortfall_us = 3;
 }
 
 // Summarized image-cache inventory (ADR 0010).

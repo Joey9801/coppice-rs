@@ -7,6 +7,7 @@
 //! `docs/decisions/0013-job-attempt-allocation-state-machines.md`.
 
 use crate::id::{AllocationId, AttemptId, JobId, NodeId};
+use crate::time::{Duration, Timestamp};
 
 /// One execution of a job. Authoritative, Raft-replicated state.
 ///
@@ -99,6 +100,71 @@ pub enum AttemptOutcome {
     NodeLost,
     /// The agent failed in a way not attributable to the workload.
     AgentError,
+    /// Terminated by the platform after a notice (ADR 0044 §2). Requeued
+    /// without consuming retry budget, whatever the reason.
+    Preempted { reason: PreemptReason },
+}
+
+/// Why the platform terminated a running attempt (ADR 0044 §2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreemptReason {
+    /// Chosen by the scheduler for a higher-class job.
+    Priority { for_job: JobId },
+    /// Moved off a persistent node because spot capacity could take it.
+    Relocation { for_job: JobId },
+    /// The node was drained with a deadline by an operator.
+    Drain,
+    /// The node's host reported an external interruption.
+    Interruption,
+}
+
+impl PreemptReason {
+    /// The reason's snake_case name (`priority`, `relocation`, `drain`,
+    /// `interruption`), as the API and CLI spell it.
+    pub fn name(&self) -> &'static str {
+        match self {
+            PreemptReason::Priority { .. } => "priority",
+            PreemptReason::Relocation { .. } => "relocation",
+            PreemptReason::Drain => "drain",
+            PreemptReason::Interruption => "interruption",
+        }
+    }
+
+    /// The job the termination makes room for, when there is one.
+    pub fn for_job(&self) -> Option<JobId> {
+        match self {
+            PreemptReason::Priority { for_job } | PreemptReason::Relocation { for_job } => {
+                Some(*for_job)
+            }
+            PreemptReason::Drain | PreemptReason::Interruption => None,
+        }
+    }
+}
+
+/// The one termination record a running attempt may carry (ADR 0044 §3).
+///
+/// There is no allocation phase for it: the allocation stays active until
+/// the attempt ends, and "preempting" is a display status derived from this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Preemption {
+    pub reason: PreemptReason,
+    /// When the coordinator committed to, or first learned of, the
+    /// termination.
+    pub requested_at: Timestamp,
+    /// Set from the agent's reported notice mark.
+    pub acknowledged: Option<Acknowledged>,
+}
+
+/// The agent's reported notice mark, as the coordinator stamped it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Acknowledged {
+    pub notified_at: Timestamp,
+    /// The attempt's stop time, as the coordinator plans against it:
+    /// `observed_at + remaining`, never an agent wall-clock time. Only ever
+    /// moves earlier.
+    pub deadline: Timestamp,
+    /// Declared notice minus notice actually given; zero when none was lost.
+    pub notice_shortfall: Duration,
 }
 
 /// Who or what an outcome is attributed to.
@@ -129,7 +195,7 @@ impl AttemptOutcome {
                     OutcomeClass::Platform
                 }
             }
-            Revoked | NodeLost | AgentError => OutcomeClass::Platform,
+            Revoked | NodeLost | AgentError | Preempted { .. } => OutcomeClass::Platform,
         }
     }
 
@@ -137,10 +203,9 @@ impl AttemptOutcome {
     /// as the reserved `COPPICE_PREVIOUS_ATTEMPT_OUTCOME` variable spells it
     /// (`docs/decisions/0044-job-preemption-and-spot-capacity.md` §2).
     ///
-    /// The one mapping from outcome to that name, so a new outcome
-    /// (`preempted`, with the termination mechanism) is named here and
-    /// nowhere else. Data-carrying variants drop their payload: the name says
-    /// *what* happened, not the exit code.
+    /// The one mapping from outcome to that name: a new outcome is named
+    /// here and nowhere else. Data-carrying variants drop their payload: the
+    /// name says *what* happened (`preempted`), not the exit code or reason.
     pub fn name(&self) -> &'static str {
         use AttemptOutcome::*;
         match self {
@@ -154,6 +219,7 @@ impl AttemptOutcome {
             StartFailed { .. } => "start_failed",
             NodeLost => "node_lost",
             AgentError => "agent_error",
+            Preempted { .. } => "preempted",
         }
     }
 }
@@ -191,6 +257,13 @@ mod tests {
         assert_eq!(Revoked.name(), "revoked");
         assert_eq!(PullFailed { user_error: true }.name(), "pull_failed");
         assert_eq!(MemoryLimitExceeded.name(), "memory_limit_exceeded");
+        assert_eq!(
+            Preempted {
+                reason: PreemptReason::Interruption
+            }
+            .name(),
+            "preempted"
+        );
     }
 
     #[test]
@@ -203,6 +276,13 @@ mod tests {
         assert_eq!(DiskLimitExceeded.class(), OutcomeClass::UserError);
         assert_eq!(Aborted.class(), OutcomeClass::UserRequest);
         assert_eq!(Revoked.class(), OutcomeClass::Platform);
+        assert_eq!(
+            Preempted {
+                reason: PreemptReason::Drain
+            }
+            .class(),
+            OutcomeClass::Platform
+        );
         assert_eq!(
             PullFailed { user_error: true }.class(),
             OutcomeClass::UserError

@@ -171,9 +171,16 @@ pub fn projected_starts_cached(state: &StateMachine, memos: &ViewMemos) -> Arc<P
 }
 
 /// Guaranteed release events per node: an allocation whose attempt is
-/// `Running` with a start time, on a job with an enforced `max_runtime`,
-/// releases its funded capacity at `start + max_runtime` (ADR 0014). Any
-/// other live allocation has no guaranteed bound and contributes nothing.
+/// `Running` with a start time releases its funded capacity at the earlier
+/// of two bounds, either of which may be absent:
+///
+/// - `start + max_runtime`, on a job with an enforced `max_runtime`
+///   (ADR 0014);
+/// - `deadline + abort_grace`, on an attempt whose termination record is
+///   acknowledged (ADR 0044 §3). An unacknowledged request bounds nothing:
+///   the workload has not been warned.
+///
+/// Any other live allocation has no guaranteed bound and contributes nothing.
 /// Collected for every node — candidate bounds for opening or moving an
 /// accrual sweep any eligible node (ADR 0027), not only current hosts.
 pub(crate) fn collect_release_events(
@@ -197,10 +204,16 @@ pub(crate) fn collect_release_events(
         let Some(job) = snapshot.jobs.get(&rec.allocation.job) else {
             continue;
         };
-        let Some(runtime) = job.spec.max_runtime else {
-            continue;
+        let runtime_bound = job.spec.max_runtime.map(|runtime| started + runtime);
+        let preemption_bound = at
+            .preemption
+            .and_then(|p| p.acknowledged)
+            .map(|ack| ack.deadline.saturating_add(snapshot.policy.abort_grace));
+        let release = match (runtime_bound, preemption_bound) {
+            (Some(a), Some(b)) => a.min(b),
+            (Some(bound), None) | (None, Some(bound)) => bound,
+            (None, None) => continue,
         };
-        let release = started + runtime;
         events.entry(node).or_default().push(ReleaseEvent {
             at: release,
             seq: rec.seq,

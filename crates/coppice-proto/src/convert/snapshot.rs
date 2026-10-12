@@ -80,6 +80,7 @@ impl From<&AttemptRecord> for pb::AttemptRecord {
             ended_at_us: r.ended_at.map(|t| t.as_micros()),
             settlement: r.settlement.map(Into::into),
             effective_preemptible: r.effective_preemptible,
+            preemption: r.preemption.as_ref().map(Into::into),
         }
     }
 }
@@ -104,6 +105,7 @@ impl TryFrom<pb::AttemptRecord> for AttemptRecord {
                 .transpose()?,
             settlement: r.settlement.map(TryInto::try_into).transpose()?,
             effective_preemptible: r.effective_preemptible,
+            preemption: r.preemption.map(TryInto::try_into).transpose()?,
         })
     }
 }
@@ -134,6 +136,7 @@ impl From<&NodeRecord> for pb::NodeRecord {
             node: Some((&r.node).into()),
             epoch: r.epoch,
             draining: r.draining,
+            interruption_deadline_us: r.interruption_deadline.map(|t| t.as_micros()),
         }
     }
 }
@@ -146,6 +149,10 @@ impl TryFrom<pb::NodeRecord> for NodeRecord {
             node: req(r.node, "NodeRecord.node")?.try_into()?,
             epoch: r.epoch,
             draining: r.draining,
+            interruption_deadline: r
+                .interruption_deadline_us
+                .map(|us| timestamp(us, "NodeRecord.interruption_deadline_us"))
+                .transpose()?,
         })
     }
 }

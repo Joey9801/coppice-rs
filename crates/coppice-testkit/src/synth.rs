@@ -667,6 +667,7 @@ fn build_attempt(
             ended_at,
             settlement,
             effective_preemptible: false,
+            preemption: None,
         },
     ));
     let allocation = Allocation {
@@ -900,6 +901,7 @@ fn build_nodes(rng: &mut Rng, count: usize) -> BTreeMap<NodeId, NodeRecord> {
                 },
                 epoch,
                 draining: false,
+                interruption_deadline: None,
             },
         ));
     }

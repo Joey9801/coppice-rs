@@ -255,6 +255,9 @@ pub enum AttemptState {
     Dispatching,
     /// Observed running.
     Running,
+    /// Running, but the platform has asked it to stop (ADR 0044 §3). Derived for
+    /// display, so never on a timeline event.
+    Preempting,
     /// Stopping, with its charge not yet settled.
     Finalizing,
     /// Finished; see the outcome.
@@ -365,6 +368,8 @@ pub enum AttemptOutcomeKind {
     NodeLost,
     /// The agent failed in a way it could not attribute.
     AgentError,
+    /// The platform terminated it; `reason` (and `for_job`) say why.
+    Preempted,
     /// A value this client does not know — a newer server's vocabulary, kept
     /// verbatim rather than rejected. See [`super`] for why this carries the
     /// spelling rather than being a bare unit variant.
@@ -377,6 +382,48 @@ impl AttemptOutcomeKind {
     /// Whether this value fell into the `Unknown` catch-all.
     pub fn is_unknown(&self) -> bool {
         matches!(self, AttemptOutcomeKind::Unknown(_))
+    }
+}
+
+/// Why the platform terminated a running attempt (ADR 0044 §2). The job the
+/// termination made room for travels beside it as `for_job`.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    strum::Display,
+    strum::EnumString,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+#[non_exhaustive]
+pub enum PreemptReason {
+    /// Made room for a higher-ranked job.
+    Priority,
+    /// Moved to make room for a job that needed this node's shape.
+    Relocation,
+    /// The node is draining.
+    Drain,
+    /// The provider is reclaiming the node's host.
+    Interruption,
+    /// A value this client does not know — a newer server's vocabulary, kept
+    /// verbatim rather than rejected. See [`super`] for why this carries the
+    /// spelling rather than being a bare unit variant.
+    #[serde(untagged)]
+    #[strum(default)]
+    Unknown(String),
+}
+
+impl PreemptReason {
+    /// Whether this value fell into the `Unknown` catch-all.
+    pub fn is_unknown(&self) -> bool {
+        matches!(self, PreemptReason::Unknown(_))
     }
 }
 
@@ -433,6 +480,12 @@ pub struct AttemptOutcome {
     pub exit_code: Option<i32>,
     /// Whose fault it was.
     pub class: OutcomeClass,
+    /// Present when `kind` is `preempted`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub reason: Option<PreemptReason>,
+    /// The job a `priority` or `relocation` preemption made room for.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub for_job: Option<JobId>,
 }
 
 /// An allocation's funding state.
@@ -505,6 +558,31 @@ pub struct AttemptView {
     /// as they stood then. When `true` the charge carries the preemptibility
     /// discount.
     pub preemptible: bool,
+    /// The termination record (ADR 0044 §3): `null` unless the platform has
+    /// asked this attempt to stop; kept after the attempt ends.
+    pub preemption: Option<AttemptPreemption>,
+}
+
+/// An attempt's termination record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct AttemptPreemption {
+    /// Why it is being terminated.
+    pub reason: PreemptReason,
+    /// The job a `priority` or `relocation` preemption made room for.
+    pub for_job: Option<JobId>,
+    /// When the coordinator committed to, or first learned of, the
+    /// termination.
+    pub requested_at: Timestamp,
+    /// When the notice was delivered; `null` until then, as are `deadline` and
+    /// `notice_shortfall_seconds`.
+    pub notified_at: Option<Timestamp>,
+    /// The attempt's stop time as the coordinator plans against it. Only ever
+    /// moves earlier.
+    pub deadline: Option<Timestamp>,
+    /// Declared notice minus notice actually given, in whole seconds (rounded
+    /// up, so any lost notice shows); zero when none was lost.
+    pub notice_shortfall_seconds: Option<i64>,
 }
 
 /// One placement of a job onto a node.
@@ -586,6 +664,8 @@ mod tests {
             kind: AttemptOutcomeKind::NodeLost,
             exit_code: None,
             class: OutcomeClass::Platform,
+            reason: None,
+            for_job: None,
         };
         assert_eq!(
             serde_json::to_value(&outcome).unwrap(),

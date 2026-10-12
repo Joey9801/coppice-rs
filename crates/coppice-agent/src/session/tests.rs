@@ -120,7 +120,7 @@ fn terminal_outcome(reports: &[pb::AgentReport]) -> Option<AttemptOutcome> {
     let pb::agent_report::Body::AttemptStatus(status) = reports.first()?.body.as_ref()? else {
         return None;
     };
-    let state: AttemptState = status.observed?.try_into().ok()?;
+    let state: AttemptState = status.observed.clone()?.try_into().ok()?;
     match state {
         AttemptState::Terminal(o) => Some(o),
         _ => None,
@@ -133,7 +133,7 @@ fn is_running_report(reports: &[pb::AgentReport]) -> bool {
     else {
         return false;
     };
-    let Ok(state): Result<AttemptState, _> = status.observed.unwrap().try_into() else {
+    let Ok(state): Result<AttemptState, _> = status.observed.clone().unwrap().try_into() else {
         return false;
     };
     matches!(state, AttemptState::Running)
@@ -235,7 +235,7 @@ async fn raising_token_resets_the_sequence_space() {
         .await
         .unwrap();
     assert!(
-        !session.state().tombstones.contains(&alloc),
+        !session.state().tombstones.contains_key(&alloc),
         "seq 3 <= 5 must be a duplicate"
     );
 
@@ -246,7 +246,7 @@ async fn raising_token_resets_the_sequence_space() {
         .unwrap();
     assert_eq!(session.epoch(), 2);
     assert!(
-        session.state().tombstones.contains(&alloc),
+        session.state().tombstones.contains_key(&alloc),
         "a raising token must reset the seq space"
     );
 }
@@ -1240,7 +1240,7 @@ async fn recovery_reports_journaled_stop_outcome_over_runtime_code() {
         .find(|a| a.allocation == Some(alloc.into()))
         .expect("the surviving allocation is reported");
     assert!(!entry.running);
-    let outcome = AttemptOutcome::try_from(entry.outcome.unwrap()).unwrap();
+    let outcome = AttemptOutcome::try_from(entry.outcome.clone().unwrap()).unwrap();
     assert_eq!(
         outcome,
         AttemptOutcome::Aborted,

@@ -605,6 +605,7 @@ mod tests {
                 },
                 epoch,
                 draining: false,
+                interruption_deadline: None,
             },
         );
         // The publisher may drop: `views.latest()` borrows the last-published

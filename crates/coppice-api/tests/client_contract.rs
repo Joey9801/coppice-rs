@@ -112,6 +112,7 @@ fn attempt_view(
         rate_ucu_per_second: 42,
         charged_ucu: 4200,
         preemptible: n % 2 == 1,
+        preemption: None,
     }
 }
 
@@ -171,14 +172,64 @@ fn job_read_models_round_trip_through_the_client() {
         kind: dto::AttemptOutcomeKind::Exited,
         exit_code: Some(1),
         class: dto::OutcomeClass::UserError,
+        reason: None,
+        for_job: None,
     };
     round_trip::<dto::AttemptOutcome, client::AttemptOutcome>(&exited);
     let node_lost = dto::AttemptOutcome {
         kind: dto::AttemptOutcomeKind::NodeLost,
         exit_code: None,
         class: dto::OutcomeClass::Platform,
+        reason: None,
+        for_job: None,
     };
     round_trip::<dto::AttemptOutcome, client::AttemptOutcome>(&node_lost);
+    for (reason, for_job) in [
+        (dto::PreemptReason::Priority, Some(jid(9))),
+        (dto::PreemptReason::Relocation, Some(jid(9))),
+        (dto::PreemptReason::Drain, None),
+        (dto::PreemptReason::Interruption, None),
+    ] {
+        let preempted = dto::AttemptOutcome {
+            kind: dto::AttemptOutcomeKind::Preempted,
+            exit_code: None,
+            class: dto::OutcomeClass::Platform,
+            reason: Some(reason),
+            for_job,
+        };
+        round_trip::<dto::AttemptOutcome, client::AttemptOutcome>(&preempted);
+        round_trip::<dto::AttemptView, client::AttemptView>(&attempt_view(
+            3,
+            dto::AttemptState::Terminal,
+            Some(preempted),
+        ));
+    }
+
+    // A running attempt with a termination record: acknowledged, then not.
+    let acknowledged = dto::AttemptView {
+        preemption: Some(dto::AttemptPreemption {
+            reason: dto::PreemptReason::Priority,
+            for_job: Some(jid(9)),
+            requested_at: ts(1_500_000),
+            notified_at: Some(ts(1_600_000)),
+            deadline: Some(ts(31_600_000)),
+            notice_shortfall_seconds: Some(5),
+        }),
+        ..attempt_view(4, dto::AttemptState::Preempting, None)
+    };
+    round_trip::<dto::AttemptView, client::AttemptView>(&acknowledged);
+    let unacknowledged = dto::AttemptView {
+        preemption: Some(dto::AttemptPreemption {
+            reason: dto::PreemptReason::Interruption,
+            for_job: None,
+            requested_at: ts(1_500_000),
+            notified_at: None,
+            deadline: None,
+            notice_shortfall_seconds: None,
+        }),
+        ..attempt_view(5, dto::AttemptState::Preempting, None)
+    };
+    round_trip::<dto::AttemptView, client::AttemptView>(&unacknowledged);
 
     round_trip::<dto::AttemptView, client::AttemptView>(&attempt_view(
         1,
@@ -398,6 +449,11 @@ fn job_read_models_round_trip_through_the_client() {
             allocation: aid(1),
             job: jid(1),
         },
+        dto::TimelineEventBody::AttemptNotified {
+            attempt: atid(1),
+            job: jid(1),
+            node: nid(1),
+        },
         dto::TimelineEventBody::NodeEpochBumped {
             node: nid(1),
             epoch: 3,
@@ -546,8 +602,14 @@ fn node_read_models_round_trip_through_the_client() {
         running_count: 2,
         accruing_count: 1,
         preemptible_only: true,
+        interruption_deadline: None,
     };
     round_trip::<dto::NodeSummary, client::NodeSummary>(&summary);
+    let interrupted = dto::NodeSummary {
+        interruption_deadline: Some(ts(9_000_000)),
+        ..summary.clone()
+    };
+    round_trip::<dto::NodeSummary, client::NodeSummary>(&interrupted);
     let lost = dto::NodeSummary {
         health: dto::NodeHealth::Lost,
         used: None,
@@ -1714,6 +1776,7 @@ fn every_server_wire_enum_variant_is_known_to_the_client() {
             dto::AttemptState::Ready,
             dto::AttemptState::Dispatching,
             dto::AttemptState::Running,
+            dto::AttemptState::Preempting,
             dto::AttemptState::Finalizing,
             dto::AttemptState::Terminal,
         ]
@@ -1731,6 +1794,16 @@ fn every_server_wire_enum_variant_is_known_to_the_client() {
             dto::AttemptOutcomeKind::StartFailed,
             dto::AttemptOutcomeKind::NodeLost,
             dto::AttemptOutcomeKind::AgentError,
+            dto::AttemptOutcomeKind::Preempted,
+        ]
+    );
+    assert_known_variants!(
+        client::PreemptReason,
+        [
+            dto::PreemptReason::Priority,
+            dto::PreemptReason::Relocation,
+            dto::PreemptReason::Drain,
+            dto::PreemptReason::Interruption,
         ]
     );
     assert_known_variants!(
@@ -1873,6 +1946,11 @@ fn every_timeline_event_kind_is_known_to_the_client() {
             node: nid(1),
             allocation: aid(1),
             job: jid(1),
+        },
+        dto::TimelineEventBody::AttemptNotified {
+            attempt: atid(1),
+            job: jid(1),
+            node: nid(1),
         },
         dto::TimelineEventBody::NodeEpochBumped {
             node: nid(1),
