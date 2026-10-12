@@ -1,4 +1,5 @@
-import type { NodeUtilization } from '@/api/types'
+import type { NodeDrain, NodeUtilization } from '@/api/types'
+import { formatTimeUntil } from '@/lib/format'
 import type { CapacityHistorySample } from '@/components'
 
 /** True when a query error is an ApiError with code `NotFound`. */
@@ -27,4 +28,16 @@ export function nodeCapacityHistory(utilization: NodeUtilization): CapacityHisto
     allocated: s.allocated,
     used: s.used,
   }))
+}
+
+/**
+ * Compact status of an operator drain (ADR 0044 §5): `complete` (the node
+ * holds no live work), `empty in 2h` style bounded horizon (only backfill that
+ * finishes by it is admitted), or `unbounded` (some live work has no enforced
+ * bound, nothing new is admitted).
+ */
+export function drainStatus(drain: NodeDrain, now: Date = new Date()): string {
+  if (drain.complete) return 'complete'
+  if (drain.horizon === null) return 'unbounded'
+  return `empty ${formatTimeUntil(drain.horizon, now)}`
 }

@@ -2,7 +2,7 @@ import { useNavigate } from '@tanstack/react-router'
 import { Boxes } from 'lucide-react'
 import type { NodeSummary } from '@/api/types'
 import { useNodes } from '@/api/queries'
-import { formatNodeCapacity, formatPercent, resourceFractions } from '@/lib/format'
+import { formatNodeCapacity, formatPercent, formatTimestamp, resourceFractions } from '@/lib/format'
 import { cn } from '@/lib/utils'
 import { EmptyState, IdLink, PageHeader, StatePill, TimeAgo } from '@/components'
 import { Badge } from '@/components/ui/badge'
@@ -18,7 +18,7 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import { InterruptionBadge } from './interruption-badge'
-import { sortedLabels } from './lib'
+import { drainStatus, sortedLabels } from './lib'
 
 export function NodesPage() {
   const { data: nodes, isPending, isError } = useNodes()
@@ -76,24 +76,59 @@ export function NodesPage() {
 
 function NodesSummaryLine({ nodes }: { nodes: NodeSummary[] | undefined }) {
   if (!nodes) return <>Loading nodes…</>
-  const schedulable = nodes.filter((n) => n.schedulable && n.health !== 'Lost').length
+  const open = nodes.filter(
+    (n) => n.drain === null && !n.agentDraining && n.health !== 'Lost',
+  ).length
   const lost = nodes.filter((n) => n.health === 'Lost').length
   return (
     <>
-      {nodes.length} {nodes.length === 1 ? 'node' : 'nodes'} · {schedulable} schedulable · {lost}{' '}
-      lost
+      {nodes.length} {nodes.length === 1 ? 'node' : 'nodes'} · {open} open · {lost} lost
     </>
   )
 }
 
-function statusPill(node: NodeSummary) {
-  if (node.health === 'Lost') return <StatePill state="Lost" />
-  // Either the admin cordon or the agent's own drain (e.g. on a provider
-  // interruption, ADR 0044 §5) stops new placements.
-  if (!node.schedulable || node.draining) return <StatePill state="Draining" />
+/**
+ * Health, plus the two independent drain facts — the operator's drain record
+ * (with its status) and the agent's own shutdown announcement — and the
+ * provider interruption the agent reported, if any (ADR 0044 §5).
+ */
+function StatusCell({ node }: { node: NodeSummary }) {
   // `Unknown` renders as itself: with no heartbeat marks to judge by (a
   // follower serving the read), "Healthy" would be a fabrication.
-  return <StatePill state={node.health} />
+  const pill =
+    node.health === 'Lost' || node.drain === null ? (
+      <StatePill state={node.health} />
+    ) : (
+      <StatePill state="Draining" />
+    )
+  return (
+    <div className="flex flex-wrap items-center gap-1.5">
+      {pill}
+      {node.drain !== null ? (
+        <span
+          className="text-xs text-muted-foreground"
+          title={`Drain requested ${formatTimestamp(node.drain.requestedAt)}${
+            node.drain.horizon ? `; empty by ${formatTimestamp(node.drain.horizon)}` : ''
+          }`}
+        >
+          {drainStatus(node.drain)}
+        </span>
+      ) : null}
+      {node.agentDraining ? (
+        <Badge
+          variant="outline"
+          className="text-[10px]"
+          title="The agent announced its own shutdown — it admits nothing"
+        >
+          agent draining
+        </Badge>
+      ) : null}
+      {node.preemptibleOnly ? <SpotBadge /> : null}
+      {node.interruptionDeadline != null ? (
+        <InterruptionBadge deadline={node.interruptionDeadline} className="text-[10px]" />
+      ) : null}
+    </div>
+  )
 }
 
 function NodeRow({ node }: { node: NodeSummary }) {
@@ -112,13 +147,7 @@ function NodeRow({ node }: { node: NodeSummary }) {
         <IdLink id={node.id} />
       </TableCell>
       <TableCell>
-        <div className="flex flex-wrap items-center gap-1.5">
-          {statusPill(node)}
-          {node.preemptibleOnly ? <SpotBadge /> : null}
-          {node.interruptionDeadline != null ? (
-            <InterruptionBadge deadline={node.interruptionDeadline} className="text-[10px]" />
-          ) : null}
-        </div>
+        <StatusCell node={node} />
       </TableCell>
       <TableCell>
         {labels.length === 0 ? (

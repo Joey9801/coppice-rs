@@ -750,6 +750,20 @@ export interface NodeUtilization {
  */
 export type NodeHealth = 'Unknown' | 'Healthy' | 'Lost'
 
+/**
+ * An operator's drain record on a node (ADR 0044 §5). Derived status:
+ * `complete` means the node holds no live work (`horizon` is null);
+ * `!complete` with a `horizon` means the node will be empty by then and
+ * until then admits only bounded backfill guaranteed to finish by it;
+ * `!complete` with `horizon: null` means some live work has no enforced
+ * bound, so the emptying time is unbounded and nothing new is admitted.
+ */
+export interface NodeDrain {
+  requestedAt: Date
+  horizon: Date | null
+  complete: boolean
+}
+
 export interface NodeSummary {
   id: NodeId
   capacity: Resources
@@ -764,18 +778,17 @@ export interface NodeSummary {
   used: Resources | null
   labels: Record<string, string>
   /**
-   * The admin cordon (`SetNodeSchedulable` / `DeclareNodeLost`): false means
-   * an operator has cordoned the node, or it has been declared lost.
-   * Survives agent restarts. A node takes new placements only when
-   * `schedulable && !draining`.
+   * The operator's drain record (ADR 0044 §5): set by `coppice node drain`
+   * or by declaring the node lost, cleared by `node undrain`. `null` means
+   * no drain is in force. Independent of `agentDraining`.
    */
-  schedulable: boolean
+  drain: NodeDrain | null
   /**
-   * The agent's own announcement that it is shutting down, cleared on
-   * re-registration. Optional on the wire; absence means false. A node
-   * takes new placements only when `schedulable && !draining`.
+   * The agent's own shutdown announcement (its SIGTERM drain, or a
+   * provider interruption notice — see `interruptionDeadline`), cleared when
+   * it re-registers. An announced node admits nothing.
    */
-  draining?: boolean
+  agentDraining: boolean
   /**
    * Spot capacity (ADR 0044 §4): the node accepts only effectively
    * preemptible work.
@@ -1004,7 +1017,8 @@ export interface CapacitySample {
 }
 
 export interface ClusterCapacity {
-  nodes: { total: number; schedulable: number; lost: number }
+  /** `open`: nodes not draining by either flag and not lost. */
+  nodes: { total: number; open: number; lost: number }
   capacity: Resources
   allocated: Resources
   /**

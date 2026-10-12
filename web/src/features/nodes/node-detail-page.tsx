@@ -5,6 +5,7 @@ import type {
   AccrualView,
   AttemptView,
   HostFacts,
+  NodeDrain,
   NodeDetail,
   NodeSummary,
   Resources,
@@ -89,7 +90,7 @@ export function NodeDetailPage({ nodeId }: { nodeId: string }) {
 function NodeDetailBody({ detail, nodeId }: { detail: NodeDetail; nodeId: string }) {
   const { summary } = detail
   const lost = summary.health === 'Lost'
-  const draining = (summary.schedulable === false || summary.draining === true) && !lost
+  const drained = summary.drain !== null && !lost
   const usedFrac = resourceFractions(summary.used, summary.capacity)
 
   return (
@@ -99,8 +100,11 @@ function NodeDetailBody({ detail, nodeId }: { detail: NodeDetail; nodeId: string
           <span className="flex flex-wrap items-center gap-3">
             <span className="font-mono text-lg break-all">{summary.id}</span>
             <StatePill state={summary.health} />
-            {summary.schedulable === false || summary.draining ? (
-              <StatePill state="Draining" />
+            {summary.drain !== null ? <StatePill state="Draining" /> : null}
+            {summary.agentDraining ? (
+              <Badge variant="outline" title="The agent announced its own shutdown">
+                agent draining
+              </Badge>
             ) : null}
             {summary.preemptibleOnly ? (
               <Badge
@@ -146,8 +150,12 @@ function NodeDetailBody({ detail, nodeId }: { detail: NodeDetail; nodeId: string
           </span>{' '}
           (agent clock). Running attempts are being preempted.
         </Banner>
-      ) : draining ? (
-        <Banner tone="amber">Draining — no new placements; existing work continues.</Banner>
+      ) : drained ? (
+        <Banner tone="amber">
+          Drained by an operator — {drainBannerText(summary.drain!)}. Existing work continues.
+        </Banner>
+      ) : summary.agentDraining ? (
+        <Banner tone="amber">Agent draining — it announced shutdown and admits nothing.</Banner>
       ) : null}
 
       <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
@@ -164,6 +172,15 @@ function NodeDetailBody({ detail, nodeId }: { detail: NodeDetail; nodeId: string
           hint={usedFrac.memory != null ? 'of capacity' : 'not reported'}
         />
       </div>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Draining</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <DrainFacts summary={summary} />
+        </CardContent>
+      </Card>
 
       <Card>
         <CardHeader>
@@ -212,6 +229,43 @@ function NodeDetailBody({ detail, nodeId }: { detail: NodeDetail; nodeId: string
         </CardContent>
       </Card>
     </div>
+  )
+}
+
+function drainBannerText(drain: NodeDrain): string {
+  if (drain.complete) return 'drain complete, the node holds no live work'
+  if (drain.horizon === null)
+    return 'emptying time is unbounded, so nothing new is admitted until the live work ends'
+  return `empty ${formatTimeUntil(drain.horizon)}; until then only backfill that finishes by then is admitted`
+}
+
+/**
+ * The operator's drain record and the agent's shutdown announcement are two
+ * independent facts, shown as separate rows.
+ */
+function DrainFacts({ summary }: { summary: NodeSummary }) {
+  const { drain } = summary
+  return (
+    <dl className="space-y-2 text-sm">
+      <HostFact label="Operator drain" value={drain === null ? 'none' : 'requested'} />
+      {drain !== null ? (
+        <>
+          <HostFact label="Requested at" value={formatTimestamp(drain.requestedAt)} />
+          <HostFact
+            label="Horizon"
+            value={drain.horizon === null ? 'unbounded' : formatTimestamp(drain.horizon)}
+          />
+          <HostFact
+            label="Complete"
+            value={drain.complete ? 'yes — node holds no live work' : 'no'}
+          />
+        </>
+      ) : null}
+      <HostFact
+        label="Agent announcement"
+        value={summary.agentDraining ? 'draining (shutting down)' : 'none'}
+      />
+    </dl>
   )
 }
 
