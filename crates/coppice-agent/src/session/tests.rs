@@ -101,6 +101,9 @@ fn start_job_with_env(
         limits: None,
         max_runtime_us,
         env,
+        notice_signal: pbcore::NoticeSignal::Sigusr1 as i32,
+        notice_us: 60_000_000,
+        ..Default::default()
     })
 }
 
@@ -353,6 +356,73 @@ async fn start_job_with_malformed_env_is_dropped_without_journaling() {
         "a malformed env must never leave a journaled intent behind"
     );
     assert!(!exec.is_running(alloc));
+}
+
+/// The reserved resumption-identity block (ADR 0044 §2) reaches the
+/// container's env alongside the job's own, the previous pair included.
+#[tokio::test]
+async fn start_job_injects_the_resumption_identity() {
+    let (_dir, mut session, exec) = session();
+    register(&mut session, 1, 1, 1).await;
+    let (alloc, attempt, job) = (AllocationId::new(), AttemptId::new(), JobId::new());
+    let previous = AttemptId::new();
+    let mut body = start_job_with_env(alloc, attempt, job, None, vec![env_var("A", "1")]);
+    if let pb::agent_command::Body::StartJob(sj) = &mut body {
+        sj.attempt_index = 2;
+        sj.previous_attempt = Some(previous.into());
+        sj.previous_attempt_outcome = Some((&AttemptOutcome::NodeLost).into());
+        sj.preemptible = true;
+        sj.notice_signal = pbcore::NoticeSignal::Sigterm as i32;
+        sj.notice_us = 120_000_000;
+    }
+    session
+        .handle_command(command(1, 1, 2, body))
+        .await
+        .unwrap();
+    let env = exec.started_env(alloc).expect("started");
+    let expect = |k: &str, v: String| assert_eq!(env.get(k), Some(&v), "{k}");
+    expect("A", "1".into());
+    expect("COPPICE_JOB_ID", job.to_string());
+    expect("COPPICE_ATTEMPT_ID", attempt.to_string());
+    expect("COPPICE_ATTEMPT_INDEX", "2".into());
+    expect("COPPICE_PREVIOUS_ATTEMPT_ID", previous.to_string());
+    expect("COPPICE_PREVIOUS_ATTEMPT_OUTCOME", "node_lost".into());
+    expect("COPPICE_PREEMPTIBLE", "1".into());
+    expect("COPPICE_NOTICE_SIGNAL", "SIGTERM".into());
+    expect("COPPICE_NOTICE_S", "120".into());
+}
+
+/// No earlier attempt ran: the previous pair is unset, never empty.
+#[test]
+fn resumption_env_omits_the_previous_pair_when_none_ran() {
+    let mut sj = pb::StartJob {
+        job: Some(JobId::new().into()),
+        attempt: Some(AttemptId::new().into()),
+        notice_signal: pbcore::NoticeSignal::Sigusr1 as i32,
+        notice_us: 60_000_000,
+        ..Default::default()
+    };
+    let block = super::resumption_env(&sj).expect("well-formed");
+    let names: Vec<&str> = block.iter().map(|(n, _)| *n).collect();
+    assert_eq!(
+        names,
+        [
+            "COPPICE_ATTEMPT_ID",
+            "COPPICE_ATTEMPT_INDEX",
+            "COPPICE_JOB_ID",
+            "COPPICE_NOTICE_S",
+            "COPPICE_NOTICE_SIGNAL",
+            "COPPICE_PREEMPTIBLE",
+        ]
+    );
+    assert!(block.contains(&("COPPICE_PREEMPTIBLE", "0".to_string())));
+
+    // Half a pair, or a signal outside the closed allowlist, is malformed.
+    sj.previous_attempt = Some(AttemptId::new().into());
+    assert!(super::resumption_env(&sj).is_none());
+    sj.previous_attempt = None;
+    sj.notice_signal = 0;
+    assert!(super::resumption_env(&sj).is_none());
 }
 
 #[tokio::test]

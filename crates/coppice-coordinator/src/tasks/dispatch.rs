@@ -24,14 +24,14 @@ use std::sync::Arc;
 use tokio::sync::watch;
 
 use coppice_consensus::{Applied, Consensus, ConsensusStatus, StateViews};
-use coppice_core::attempt::AttemptState;
+use coppice_core::attempt::{AttemptOutcome, AttemptState};
 use coppice_core::id::{AllocationId, AttemptId, NodeId};
 use coppice_core::time::{Duration, Timestamp};
 use coppice_proto::pb::agent::v1::{
     agent_command, AgentCommand, RegisterAccepted, StartJob, StopJob,
 };
 use coppice_state::command::DispatchAttempt;
-use coppice_state::{AllocationRecord, AttemptRecord, Command, Event, JobRecord};
+use coppice_state::{AllocationRecord, AttemptRecord, Command, Event, JobRecord, StateMachine};
 
 use crate::leadership;
 use crate::tasks::agent_gateway::{RouteCommand, RouterHandle};
@@ -261,7 +261,7 @@ async fn dispatch_ready_attempt<C: Consensus>(
                 return;
             };
             let node = record.attempt.node;
-            let agent_command = start_job_command(job, record, allocation);
+            let agent_command = start_job_command(view.state(), job, record, allocation);
             if router
                 .send(RouteCommand {
                     node,
@@ -308,10 +308,13 @@ async fn route_stop(
 /// the allocation's requested vector; `max_runtime` rides straight from the
 /// job spec's `max_runtime` (absent = unbounded).
 pub(crate) fn start_job_command(
+    state: &StateMachine,
     job: &JobRecord,
     attempt: &AttemptRecord,
     allocation: &AllocationRecord,
 ) -> AgentCommand {
+    let identity = resumption_identity(state, job, attempt.attempt.id);
+    let preemption = &job.spec.preemption;
     AgentCommand {
         header: None,
         body: Some(agent_command::Body::StartJob(StartJob {
@@ -330,7 +333,77 @@ pub(crate) fn start_job_command(
             // Ascending name order for free (`JobEnv` is a `BTreeMap`); the
             // agent applies these over the image's own `ENV` on create.
             env: coppice_proto::convert::env_to_pb(&job.spec.env),
+            attempt_index: identity.index,
+            previous_attempt: identity.previous.as_ref().map(|(id, _)| (*id).into()),
+            previous_attempt_outcome: identity
+                .previous
+                .as_ref()
+                .map(|(_, outcome)| outcome.into()),
+            preemptible: attempt.effective_preemptible,
+            notice_signal: coppice_proto::convert::notice_signal_to_pb(preemption.notice_signal)
+                as i32,
+            // Resolved at submission, so always present on a stored job; the
+            // floor is what an absent one would have resolved to.
+            notice_us: preemption
+                .notice
+                .unwrap_or(state.policy.preemption_notice_floor)
+                .as_micros()
+                .max(0) as u64,
         })),
+    }
+}
+
+/// The resumption identity of ADR 0044 §2: where an attempt sits in its
+/// job's lineage, and the most recent earlier attempt that ran.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResumptionIdentity {
+    /// Position in `JobRecord.attempts`, counting attempts that never ran.
+    pub index: u32,
+    /// The most recent earlier attempt that reached `Running`, with its
+    /// outcome.
+    pub previous: Option<(AttemptId, AttemptOutcome)>,
+}
+
+/// Derive [`ResumptionIdentity`] from the job's durable lineage
+/// (`JobRecord.attempts`, ADR 0030), so it is right even when the previous
+/// attempt's end was never reported by its agent: a node loss is still a
+/// recorded outcome.
+///
+/// "Reached `Running`" is a recorded `started_at`. Attempts that never ran —
+/// revoked while accruing, refused at the door — are skipped for the
+/// previous pair, since they can have touched nothing, but still count in
+/// the index.
+///
+/// The pair is reported only for a candidate that is also `Terminal`, and
+/// otherwise omitted *whole*, never half: the variables are both-or-neither.
+/// Under ADR 0030 an earlier attempt is always terminal by the time a later
+/// one exists — a job has one live attempt and only gets a new one through a
+/// resolution — so the omission is a guard against a lineage that breaks
+/// that rule, where inventing an outcome would be worse than saying nothing.
+/// An attempt the lineage names but the state no longer holds is skipped
+/// the same way.
+pub(crate) fn resumption_identity(
+    state: &StateMachine,
+    job: &JobRecord,
+    attempt: AttemptId,
+) -> ResumptionIdentity {
+    let position = job
+        .attempts
+        .iter()
+        .position(|a| *a == attempt)
+        .unwrap_or(job.attempts.len());
+    let previous = job.attempts[..position]
+        .iter()
+        .rev()
+        .filter_map(|id| state.attempts.get(id).map(|r| (*id, r)))
+        .find(|(_, r)| r.started_at.is_some())
+        .and_then(|(id, r)| match &r.attempt.state {
+            AttemptState::Terminal(outcome) => Some((id, outcome.clone())),
+            _ => None,
+        });
+    ResumptionIdentity {
+        index: u32::try_from(position).unwrap_or(u32::MAX),
+        previous,
     }
 }
 
@@ -414,7 +487,7 @@ mod tests {
             AllocationState::Funded,
         );
 
-        let command = start_job_command(&job, &attempt, &allocation);
+        let command = start_job_command(&StateMachine::default(), &job, &attempt, &allocation);
         // The manager stamps the header on the way out.
         assert!(command.header.is_none());
         let agent_command::Body::StartJob(sj) = command.body.expect("body") else {
@@ -476,11 +549,88 @@ mod tests {
             AllocationState::Funded,
         );
 
-        let command = start_job_command(&job, &attempt, &allocation);
+        let command = start_job_command(&StateMachine::default(), &job, &attempt, &allocation);
         let agent_command::Body::StartJob(sj) = command.body.expect("body") else {
             panic!("expected StartJob");
         };
         assert_eq!(sj.max_runtime_us, None);
+    }
+
+    /// ADR 0044 §2: the index counts every attempt; the previous pair
+    /// skips attempts that never ran and names the latest that did.
+    #[test]
+    fn resumption_identity_skips_attempts_that_never_ran() {
+        let job_id = JobId::new();
+        let node = NodeId::new();
+        let mut state = StateMachine::default();
+        let mut job = job_record(job_id, "img", requested(), None);
+        let started = Some(Timestamp::UNIX_EPOCH);
+        // 0 ran and was lost; 1 ran and exited; 2 was revoked while
+        // accruing; 3 is the attempt being started.
+        let lineage = [
+            (AttemptState::Terminal(AttemptOutcome::NodeLost), started),
+            (
+                AttemptState::Terminal(AttemptOutcome::Exited { code: 3 }),
+                started,
+            ),
+            (AttemptState::Terminal(AttemptOutcome::Revoked), None),
+            (AttemptState::Ready, None),
+        ];
+        let ids: Vec<AttemptId> = lineage.iter().map(|_| AttemptId::new()).collect();
+        for (id, (st, started_at)) in ids.iter().zip(lineage) {
+            state.attempts.insert(
+                *id,
+                attempt_record(*id, job_id, AllocationId::new(), node, st, started_at),
+            );
+            job.attempts.push(*id);
+        }
+
+        let identity = resumption_identity(&state, &job, ids[3]);
+        assert_eq!(identity.index, 3);
+        assert_eq!(
+            identity.previous,
+            Some((ids[1], AttemptOutcome::Exited { code: 3 }))
+        );
+        // The first attempt has nobody before it.
+        assert_eq!(
+            resumption_identity(&state, &job, ids[0]),
+            ResumptionIdentity {
+                index: 0,
+                previous: None
+            }
+        );
+
+        // And it reaches the command, with the notice contract.
+        job.spec.preemption.notice = Some(Duration::from_secs(90));
+        let mut current = state.attempts.get(&ids[3]).unwrap().clone();
+        current.effective_preemptible = true;
+        let allocation = allocation_record(
+            current.attempt.allocation,
+            job_id,
+            ids[3],
+            node,
+            requested(),
+            AllocationState::Funded,
+        );
+        let agent_command::Body::StartJob(sj) =
+            start_job_command(&state, &job, &current, &allocation)
+                .body
+                .expect("body")
+        else {
+            panic!("expected StartJob");
+        };
+        assert_eq!(sj.attempt_index, 3);
+        assert_eq!(
+            AttemptId::try_from(sj.previous_attempt.unwrap()).unwrap(),
+            ids[1]
+        );
+        assert!(sj.previous_attempt_outcome.is_some());
+        assert!(sj.preemptible);
+        assert_eq!(sj.notice_us, 90_000_000);
+        assert_eq!(
+            sj.notice_signal,
+            coppice_proto::pb::core::v1::NoticeSignal::Sigusr1 as i32
+        );
     }
 
     #[test]

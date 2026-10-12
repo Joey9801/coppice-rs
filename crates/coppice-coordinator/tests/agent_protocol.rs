@@ -668,6 +668,9 @@ fn start_job_body(alloc: AllocationId, attempt: AttemptId, job: JobId) -> pb::ag
         env: Vec::new(),
         limits: None,
         max_runtime_us: None,
+        notice_signal: coppice_proto::pb::core::v1::NoticeSignal::Sigusr1 as i32,
+        notice_us: 60_000_000,
+        ..Default::default()
     })
 }
 

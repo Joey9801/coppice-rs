@@ -59,6 +59,13 @@ Decided in [ADR 0009](../decisions/0009-fencing-and-reconciliation.md):
   reject lower terms, mismatched epochs, and already-seen sequence numbers.
 - `StartJob` is idempotent on `AllocationId`; status reports are idempotent on
   `(AttemptId, attempt_state)` because the attempt state machine is monotonic.
+- `StartJob` also carries the attempt's *resumption identity*
+  ([ADR 0044](../decisions/0044-job-preemption-and-spot-capacity.md) §2):
+  its index in the job's lineage, the most recent earlier attempt that
+  reached `Running` with its outcome (derived from replicated
+  `JobRecord.attempts`, so a lost node's attempt still counts), the
+  attempt's recorded effective preemptibility, and the job's notice
+  contract. The agent injects it as the reserved `COPPICE_*` env block.
 - Agents journal `(allocation_id, attempt_id, job_id, epoch)` durably before
   starting a container, and label containers with allocation/attempt IDs. On
   restart the agent rebuilds its actual set from journal + runtime, registers

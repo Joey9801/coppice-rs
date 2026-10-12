@@ -39,6 +39,14 @@ pub mod storage {
 
 pub mod agent {
     pub mod v1 {
+        // `AgentCommand.body`'s `StartJob` arm carries the whole launch
+        // description — image, argv, env, limits and the ADR 0044
+        // resumption identity — so it dwarfs the control arms (stop, drain,
+        // hints). As with `raft.v1` above, the size gap is the schema's
+        // shape: a start command *is* mostly its payload, and boxing it
+        // would only move the allocation.
+        #![allow(clippy::large_enum_variant)]
+
         include!(concat!(env!("OUT_DIR"), "/coppice.agent.v1.rs"));
     }
 }
