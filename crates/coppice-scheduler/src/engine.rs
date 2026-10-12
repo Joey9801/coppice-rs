@@ -177,6 +177,24 @@ struct NodeModel<'a> {
     pending_accruals: Vec<Resources>,
 }
 
+/// The placement gate a candidate node must pass for one job: the node
+/// takes new work at all (ADR 0041), and — when it is a spot-only node — the
+/// job is effectively preemptible (ADR 0044 §4). The same two checks apply's
+/// `validate_placement` makes, asked from the same snapshot, so the pass
+/// never proposes a seat apply would refuse.
+fn node_admits(nm: &NodeModel, preemptible: bool) -> bool {
+    nm.accepts_placements && (!nm.node.preemptible_only || preemptible)
+}
+
+/// The spot tie-break (ADR 0044 §4): between two equally scored nodes, an
+/// effectively preemptible job takes the `preemptible_only` one, leaving the
+/// persistent capacity for work that cannot go anywhere else. Never a score
+/// bonus — it decides only an exact tie, which otherwise keeps the first
+/// (lowest-`NodeId`) node.
+fn prefers_on_tie(preemptible: bool, candidate: &NodeModel, incumbent: &NodeModel) -> bool {
+    preemptible && candidate.node.preemptible_only && !incumbent.node.preemptible_only
+}
+
 // ---- the pass ----
 
 struct Pass<'a> {
@@ -416,8 +434,10 @@ impl<'a> Pass<'a> {
             }
             let requested = jr.spec.requests;
             let required = required_labels(&jr.spec);
+            // A reseat is a fresh placement, resolved afresh at apply.
+            let preemptible = snapshot.effective_preemptible(&jr.spec);
             if let Some(target_idx) =
-                self.best_reseat_target(source, &jr.spec, &requested, &required)
+                self.best_reseat_target(source, &jr.spec, preemptible, &requested, &required)
             {
                 self.revoke_accrual_on_source(source, alloc);
                 self.revocations.push(alloc);
@@ -437,7 +457,14 @@ impl<'a> Pass<'a> {
             }
             if improvement_scans < self.accrual_limit {
                 improvement_scans += 1;
-                self.try_improve_accrual_bound(job_id, alloc, source, &requested, &required);
+                self.try_improve_accrual_bound(
+                    job_id,
+                    alloc,
+                    source,
+                    preemptible,
+                    &requested,
+                    &required,
+                );
             }
         }
     }
@@ -453,6 +480,7 @@ impl<'a> Pass<'a> {
         job_id: JobId,
         alloc: AllocationId,
         source: NodeId,
+        preemptible: bool,
         requested: &Resources,
         required: &BTreeMap<String, String>,
     ) -> bool {
@@ -462,7 +490,8 @@ impl<'a> Pass<'a> {
         let Some(current) = self.accrual_projected_ready(source_idx, alloc) else {
             return false;
         };
-        let Some(target_idx) = self.best_improvement_target(source, requested, required, current)
+        let Some(target_idx) =
+            self.best_improvement_target(source, preemptible, requested, required, current)
         else {
             return false;
         };
@@ -521,13 +550,14 @@ impl<'a> Pass<'a> {
     fn best_improvement_target(
         &self,
         source: NodeId,
+        preemptible: bool,
         requested: &Resources,
         required: &BTreeMap<String, String>,
         current: Option<Timestamp>,
     ) -> Option<usize> {
         let mut best: Option<(Timestamp, f64, usize)> = None;
         for (i, nm) in self.nodes.iter().enumerate() {
-            if nm.node.id == source || !nm.accepts_placements {
+            if nm.node.id == source || !node_admits(nm, preemptible) {
                 continue;
             }
             if self.revoked_nodes.contains(&nm.node.id) {
@@ -570,8 +600,12 @@ impl<'a> Pass<'a> {
             let pledged = pledge_fraction(&nm.sim_free, requested);
             let better = match best {
                 None => true,
-                Some((best_ready, best_pledged, _)) => {
-                    ready < best_ready || (ready == best_ready && pledged > best_pledged)
+                Some((best_ready, best_pledged, bi)) => {
+                    ready < best_ready
+                        || (ready == best_ready && pledged > best_pledged)
+                        || (ready == best_ready
+                            && pledged == best_pledged
+                            && prefers_on_tie(preemptible, nm, &self.nodes[bi]))
                 }
             };
             if better {
@@ -589,12 +623,13 @@ impl<'a> Pass<'a> {
         &self,
         source: NodeId,
         job: &Job,
+        preemptible: bool,
         requested: &Resources,
         required: &BTreeMap<String, String>,
     ) -> Option<usize> {
         let mut best: Option<(f64, usize)> = None;
         for (i, nm) in self.nodes.iter().enumerate() {
-            if nm.node.id == source || !nm.accepts_placements || !nm.accruals.is_empty() {
+            if nm.node.id == source || !node_admits(nm, preemptible) || !nm.accruals.is_empty() {
                 continue;
             }
             if self.revoked_nodes.contains(&nm.node.id) {
@@ -610,7 +645,9 @@ impl<'a> Pass<'a> {
                 - cache_affinity_bonus(job, nm.node);
             let better = match best {
                 None => true,
-                Some((bk, _)) => key < bk,
+                Some((bk, bi)) => {
+                    key < bk || (key == bk && prefers_on_tie(preemptible, nm, &self.nodes[bi]))
+                }
             };
             if better {
                 best = Some((key, i));
@@ -672,13 +709,15 @@ impl<'a> Pass<'a> {
             }
             let requested = jr.spec.requests;
             let required = required_labels(&jr.spec);
-            if self.try_free_fit(rank.job, &jr.spec, &requested, &required) {
+            // ADR 0044 §4: resolved once per job, by the resolver apply uses.
+            let preemptible = snapshot.effective_preemptible(&jr.spec);
+            if self.try_free_fit(rank.job, &jr.spec, preemptible, &requested, &required) {
                 continue;
             }
-            if self.try_backfill(rank.job, &jr.spec, &requested, &required) {
+            if self.try_backfill(rank.job, &jr.spec, preemptible, &requested, &required) {
                 continue;
             }
-            self.try_open_accrual(rank.job, &jr.spec, &requested, &required);
+            self.try_open_accrual(rank.job, &jr.spec, preemptible, &requested, &required);
         }
     }
 
@@ -687,12 +726,13 @@ impl<'a> Pass<'a> {
         &mut self,
         job_id: JobId,
         job: &Job,
+        preemptible: bool,
         requested: &Resources,
         required: &BTreeMap<String, String>,
     ) -> bool {
         let mut best: Option<(f64, usize)> = None;
         for (i, nm) in self.nodes.iter().enumerate() {
-            if !nm.accepts_placements
+            if !node_admits(nm, preemptible)
                 || !requested.fits_within(&nm.node.capacity)
                 || !node_satisfies_labels(required, &nm.node.labels)
                 || !requested.fits_within(&nm.sim_free)
@@ -703,7 +743,9 @@ impl<'a> Pass<'a> {
                 - cache_affinity_bonus(job, nm.node);
             let better = match best {
                 None => true,
-                Some((bk, _)) => key < bk,
+                Some((bk, bi)) => {
+                    key < bk || (key == bk && prefers_on_tie(preemptible, nm, &self.nodes[bi]))
+                }
             };
             if better {
                 best = Some((key, i));
@@ -734,6 +776,7 @@ impl<'a> Pass<'a> {
         &mut self,
         job_id: JobId,
         job: &Job,
+        preemptible: bool,
         requested: &Resources,
         required: &BTreeMap<String, String>,
     ) -> bool {
@@ -749,7 +792,22 @@ impl<'a> Pass<'a> {
         let deadline = self.now + runtime;
         let mut best: Option<(f64, usize)> = None;
         for (i, nm) in self.nodes.iter().enumerate() {
-            if !nm.accepts_placements || nm.accruals.is_empty() {
+            if !node_admits(nm, preemptible) || nm.accruals.is_empty() {
+                continue;
+            }
+            // The lend reseats every survivor on this node as a fresh
+            // placement, which apply gates again: on a spot-only node each
+            // survivor must still be effectively preemptible *now* (an entity
+            // switch may have flipped since it was placed), or the whole
+            // batch would be refused.
+            if nm.node.preemptible_only
+                && !nm.accruals.iter().all(|a| {
+                    self.snapshot
+                        .jobs
+                        .get(&a.job)
+                        .is_some_and(|j| self.snapshot.effective_preemptible(&j.spec))
+                })
+            {
                 continue;
             }
             // A lend reseats every survivor on the same node, so the node ends
@@ -792,7 +850,9 @@ impl<'a> Pass<'a> {
             let key = borrowed_fraction(&nm.sim_free, requested, &nm.node.capacity);
             let better = match best {
                 None => true,
-                Some((bk, _)) => key < bk,
+                Some((bk, bi)) => {
+                    key < bk || (key == bk && prefers_on_tie(preemptible, nm, &self.nodes[bi]))
+                }
             };
             if better {
                 best = Some((key, i));
@@ -870,6 +930,7 @@ impl<'a> Pass<'a> {
         &mut self,
         job_id: JobId,
         _job: &Job,
+        preemptible: bool,
         requested: &Resources,
         required: &BTreeMap<String, String>,
     ) -> bool {
@@ -880,7 +941,7 @@ impl<'a> Pass<'a> {
         }
         let mut best: Option<(Option<Timestamp>, f64, usize)> = None;
         for (i, nm) in self.nodes.iter().enumerate() {
-            if !nm.accepts_placements
+            if !node_admits(nm, preemptible)
                 || !requested.fits_within(&nm.node.capacity)
                 || !node_satisfies_labels(required, &nm.node.labels)
             {
@@ -900,12 +961,15 @@ impl<'a> Pass<'a> {
             let pledged = pledge_fraction(&nm.sim_free, requested);
             let better = match &best {
                 None => true,
-                Some((best_ready, best_pledged, _)) => match (ready, *best_ready) {
-                    (Some(_), None) => true,
-                    (None, Some(_)) => false,
-                    (Some(t), Some(bt)) => t < bt || (t == bt && pledged > *best_pledged),
-                    (None, None) => pledged > *best_pledged,
-                },
+                Some((best_ready, best_pledged, bi)) => {
+                    let tie = ready == *best_ready && pledged == *best_pledged;
+                    (match (ready, *best_ready) {
+                        (Some(_), None) => true,
+                        (None, Some(_)) => false,
+                        (Some(t), Some(bt)) => t < bt || (t == bt && pledged > *best_pledged),
+                        (None, None) => pledged > *best_pledged,
+                    }) || (tie && prefers_on_tie(preemptible, nm, &self.nodes[*bi]))
+                }
             };
             if better {
                 best = Some((ready, pledged, i));
@@ -1229,6 +1293,7 @@ mod tests {
                     service_addr: None,
                     host_facts: None,
                     detected_capacity: None,
+                    preemptible_only: false,
                 },
                 epoch: 1,
                 draining: false,

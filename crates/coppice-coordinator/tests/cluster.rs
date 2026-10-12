@@ -958,6 +958,7 @@ async fn a_follower_reports_node_health_from_the_leaders_liveness_marks() {
         telemetry: Default::default(),
         listen: None,
         metrics_addr: None,
+        preemption: Default::default(),
     };
 
     let advertised = agent_config

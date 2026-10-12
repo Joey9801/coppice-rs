@@ -601,6 +601,7 @@ mod tests {
                     service_addr: None,
                     host_facts: None,
                     detected_capacity: None,
+                    preemptible_only: false,
                 },
                 epoch,
                 draining: false,

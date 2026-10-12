@@ -76,6 +76,7 @@ fn register_node_command() -> Command {
         host_facts: None,
         detected_capacity: None,
         draining: false,
+        preemptible_only: false,
     })
 }
 

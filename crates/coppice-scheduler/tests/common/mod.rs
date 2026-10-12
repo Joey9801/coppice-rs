@@ -134,6 +134,16 @@ pub fn configure_entity_cmd(entity: QuotaEntityId, parent: Option<QuotaEntityId>
 }
 
 pub fn register_node_cmd(node: NodeId, capacity: Resources, at: Timestamp) -> Command {
+    register_node_cmd_with(node, capacity, at, false)
+}
+
+/// `register_node_cmd` with the agent's `preemptible_only` (ADR 0044 §4).
+pub fn register_node_cmd_with(
+    node: NodeId,
+    capacity: Resources,
+    at: Timestamp,
+    preemptible_only: bool,
+) -> Command {
     Command::RegisterNode(RegisterNode {
         node,
         capacity,
@@ -143,6 +153,7 @@ pub fn register_node_cmd(node: NodeId, capacity: Resources, at: Timestamp) -> Co
         host_facts: None,
         detected_capacity: None,
         draining: false,
+        preemptible_only,
     })
 }
 
@@ -152,6 +163,25 @@ pub fn submit_cmd(
     max_runtime_s: Option<i64>,
     multiplier: PriorityMultiplier,
     at: Timestamp,
+) -> Command {
+    submit_cmd_with(
+        job,
+        requests,
+        max_runtime_s,
+        multiplier,
+        at,
+        Default::default(),
+    )
+}
+
+/// `submit_cmd` with an explicit `[preemption]` table (ADR 0044 §1).
+pub fn submit_cmd_with(
+    job: JobId,
+    requests: Resources,
+    max_runtime_s: Option<i64>,
+    multiplier: PriorityMultiplier,
+    at: Timestamp,
+    preemption: coppice_core::preemption::PreemptionSpec,
 ) -> Command {
     Command::SubmitJob(SubmitJob {
         job: Job {
@@ -168,7 +198,7 @@ pub fn submit_cmd(
             submitted_by: None,
             metadata: Default::default(),
             env: Default::default(),
-            preemption: Default::default(),
+            preemption,
         },
         multiplier,
         submitted_at: at,

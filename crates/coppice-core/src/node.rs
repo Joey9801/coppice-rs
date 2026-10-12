@@ -32,6 +32,12 @@ pub struct Node {
     /// overrides, so a reader can explain an advertised capacity that differs
     /// from the hardware. `None` when the agent detected nothing.
     pub detected_capacity: Option<Resources>,
+    /// The node accepts only *effectively preemptible* work
+    /// (`docs/decisions/0044-job-preemption-and-spot-capacity.md` §4): set
+    /// by the agent's `[preemption] preemptible_only`, typically on spot
+    /// capacity, and rewritten by every registration. Both the scheduler's
+    /// candidate filter and apply's placement validation enforce it.
+    pub preemptible_only: bool,
 }
 
 /// Static description of the machine an agent runs on, collected once at agent

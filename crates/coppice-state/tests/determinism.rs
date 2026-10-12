@@ -202,9 +202,10 @@ fn arb_global() -> impl Strategy<Value = Command> {
             0usize..NODES as usize,
             4_000u64..32_000,
             any::<bool>(),
+            any::<bool>(),
             arb_ts()
         )
-            .prop_map(|(n, cpu_millis, draining, ts)| {
+            .prop_map(|(n, cpu_millis, draining, preemptible_only, ts)| {
                 Command::RegisterNode(RegisterNode {
                     node: node_of(n),
                     capacity: cpu(cpu_millis),
@@ -214,6 +215,9 @@ fn arb_global() -> impl Strategy<Value = Command> {
                     host_facts: None,
                     detected_capacity: None,
                     draining,
+                    // ADR 0044 §4: a spot node refuses placements for jobs
+                    // that are not effectively preemptible, deterministically.
+                    preemptible_only,
                 })
             }),
         (0usize..NODES as usize, arb_ts()).prop_map(|(n, ts)| {

@@ -351,6 +351,24 @@ lifecycle-hook heartbeat timeout — must be sized with margin over it,
 since systemd SIGKILLs the process outright once `TimeoutStopSec`
 elapses.
 
+An optional `[preemption]` table marks a **spot-only** node
+([ADR 0044](../decisions/0044-job-preemption-and-spot-capacity.md) §4):
+
+```toml
+[preemption]
+preemptible_only = true   # default false
+```
+
+The flag rides every `Register` onto the replicated node record, and both
+the scheduler and apply then place only *effectively preemptible* jobs
+there — the job declared `[preemption] preemptible = true` and no quota
+entity on its path switched preemption off. Preemptible jobs still run on
+ordinary nodes; there is no placement bonus toward spot capacity, only a
+tie-break that sends a preemptible job to the spot node when two nodes
+score the same. Because registration rewrites the flag, changing it takes
+effect when the agent restarts. It is a fact about the machine, not the
+cluster, so it is node config rather than policy.
+
 ## Replicated policy
 
 Policy is inspected and changed through the CLI, which converts

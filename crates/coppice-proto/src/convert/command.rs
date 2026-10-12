@@ -486,6 +486,7 @@ impl From<&RegisterNode> for pb::RegisterNode {
             host_facts: c.host_facts.as_ref().map(Into::into),
             detected_capacity: c.detected_capacity.as_ref().map(Into::into),
             draining: c.draining,
+            preemptible_only: c.preemptible_only,
         }
     }
 }
@@ -504,6 +505,7 @@ impl TryFrom<pb::RegisterNode> for RegisterNode {
             host_facts: c.host_facts.map(Into::into),
             detected_capacity: c.detected_capacity.map(Resources::try_from).transpose()?,
             draining: c.draining,
+            preemptible_only: c.preemptible_only,
         })
     }
 }

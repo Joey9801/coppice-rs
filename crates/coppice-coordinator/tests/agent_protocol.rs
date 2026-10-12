@@ -117,6 +117,7 @@ fn agent_config(node_id: NodeId, data_dir: PathBuf, endpoint: &str, ca: &Ca) -> 
         // agent-hosted NodeService (ADR 0034), so no listener is configured.
         listen: None,
         metrics_addr: None,
+        preemption: Default::default(),
     }
 }
 

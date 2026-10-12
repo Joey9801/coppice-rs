@@ -227,6 +227,7 @@ fn every_command() -> Vec<Command> {
                 disk: ByteSize::from_gib(512),
             }),
             draining: true,
+            preemptible_only: false,
         }),
         Command::DeclareNodeLost(DeclareNodeLost {
             node,

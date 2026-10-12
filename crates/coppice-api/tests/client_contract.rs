@@ -545,6 +545,7 @@ fn node_read_models_round_trip_through_the_client() {
         last_heartbeat: Some(ts(4_000_000)),
         running_count: 2,
         accruing_count: 1,
+        preemptible_only: true,
     };
     round_trip::<dto::NodeSummary, client::NodeSummary>(&summary);
     let lost = dto::NodeSummary {

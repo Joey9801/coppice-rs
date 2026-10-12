@@ -217,7 +217,7 @@ fn node_summary_json(id: NodeId) -> serde_json::Value {
         "id": id.to_string(),
         "capacity": { "cpu_millis": 0, "memory_bytes": 0, "disk_bytes": 0 },
         "allocated": { "cpu_millis": 0, "memory_bytes": 0, "disk_bytes": 0 },
-        "used": null, "labels": {}, "schedulable": true, "draining": false, "health": "healthy",
+        "used": null, "labels": {}, "schedulable": true, "draining": false, "preemptible_only": false, "health": "healthy",
         "epoch": 0, "last_heartbeat": null, "running_count": 0, "accruing_count": 0
     })
 }

@@ -125,6 +125,7 @@ fn node_summary(
         labels: record.node.labels.clone(),
         schedulable: record.node.schedulable,
         draining: record.draining,
+        preemptible_only: record.node.preemptible_only,
         health: node_health(mark),
         epoch: record.epoch,
         // The wall stamp is display-only: health above never reads it.
@@ -1638,6 +1639,7 @@ mod tests {
                 service_addr: None,
                 host_facts: None,
                 detected_capacity: None,
+                preemptible_only: false,
             },
             epoch: 1,
             draining: false,

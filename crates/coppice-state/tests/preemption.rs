@@ -268,3 +268,54 @@ fn update_policy_validates_the_preemption_knobs() {
         Some(Duration::from_secs(90))
     );
 }
+
+fn register_spot(node: coppice_core::id::NodeId, preemptible_only: bool) -> Command {
+    let mut cmd = register_node_cmd(node, cpu(10_000), base_ts());
+    if let Command::RegisterNode(r) = &mut cmd {
+        r.preemptible_only = preemptible_only;
+    }
+    cmd
+}
+
+/// ADR 0044 §4 at apply: a spot-only node refuses a seat for a job that is
+/// not effectively preemptible, by declaration or by an entity switch, and a
+/// re-registration rewrites the flag.
+#[test]
+fn a_spot_only_node_refuses_work_that_is_not_effectively_preemptible() {
+    let mut sm = setup();
+    apply_ok(&mut sm, register_spot(nid(2), true));
+    assert!(sm.nodes[&nid(2)].node.preemptible_only);
+
+    let seat = |n: u128| {
+        place_cmd(
+            placement(
+                jid(n),
+                aid(10 * n + 1),
+                alid(100 * n + 11),
+                nid(2),
+                cpu(1_000),
+            ),
+            base_ts(),
+        )
+    };
+    let refused = |r: RejectionReason| {
+        r == RejectionReason::InvalidBatch(vec![coppice_state::Rejection {
+            item_index: 0,
+            reason: RejectionReason::NodeRequiresPreemptible(nid(2)),
+        }])
+    };
+
+    apply_ok(&mut sm, submit(1, Some(3_600), spec(false, None)));
+    assert!(refused(sm.apply(&seat(1)).unwrap_err()));
+
+    apply_ok(&mut sm, submit(2, Some(3_600), spec(true, None)));
+    apply_ok(&mut sm, set_switch(ROOT, None, Some(false)));
+    assert!(refused(sm.apply(&seat(2)).unwrap_err()));
+    apply_ok(&mut sm, set_switch(ROOT, None, Some(true)));
+    apply_ok(&mut sm, seat(2));
+
+    // The agent restarts without `[preemption]`: an ordinary node again.
+    apply_ok(&mut sm, register_spot(nid(2), false));
+    assert!(!sm.nodes[&nid(2)].node.preemptible_only);
+    apply_ok(&mut sm, seat(1));
+}

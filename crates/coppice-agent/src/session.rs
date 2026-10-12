@@ -119,6 +119,9 @@ pub struct Session<F: Fs, E: Executor> {
     /// a reader can see why `capacity` above differs from the hardware. `None`
     /// when no dimension could be detected.
     detected_capacity: Option<Resources>,
+    /// The `[preemption] preemptible_only` switch (ADR 0044 §4), echoed in
+    /// every `Register`: this node takes only effectively preemptible work.
+    preemptible_only: bool,
     /// The shared snapshot behind the daemon's `/readyz` (ADR 0041), written
     /// here and read by the operational listener. `None` for a session that was
     /// never given one — every unit test, and `coppice dev`. Nothing in the
@@ -154,6 +157,7 @@ impl<F: Fs, E: Executor> Session<F, E> {
             service_addr: None,
             host_facts: None,
             detected_capacity: None,
+            preemptible_only: false,
             health: None,
         }
     }
@@ -173,6 +177,14 @@ impl<F: Fs, E: Executor> Session<F, E> {
     /// need not thread a `None` through [`Session::new`].
     pub fn with_service_addr(mut self, service_addr: Option<String>) -> Session<F, E> {
         self.service_addr = service_addr;
+        self
+    }
+
+    /// Mark the node as accepting only effectively preemptible work
+    /// (ADR 0044 §4), echoed in every `Register`. A builder setter like the
+    /// others: off unless the agent's `[preemption]` table turns it on.
+    pub fn with_preemptible_only(mut self, preemptible_only: bool) -> Session<F, E> {
+        self.preemptible_only = preemptible_only;
         self
     }
 
@@ -818,6 +830,9 @@ impl<F: Fs, E: Executor> Session<F, E> {
                 // Registration rewrites the replicated flag, so a session that
                 // is not draining clears a stale announcement here (ADR 0041).
                 draining: self.draining,
+                // Spot-only (ADR 0044 §4); registration rewrites the
+                // replicated flag, so a config change takes effect on restart.
+                preemptible_only: self.preemptible_only,
             })),
         }
     }

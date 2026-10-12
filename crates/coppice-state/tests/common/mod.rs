@@ -124,6 +124,7 @@ pub fn register_node_cmd(node: NodeId, capacity: Resources, at: Timestamp) -> Co
         host_facts: None,
         detected_capacity: None,
         draining: false,
+        preemptible_only: false,
     })
 }
 
@@ -161,6 +162,7 @@ pub fn register_node_cmd_with_host(
         detected_capacity: host_facts.as_ref().map(|_| capacity),
         host_facts,
         draining: false,
+        preemptible_only: false,
     })
 }
 

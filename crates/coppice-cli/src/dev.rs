@@ -472,6 +472,7 @@ pub async fn run(args: DevArgs) -> Result<()> {
                 .parse()
                 .expect("agent metrics socket addr"),
         ),
+        preemption: Default::default(),
     };
 
     // Obtain the machine-plane leaf before anything tries to load it — the

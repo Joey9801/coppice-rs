@@ -644,6 +644,11 @@ impl StateMachine {
         if !node.accepts_placements() {
             return Some(RejectionReason::NodeNotSchedulable(spec.node));
         }
+        // ADR 0044 §4: a spot-only node takes only effectively preemptible
+        // work, resolved exactly as the effects phase will record it.
+        if node.node.preemptible_only && !self.effective_preemptible(&job.spec) {
+            return Some(RejectionReason::NodeRequiresPreemptible(spec.node));
+        }
         if !spec.requested.fits_within(&node.node.capacity) {
             return Some(RejectionReason::RequestExceedsNodeCapacity(spec.id));
         }
@@ -954,6 +959,7 @@ impl StateMachine {
                 // a half-updated record would be worse than either.
                 rec.node.host_facts = c.host_facts.clone();
                 rec.node.detected_capacity = c.detected_capacity;
+                rec.node.preemptible_only = c.preemptible_only;
                 events.push(Event::NodeEpochBumped {
                     node: c.node,
                     epoch: rec.epoch,
@@ -971,6 +977,7 @@ impl StateMachine {
                             service_addr: c.service_addr.clone(),
                             host_facts: c.host_facts.clone(),
                             detected_capacity: c.detected_capacity,
+                            preemptible_only: c.preemptible_only,
                         },
                         epoch: 1,
                         draining: c.draining,

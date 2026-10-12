@@ -39,6 +39,10 @@ message Node {
   // advertised vector; this is display-only context explaining a node that
   // advertises something other than its hardware. Absent when undetected.
   optional Resources detected_capacity = 7;
+  // The node accepts only effectively preemptible work (ADR 0044 §4, spot
+  // capacity), from the agent's `[preemption] preemptible_only`. Rewritten by
+  // every registration, like capacity and labels.
+  bool preemptible_only = 8;
 }
 
 // Static description of the machine an agent runs on, collected once at

@@ -784,6 +784,7 @@ mod tests {
                     service_addr,
                     host_facts: None,
                     detected_capacity: None,
+                    preemptible_only: false,
                 },
                 epoch: 1,
                 draining: false,

@@ -942,6 +942,10 @@ pub enum RejectionReason {
     AllocationNotAccruing(AllocationId),
     #[error("node {0} is not schedulable")]
     NodeNotSchedulable(NodeId),
+    /// The node is `preemptible_only` and the job is not effectively
+    /// preemptible (ADR 0044 §4).
+    #[error("node {0} accepts only preemptible work")]
+    NodeRequiresPreemptible(NodeId),
     #[error("node {0} still accepts placements")]
     NodeAcceptsPlacements(NodeId),
     #[error("node {0} still holds a live allocation")]

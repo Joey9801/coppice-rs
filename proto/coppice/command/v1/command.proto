@@ -266,6 +266,9 @@ message RegisterNode {
   // not carry it clears any earlier one at the same log position that bumps
   // the epoch.
   bool draining = 8;
+  // Whether the node accepts only effectively preemptible work (ADR 0044
+  // §4), from the agent's `Register.preemptible_only`.
+  bool preemptible_only = 9;
 }
 
 // Node missed the replicated heartbeat deadline: epoch bump, unschedulable,

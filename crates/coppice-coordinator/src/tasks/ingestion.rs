@@ -328,6 +328,9 @@ fn normalize(view: &StateView, report: &InboundReport, now: Timestamp) -> Normal
                 // clears the flag at the same log position that bumps the
                 // epoch.
                 draining: reg.draining,
+                // ADR 0044 §4: the agent's `[preemption] preemptible_only`,
+                // rewritten by every registration like capacity and labels.
+                preemptible_only: reg.preemptible_only,
             }));
         }
 
@@ -849,6 +852,7 @@ mod tests {
             }),
             detected_capacity: Some((&requested()).into()),
             draining: false,
+            preemptible_only: false,
         });
 
         let out = normalize(&view, &report(node, 0, reg), now());
@@ -887,6 +891,7 @@ mod tests {
                 host_facts: None,
                 detected_capacity: None,
                 draining,
+                preemptible_only: false,
             })
         };
 
@@ -1516,6 +1521,7 @@ mod tests {
             host_facts: None,
             detected_capacity: None,
             draining: false,
+            preemptible_only: false,
         });
         let inbound = report(node, 0, reg);
 
