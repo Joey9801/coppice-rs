@@ -189,7 +189,7 @@ function ChargeSection({
     <span className="text-xs text-muted-foreground">
       {formatUcuRatePerHour(cost.effectiveRateUcuPerSecond)} ×{' '}
       {formatDuration(cost.chargeWindowSeconds)}{' '}
-      {cost.chargeWindowIsDefault ? 'default window' : 'max runtime'}
+      {cost.chargeWindowIsDefault ? 'renewal interval' : 'max runtime'}
     </span>
   )
 

@@ -408,13 +408,22 @@ export interface CostReport {
   /** The µCU/second actually priced: `rateUcuPerSecond × priority × unbounded`. */
   effectiveRateUcuPerSecond: number
   /**
-   * Duration the upfront placement charge covers: the job's `max_runtime`, or
-   * the policy default charge runtime when `max_runtime` is unset.
+   * Duration the upfront placement charge covers: the job's `max_runtime`. For
+   * an unbounded job it is the renewal interval (captured on the latest
+   * attempt's charge, else the current policy's `unbounded_charge_interval_s`;
+   * ADR 0046).
    */
   chargeWindowSeconds: number
-  /** True iff `chargeWindowSeconds` is the policy default (job declared no `max_runtime`). */
+  /**
+   * True iff the job is unbounded, i.e. `chargeWindowSeconds` is the policy
+   * renewal interval rather than the job's own `max_runtime`.
+   */
   chargeWindowIsDefault: boolean
-  /** Upfront charge taken at placement: `effectiveRate × chargeWindow`. */
+  /**
+   * Upfront charge for one placement: `effectiveRate × chargeWindow`. For an
+   * unbounded job this is the cost of one interval; later intervals are charged
+   * as the attempt keeps running (ADR 0046).
+   */
   estimatedUcu: number
   /** Total charged across attempts so far; 0 before the job is placed. */
   chargedUcu: number
