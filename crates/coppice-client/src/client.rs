@@ -969,19 +969,19 @@ impl Client {
         self.get(&paths::node_utilization(node), &[]).await
     }
 
-    /// `POST /api/v1/nodes/{node}/drain` — cordon a node. New placements stop;
-    /// running work continues.
+    /// `POST /api/v1/nodes/{node}/drain` — drain a node. Only bounded
+    /// backfill is admitted from then on; running work continues.
     pub async fn drain_node(&self, node: NodeId) -> Result<DrainNodeResponse> {
         self.post_empty(&paths::node_drain(node)).await
     }
 
-    /// `POST /api/v1/nodes/{node}/undrain` — lift the cordon.
+    /// `POST /api/v1/nodes/{node}/undrain` — clear the operator's drain.
     pub async fn undrain_node(&self, node: NodeId) -> Result<DrainNodeResponse> {
         self.post_empty(&paths::node_undrain(node)).await
     }
 
     /// `POST /api/v1/nodes/{node}/remove` — evict a node's record. Refused
-    /// while the node still accepts placements or holds a live allocation.
+    /// while the node is not draining or holds a live allocation.
     pub async fn remove_node(&self, node: NodeId) -> Result<RemoveNodeResponse> {
         self.post_empty(&paths::node_remove(node)).await
     }

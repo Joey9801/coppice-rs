@@ -224,7 +224,7 @@ pub const MAX_RENEWAL_BATCHES_PER_PASS: usize = 16;
 /// Agent-liveness deadline before the leader proposes `DeclareNodeLost`
 /// (ADR 0009 health monitor).
 ///
-/// A node whose last report is older than this and that is still schedulable
+/// A node whose last report is older than this and that is not draining
 /// or holds live allocations is declared lost. This is documented as
 /// replicated policy in `docs/operations/configuration.md` ("Agent-liveness /
 /// allocation-lost deadlines") and will migrate into `PolicyConfig` later; a

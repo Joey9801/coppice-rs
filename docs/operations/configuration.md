@@ -459,7 +459,7 @@ live allocation is kept after the leader stops hearing from it
 ([ADR 0041](../decisions/0041-graceful-scale-in-drain-and-node-eviction.md));
 it is what bounds the replicated state of an autoscaling group that churns
 instances, and it is long enough by default that a node drained for
-maintenance comes back to its own record — and its cordon — rather than to a
+maintenance comes back to its own record — and its drain — rather than to a
 fresh one. `terminal` is the post-terminal job window of
 [ADR 0012](../decisions/0012-data-retention.md). Both are seeded only while
 the replicated field still holds its booted default, exactly like the prices,

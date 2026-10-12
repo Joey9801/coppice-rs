@@ -189,7 +189,7 @@ Funding is deterministic bookkeeping in the apply loop (ADR 0014). Exactly:
   same apply. In v1 every group is a singleton (`GroupId` = the job's id),
   so the barrier is per-attempt; the evaluation is written over the group
   from day one so gang scheduling adds members, not mechanism.
-- Nodes that are drained (`schedulable = false`) keep funding their
+- Nodes that are drained (a `drain` record) keep funding their
   existing accruing allocations — drain blocks *new placements*, not the
   completion of committed holds. A *lost* node's allocations are all
   released with the attempts, so no pledge pass runs there.
@@ -334,7 +334,7 @@ re-checks the actor's authority against the replicated bindings and job
 ownership in its read-only validation phase — a pure lookup, rejecting
 `PermissionDenied` — so authorization races resolve in log order. The
 actor-carrying commands are `SubmitJob`, `AbortJob`, `UpdateJobMetadata`,
-`SetNodeSchedulable`, `EvictNodes`, `ConfigureQuotaEntity`, `UpdatePolicy`,
+`SetNodeDrain`, `EvictNodes`, `ConfigureQuotaEntity`, `UpdatePolicy`,
 `UpdateAuthorization`, and `BumpClusterVersion`; internal proposers
 (scheduler, ingestion, node lifecycle, housekeeping) carry no actor and their command types are not
 reachable through the API.
@@ -379,9 +379,9 @@ reachable through the API.
 | --- | --- |
 | Proposer | Scheduler engine via the leader — one batch per scheduling pass |
 | Payload | `expected_version: u64` (audit record of the snapshot version; see contract), `proposed_at_us` (the charge timestamp), `revocations: AllocationId[]`, `placements: Placement[]` where `Placement = { job: JobId, attempt: AttemptId, group: GroupId, allocations: AllocationSpec[] }`, `AllocationSpec = { id: AllocationId, node: NodeId, requested: Resources }`. The proto field is repeated; **v1 writers emit exactly one allocation per placement and set `group` = the job's id** (singleton groups); apply rejects other shapes until the gang-scheduling ADR. |
-| Validation (all-or-nothing, per-item diagnostics) | Revocations: allocation exists and is `Accruing` (funded allocations are stable — revoking one is always a rejection). Placements: job exists and is `Queued`; attempt and allocation ids are fresh; node exists and accepts placements (`schedulable` and not `draining` — ADR 0041); a `preemptible_only` node only for a job that is effectively preemptible, resolved as the effects phase records it (ADR 0044 §4); `requested` fits within the node's total advertised capacity; exactly one allocation, `group` = job id. Batch-level: after simulating the batch (revocation frees → pledge pass → new placements in order), the number of distinct jobs holding accruing allocations must not exceed the replicated accrual cap K, and no node the batch touches may be left accruing for more than one job (ADR 0027 — hardcoded at one, so a same-batch swap on an occupied node passes and a second accrual on it does not). |
+| Validation (all-or-nothing, per-item diagnostics) | Revocations: allocation exists and is `Accruing` (funded allocations are stable — revoking one is always a rejection). Placements: job exists and is `Queued`; attempt and allocation ids are fresh; node exists and is not draining (no `drain` record and no agent `draining` — ADR 0041, ADR 0044 §5); a `preemptible_only` node only for a job that is effectively preemptible, resolved as the effects phase records it (ADR 0044 §4); `requested` fits within the node's total advertised capacity; exactly one allocation, `group` = job id. Batch-level: after simulating the batch (revocation frees → pledge pass → new placements in order), the number of distinct jobs holding accruing allocations must not exceed the replicated accrual cap K, and no node the batch touches may be left accruing for more than one job (ADR 0027 — hardcoded at one, so a same-batch swap on an occupied node passes and a second accrual on it does not). |
 | Apply effects | In order: **(1) Revocations** — each attempt `Terminal(Revoked)`, allocations `Released`, true-up (full decayed refund; the attempt never ran), job → `Queued` free of retry budget (or `Aborted` if an abort is pending), freed capacity pledged onward in commit order. **(2) Placements**, in payload order: assign the allocation the next `seq`; insert attempt + allocation; run the pledge from the node's current free capacity — fully covered → allocation `Funded`, attempt starts `Ready` (accrual skipped, the common case); partially or not covered → allocation `Accruing` in the accrual queue, attempt starts `Accruing`. Job → `Attempting(attempt)`. **(3) Quota charge**: a job with no *enforced* `max_runtime` first has its multiplier inflated, `m' = ⌊multiplier × unbounded_runtime_multiplier / 2³²⌋` (else `m' = multiplier`); an attempt that is *effectively preemptible* — the job's `preemption.preemptible` and every entity on its quota chain switched on, resolved now and recorded on the attempt as `effective_preemptible` — then has the discount folded the same way, `m' = ⌊m' × preemptible_multiplier / 2³²⌋` (ADR 0044 §1); the job's cost `C = rate(requests, current weights) × ceil(max_runtime_s) × m'` is charged to every ancestor of its entity at `proposed_at_us`; a job with no `max_runtime` is charged **one interval**, `C = rate × unbounded_charge_interval_s × m'` (ADR 0046), and the record also captures `interval { seconds, paid = 1, last_tranche = C, prior_charged_at = proposed_at_us }` (renewed later by `RenewIntervalCharges`); the attempt records `(C, rate, m', proposed_at_us, refund_fraction_milli[, interval])` for true-up, where the recorded fraction is the replicated `refund_fraction_milli` for a bounded job or 1000 for an unbounded one (ADR 0029). |
-| Rejections | `InvalidBatch[(index, reason)]` wrapping `UnknownAllocation`, `AllocationNotAccruing`, `UnknownJob`, `JobNotQueued`, `DuplicateAttempt`, `DuplicateAllocation`, `UnknownNode`, `NodeNotSchedulable`, `NodeRequiresPreemptible`, `RequestExceedsNodeCapacity`, `UnsupportedPlacementShape`, `UnknownQuotaEntity`; batch-level `AccrualLimitExceeded`, `PerNodeAccrualExceeded` |
+| Rejections | `InvalidBatch[(index, reason)]` wrapping `UnknownAllocation`, `AllocationNotAccruing`, `UnknownJob`, `JobNotQueued`, `DuplicateAttempt`, `DuplicateAllocation`, `UnknownNode`, `NodeDraining`, `NodeRequiresPreemptible`, `RequestExceedsNodeCapacity`, `UnsupportedPlacementShape`, `UnknownQuotaEntity`; batch-level `AccrualLimitExceeded`, `PerNodeAccrualExceeded` |
 
 #### `DispatchAttempt`
 
@@ -454,7 +454,7 @@ reachable through the API.
 | Proposer | Leader, on agent (re)registration |
 | Payload | `node: Node` (id, `capacity: Resources`, labels), `registered_at_us`, `service_addr`, `host_facts`, `detected_capacity`, `draining: bool` (the agent's own shutdown announcement, from its `Register` report — ADR 0041), `preemptible_only: bool` (the agent's `[preemption] preemptible_only`, spot capacity — ADR 0044 §4), `interruption_deadline_us: optional int64` (the provider's interruption deadline as the agent's clock read it, display-only — ADR 0044 §5) |
 | Validation | None beyond shape — registration is always legal |
-| Apply effects | New node: insert with `epoch = 1`, `schedulable = true`, `draining` from the command. Existing node: **bump `node_epoch`** (invalidating all commands issued under earlier epochs, per ADR 0009), update capacity, labels, `preemptible_only`, `interruption_deadline` (rewritten with `draining`), `service_addr`, and the display-only `host_facts` / `detected_capacity` (overwritten wholesale — a re-imaged host must not leave half the previous machine's story behind); the admin cordon `schedulable` is **not** touched — it is desired state owned by the admin, and an agent restart must not undo it, while `draining` **is** rewritten from the report, so an agent that comes back voids its earlier "I am leaving" at the same log position that bumps the epoch. Live allocations are untouched (the ObservedSet reconciliation that follows registration settles them). If capacity grew, run a pledge pass. |
+| Apply effects | New node: insert with `epoch = 1`, `drain = None`, `draining` from the command. Existing node: **bump `node_epoch`** (invalidating all commands issued under earlier epochs, per ADR 0009), update capacity, labels, `preemptible_only`, `interruption_deadline` (rewritten with `draining`), `service_addr`, and the display-only `host_facts` / `detected_capacity` (overwritten wholesale — a re-imaged host must not leave half the previous machine's story behind); the operator's `drain` record is **not** touched — it is desired state owned by the admin, and an agent restart must not undo it, while `draining` **is** rewritten from the report, so an agent that comes back voids its earlier "I am leaving" at the same log position that bumps the epoch. Live allocations are untouched (the ObservedSet reconciliation that follows registration settles them). If capacity grew, run a pledge pass. |
 | Rejections | — (structurally infallible) |
 
 #### `DeclareNodeLost`
@@ -464,17 +464,17 @@ reachable through the API.
 | Proposer | Leader health monitor, when a node misses the replicated heartbeat deadline |
 | Payload | `node: NodeId`, `declared_at_us` |
 | Validation | Node exists |
-| Apply effects | Bump `node_epoch`; `schedulable = false`. Every non-`Released` allocation on the node, **in `seq` order**: attempt `Terminal(NodeLost)` via the full terminal path (release, true-up, job resolution — platform outcome, so retry policy applies). The node's accrual queue empties as a consequence; no pledge pass runs on a lost node. The node record remains (it may re-register). |
+| Apply effects | Bump `node_epoch`; set `drain = Some(Drain { requested_at: declared_at })` (an existing drain is kept). Every non-`Released` allocation on the node, **in `seq` order**: attempt `Terminal(NodeLost)` via the full terminal path (release, true-up, job resolution — platform outcome, so retry policy applies). The node's accrual queue empties as a consequence; no pledge pass runs on a lost node. The node record remains (it may re-register). |
 | Rejections | `UnknownNode` |
 
-#### `SetNodeSchedulable`
+#### `SetNodeDrain`
 
 | | |
 | --- | --- |
 | Proposer | Admin API (drain / undrain) |
-| Payload | `node: NodeId`, `schedulable: bool`, `actor: Actor`, `updated_at_us` |
-| Validation | Node exists; actor holds unscoped `operator` or `admin` (node operations are cluster verbs — ADR 0023) |
-| Apply effects | Set the flag. Drain blocks new placements only: running work continues, and existing accruing allocations keep funding (revoking them is the scheduler's call, via `CommitPlacements`). This is the **admin cordon**, one of the two flags behind `NodeRecord::accepts_placements()` (ADR 0041); the other is the agent's own `draining`, which no actor-carrying command writes. |
+| Payload | `node: NodeId`, `drain: Option<Drain>` (`Drain { requested_at }`), `actor: Actor`, `updated_at_us` |
+| Validation | Node exists; actor holds unscoped `operator` or `admin` (node operations are cluster verbs — `Verb::Drain`, ADR 0023). The HTTP handler stamps `requested_at` from the coordinator clock, the same source as `updated_at` |
+| Apply effects | `Some`: set `Node.drain`; on a node already draining this is a no-op that keeps the original `requested_at` (re-drain is idempotent). `None`: clear it (undrain). Drain blocks new placements only: running work continues, and existing accruing allocations keep funding (revoking them is the scheduler's call, via `CommitPlacements`). This is the **operator's drain record**, one of the two flags behind `NodeRecord::is_draining()` (ADR 0041, ADR 0044 §5); the other is the agent's own `draining`, which no actor-carrying command writes. No events. |
 | Rejections | `UnknownNode`, `PermissionDenied` |
 
 #### `SetNodeDraining`
@@ -484,7 +484,7 @@ reachable through the API.
 | Proposer | Leader ingestion, when an agent's `Heartbeat` report carries a `draining` or an `interruption_deadline_us` that differs from the replicated record (ADR 0041, ADR 0044 §5). A `Register` carries the same fact on `RegisterNode` instead, so this command never competes with a registration. Machine-proposed: no actor, like `DeclareNodeLost` |
 | Payload | `node: NodeId`, `draining: bool`, `interruption_deadline_us: optional int64` (agent wall-clock, display-only; absent clears it), `at_us` |
 | Validation | Node exists |
-| Apply effects | Set `NodeRecord.draining` and `NodeRecord.interruption_deadline` (shown on the node view; nothing plans against it). Gates placements through `accepts_placements()` and nothing else: running work continues and existing accruing allocations keep funding, exactly as under an admin cordon. `schedulable` is **not** touched — the cordon is the admin's flag and this one is the agent's. No events. |
+| Apply effects | Set `NodeRecord.draining` and `NodeRecord.interruption_deadline` (shown on the node view; nothing plans against it). Gates placements through `is_draining()` and nothing else: running work continues and existing accruing allocations keep funding, exactly as under an operator drain. `Node.drain` is **not** touched — the drain record is the admin's flag and this one is the agent's. No events. |
 | Rejections | `UnknownNode` |
 
 ### Housekeeping
@@ -505,9 +505,9 @@ reachable through the API.
 | --- | --- |
 | Proposer | Two, applying identically (ADR 0041). **Leader housekeeping retention GC**: every node that does not accept placements, holds no live allocation, and has been silent for at least `policy.node_retention` (24 h default) according to the leader-local liveness marks of ADR 0040 — proposed with no actor, and the clock is the proposer's, never apply's. **Admin API `node remove`** (`coppice node remove`): one node, with the request's actor. The GC proposes in capped batches like `EvictTerminalJobs` — at most 512 nodes a command, longest-silent first, at most 16 commands a pass — which also keeps one ineligible node from sinking the whole backlog. |
 | Payload | `nodes: NodeId[]`, `actor: Actor`, `evicted_at_us` |
-| Validation | Every listed node that exists must **not accept placements** (`schedulable = false` or the agent's `draining`) and must hold **no non-`Released` allocation**. Missing ids are skipped silently — duplicate proposals across leader changes must be idempotent. Either failure is a proposer bug and rejects the whole command, with per-item diagnostics. Actor (when present) holds unscoped `operator` or `admin` — removal is the same cluster verb as drain. Validation precedes the authorization check, as it does for `SetNodeSchedulable`. |
-| Apply effects | Remove each listed node record, and any accrual-queue entries keyed by it (an evictable node has none — the range is cleared so no key can outlive the record it describes). **No events**: nothing downstream watches a node record disappear, and an empty node has no work whose fate an event would describe. A removed node whose agent is still alive re-registers as a genuinely new record — `epoch = 1`, schedulable — which is the honest outcome of removing a node that was not gone; `revoke-identity` is how you stop that. |
-| Rejections | `InvalidBatch` wrapping `NodeAcceptsPlacements` / `NodeNotEmpty`; `PermissionDenied` |
+| Validation | Every listed node that exists must be **draining by either flag** (a `drain` record or the agent's `draining`) and must hold **no non-`Released` allocation**. Missing ids are skipped silently — duplicate proposals across leader changes must be idempotent. Either failure is a proposer bug and rejects the whole command, with per-item diagnostics. Actor (when present) holds unscoped `operator` or `admin` — removal is the same cluster verb as drain. Validation precedes the authorization check, as it does for `SetNodeDrain`. |
+| Apply effects | Remove each listed node record, and any accrual-queue entries keyed by it (an evictable node has none — the range is cleared so no key can outlive the record it describes). **No events**: nothing downstream watches a node record disappear, and an empty node has no work whose fate an event would describe. A removed node whose agent is still alive re-registers as a genuinely new record — `epoch = 1`, not draining — which is the honest outcome of removing a node that was not gone; `revoke-identity` is how you stop that. |
+| Rejections | `InvalidBatch` wrapping `NodeNotDraining` / `NodeNotEmpty`; `PermissionDenied` |
 
 #### `RenewIntervalCharges`
 
@@ -580,7 +580,7 @@ diverge scheduling if replicas disagreed (ADR 0020); cluster identity is a
 different concern with a different lifecycle, so the placement is deliberate.
 These are administrative identity facts with no event subscribers in v1 — the
 consuming flows read the replicated state directly — so, like
-`SetNodeSchedulable`, an accepted apply emits **no events**. The CA *private
+`SetNodeDrain`, an accepted apply emits **no events**. The CA *private
 key* never appears in any of these payloads or in replicated state (ADR 0037
 §4): only the *fact* of key possession is replicated.
 
@@ -710,7 +710,8 @@ key* never appears in any of these payloads or in replicated state (ADR 0037
 | `StaleAttemptState` | Monotonicity dedupe: the attempt already passed this transition |
 | `AttemptNotOnNode` | Reconciliation verdict references an attempt on a different node |
 | `AllocationNotAccruing` | Revocation of a funded/active/released allocation |
-| `NodeNotSchedulable` | Placement onto a drained node |
+| `NodeDraining` | Placement onto a node draining by its drain record or its agent's announcement |
+| `NodeNotDraining` | `EvictNodes` of a node that is not draining by either flag |
 | `NodeRequiresPreemptible` | Placement of a job that is not effectively preemptible onto a `preemptible_only` node (ADR 0044 §4) |
 | `StaleNodeEpoch` | ObservedSet predates a re-registration |
 | `RequestExceedsNodeCapacity` | Request can never fit the node's total capacity |

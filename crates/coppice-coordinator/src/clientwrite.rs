@@ -37,6 +37,7 @@ use coppice_api::{ApiError, RejectionKind};
 use coppice_consensus::{CoordinatorId, NodeHandle};
 use coppice_core::entity_ref::QuotaEntityRef;
 use coppice_core::id::{JobId, NodeId};
+use coppice_core::node::Drain;
 use coppice_net::admin::Client;
 use coppice_proto::convert::{
     env_from_pb, env_to_pb, metadata_from_pb, metadata_map_to_pb, metadata_to_pb, ConvertError,
@@ -501,24 +502,23 @@ impl LeaderWrites for AdminForwarder {
         })
     }
 
-    fn set_node_schedulable<'a>(
+    fn set_node_drain<'a>(
         &'a self,
         leader: CoordinatorId,
         node: NodeId,
-        schedulable: bool,
+        drain: Option<Drain>,
         actor: &'a Actor,
     ) -> BoxFuture<'a, Result<(), ApiError>> {
         Box::pin(async move {
             let deadline = forward_deadline();
             let (mut client, history_id) = self.dial(leader, deadline, FORWARD_TIMEOUT).await?;
-            let wire = pb::ForwardSetNodeSchedulableRequest {
+            let wire = pb::ForwardSetNodeDrainRequest {
                 history_id: history_id.to_vec(),
                 node: Some(node.into()),
-                schedulable,
+                drain: drain.as_ref().map(Into::into),
                 actor: Some(actor.into()),
             };
-            let response =
-                under_timeout(deadline, client.forward_set_node_schedulable(wire)).await?;
+            let response = under_timeout(deadline, client.forward_set_node_drain(wire)).await?;
             applied_index(response.outcome)?;
             Ok(())
         })
@@ -950,13 +950,13 @@ pub(crate) fn abort_actor_from_pb(
     actor_from_pb(actor, "ForwardAbortJobRequest.actor")
 }
 
-/// A forwarded cordon's actor. Like the abort's: the node and the flag are
+/// A forwarded drain's actor. Like the abort's: the node and the drain are
 /// read straight off the message by the handler, so only the actor needs a
 /// conversion boundary of its own.
-pub(crate) fn set_node_schedulable_actor_from_pb(
+pub(crate) fn set_node_drain_actor_from_pb(
     actor: Option<coppice_proto::pb::core::v1::Actor>,
 ) -> Result<Actor, ConvertError> {
-    actor_from_pb(actor, "ForwardSetNodeSchedulableRequest.actor")
+    actor_from_pb(actor, "ForwardSetNodeDrainRequest.actor")
 }
 
 /// A forwarded eviction's actor.
@@ -969,7 +969,7 @@ pub(crate) fn evict_nodes_actor_from_pb(
 /// A forwarded metadata write, back as the job it names, the domain
 /// [`JobMetadataUpdate`] it carries, and the actor that made the request.
 ///
-/// Unlike the abort/cordon/eviction actor-only helpers above, this one has a
+/// Unlike the abort/drain/eviction actor-only helpers above, this one has a
 /// body to rebuild: `job` and the `update` oneof, decoded with the same
 /// `coppice_proto::convert` helpers the command log itself uses — a
 /// forwarded write is refused by exactly the same rule a direct one would

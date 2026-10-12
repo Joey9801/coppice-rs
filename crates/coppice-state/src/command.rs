@@ -13,7 +13,7 @@
 //! # Actor-carrying commands
 //!
 //! Nine commands — [`SubmitJob`], [`AbortJob`], [`UpdateJobMetadata`],
-//! [`SetNodeSchedulable`], [`EvictNodes`], [`ConfigureQuotaEntity`],
+//! [`SetNodeDrain`], [`EvictNodes`], [`ConfigureQuotaEntity`],
 //! [`UpdatePolicy`], [`UpdateAuthorization`], and
 //! [`BumpClusterVersion`] — carry an
 //! `actor: Option<Actor>` (ADR 0023). They
@@ -39,7 +39,7 @@ use coppice_core::id::{
 };
 use coppice_core::job::Job;
 use coppice_core::metadata::JobMetadata;
-use coppice_core::node::HostFacts;
+use coppice_core::node::{Drain, HostFacts};
 use coppice_core::quota::{CostUnits, PriorityMultiplier};
 use coppice_core::resource::Resources;
 use coppice_core::time::{Duration, Timestamp};
@@ -67,7 +67,7 @@ pub enum Command {
     // Node lifecycle.
     RegisterNode(RegisterNode),
     DeclareNodeLost(DeclareNodeLost),
-    SetNodeSchedulable(SetNodeSchedulable),
+    SetNodeDrain(SetNodeDrain),
     SetNodeDraining(SetNodeDraining),
     // Housekeeping.
     EvictTerminalJobs(EvictTerminalJobs),
@@ -116,7 +116,7 @@ impl Command {
             Command::RecordAttemptNotified(c) => c.observed_at,
             Command::RegisterNode(c) => c.registered_at,
             Command::DeclareNodeLost(c) => c.declared_at,
-            Command::SetNodeSchedulable(c) => c.updated_at,
+            Command::SetNodeDrain(c) => c.updated_at,
             Command::SetNodeDraining(c) => c.at,
             Command::EvictTerminalJobs(c) => c.evicted_at,
             Command::EvictNodes(c) => c.evicted_at,
@@ -338,7 +338,7 @@ pub struct LostAttempt {
 /// Node (re)registration.
 ///
 /// Re-registration bumps the node epoch, fencing all commands issued under
-/// earlier epochs; the admin cordon survives (an agent restart must not undo
+/// earlier epochs; the operator's drain survives (an agent restart must not undo
 /// an admin's drain), while the agent's own `draining` announcement is
 /// rewritten from this report (ADR 0041).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -373,8 +373,8 @@ pub struct RegisterNode {
     pub interruption_deadline: Option<Timestamp>,
 }
 
-/// Node missed the replicated heartbeat deadline: epoch bump, unschedulable,
-/// and every live attempt on it terminates `NodeLost` (platform outcome —
+/// Node missed the replicated heartbeat deadline: epoch bump, a regular drain
+/// stamped `declared_at` (an existing drain is kept), and every live attempt on it terminates `NodeLost` (platform outcome —
 /// retry policy applies).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeclareNodeLost {
@@ -382,14 +382,17 @@ pub struct DeclareNodeLost {
     pub declared_at: Timestamp,
 }
 
-/// Admin drain / undrain.
+/// Admin drain / undrain (ADR 0044 §5).
 ///
-/// Drain blocks new placements only: running work and existing accrual
-/// funding continue.
+/// `Some` drains the node; on a node already draining it is a no-op that
+/// keeps the original drain, so a repeated drain never moves
+/// `requested_at`. `None` undrains. A drain gates admission only: running
+/// work and existing accrual funding continue, and only bounded backfill is
+/// admitted.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SetNodeSchedulable {
+pub struct SetNodeDrain {
     pub node: NodeId,
-    pub schedulable: bool,
+    pub drain: Option<Drain>,
     /// Who asked — see the module note on actor-carrying commands.
     pub actor: Option<Actor>,
     pub updated_at: Timestamp,
@@ -399,8 +402,8 @@ pub struct SetNodeSchedulable {
 ///
 /// Machine-proposed like [`DeclareNodeLost`]: the leader's ingestion turns a
 /// `Heartbeat` whose `draining` differs from the replicated record into one
-/// of these. Distinct from [`SetNodeSchedulable`], the admin cordon: this
-/// one never carries an actor and never writes `schedulable`.
+/// of these. Distinct from [`SetNodeDrain`], the operator's drain: this
+/// one never carries an actor and never writes `Node::drain`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SetNodeDraining {
     pub node: NodeId,

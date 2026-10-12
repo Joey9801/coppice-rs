@@ -419,7 +419,7 @@ async fn run_to_running_with(tweak: impl FnOnce(&mut Config)) -> RunningJob {
     })
     .await;
 
-    // Seed the quota entity, then submit a schedulable job.
+    // Seed the quota entity, then submit a placeable job.
     let entity = QuotaEntityId::new();
     seed_quota(&coord, entity).await;
     let job = JobId::new();
@@ -1020,9 +1020,9 @@ async fn node_lost_then_reappearing_container_is_stopped() {
         applied.outcome
     );
 
-    // The lost attempt is Terminal(NodeLost); the node is unschedulable with a
+    // The lost attempt is Terminal(NodeLost); the node is drained with a
     // bumped epoch; the job requeues per retry policy (returns to Queued, and
-    // stays there — its only node is unschedulable).
+    // stays there — its only node is drained).
     poll(DEADLINE, "attempt Terminal(NodeLost)", || {
         let views = views.clone();
         async move {
@@ -1032,15 +1032,16 @@ async fn node_lost_then_reappearing_container_is_stopped() {
     .await;
     assert!(node_epoch(&views, node).is_some_and(|e| e > epoch_before));
     assert!(
-        !views
+        views
             .latest()
             .state()
             .nodes
             .get(&node)
             .unwrap()
             .node
-            .schedulable,
-        "a lost node is unschedulable"
+            .drain
+            .is_some(),
+        "a lost node is drained"
     );
     poll(DEADLINE, "job requeued to Queued", || {
         let views = views.clone();

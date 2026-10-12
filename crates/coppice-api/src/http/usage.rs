@@ -697,9 +697,9 @@ mod tests {
         ) -> Result<crate::http::dto::UpdateJobMetadataResponse, ApiError> {
             unimplemented!("usage tests never write metadata")
         }
-        async fn set_node_schedulable(
+        async fn set_node_drain(
             &self,
-            _req: crate::http::dto::SetNodeSchedulableRequest,
+            _req: crate::http::dto::SetNodeDrainRequest,
             _actor: coppice_state::Actor,
         ) -> Result<(), ApiError> {
             unimplemented!("usage tests never drain a node")
@@ -780,7 +780,7 @@ mod tests {
                     id,
                     capacity: Resources::ZERO,
                     labels: Default::default(),
-                    schedulable: true,
+                    drain: None,
                     service_addr,
                     host_facts: None,
                     detected_capacity: None,

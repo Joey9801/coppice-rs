@@ -41,7 +41,7 @@ itself stays cheap even with a queue in the hundreds of thousands.
 For a candidate job, a node is eligible only if it passes every hard
 filter:
 
-- **Schedulable** — `node.schedulable == true`. Unschedulable nodes are
+- **Open** — the node is not draining (`NodeRecord::is_draining()`: no `drain` record and no agent `draining` announcement). Draining nodes are
   skipped entirely; their capacity isn't even loaded into the pass's node
   model.
 - **Labels** — `node_satisfies_labels(required, node.labels)`: every
@@ -210,13 +210,13 @@ Before the seating loop, the pass looks at every existing accruing job
 (distinct, in `seq` order) and re-plans it in two tiers:
 
 1. **Reseat-elsewhere (immediate fit).** If its full `requested` now fits
-   within some *other* schedulable, accrual-free node's free capacity
+   within some *other* open, accrual-free node's free capacity
    (label-checked), revoke the accrual and reseat the job there with
    `expect_funded = true` — "if the job's slot appears on a different node
    first it is seated there and the accrual is revoked"
    ([scheduling-model.md](scheduling-model.md#large-jobs-accrual-and-backfilling)).
 2. **Improvement move (ADR 0027).** Failing that, if some other
-   schedulable node would give the accrual a finite `projected_ready`
+   open node would give the accrual a finite `projected_ready`
    *meaningfully better* than its current bound — any finite bound when
    the current one is indefinite, or earlier by at least
    `replan_min_improvement_us` (scheduler config, default 300 s) between

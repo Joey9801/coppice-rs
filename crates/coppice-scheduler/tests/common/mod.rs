@@ -10,12 +10,13 @@ use std::collections::BTreeMap;
 use coppice_core::bytes::ByteSize;
 use coppice_core::id::{AllocationId, AttemptId, GroupId, JobId, NodeId, QuotaEntityId};
 use coppice_core::job::{Job, RetryPolicy};
+use coppice_core::node::Drain;
 use coppice_core::quota::{CostUnits, CostWeights, PriorityMultiplier};
 use coppice_core::resource::Resources;
 use coppice_core::time::{Duration, Timestamp};
 use coppice_state::command::{
     AbortJob, AllocationSpec, CommitPlacements, ConfigureQuotaEntity, DispatchAttempt, Placement,
-    RecordAttemptStarted, RegisterNode, SetNodeSchedulable, SubmitJob, UpdatePolicy,
+    RecordAttemptStarted, RegisterNode, SetNodeDrain, SubmitJob, UpdatePolicy,
 };
 use coppice_state::{Applied, Command, PolicyConfig, RejectionReason, StateMachine};
 use uuid::Uuid;
@@ -259,9 +260,9 @@ pub fn abort_cmd(job: JobId, at: Timestamp) -> Command {
 }
 
 pub fn drain_cmd(node: NodeId, at: Timestamp) -> Command {
-    Command::SetNodeSchedulable(SetNodeSchedulable {
+    Command::SetNodeDrain(SetNodeDrain {
         node,
-        schedulable: false,
+        drain: Some(Drain { requested_at: at }),
         updated_at: at,
         actor: None,
     })

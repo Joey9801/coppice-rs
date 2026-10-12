@@ -14,13 +14,14 @@ node only when **both** allow it:
 
 | Flag | Set by | Cleared by | Survives an agent restart? |
 | --- | --- | --- | --- |
-| cordon (`schedulable = false`) | `coppice node drain`, or the coordinator declaring the node lost | `coppice node undrain` | **Yes** — it is the operator's desired state |
-| `draining` | the agent itself, on SIGTERM | the agent registering again without it | **No** — an agent that came back has not gone away |
+| drain record (`drain`) | `coppice node drain`, or the coordinator declaring the node lost | `coppice node undrain` | **Yes** — it is the operator's desired state |
+| `agent_draining` | the agent itself, on SIGTERM or a provider interruption notice ([Cloud wiring](#cloud-wiring)) | the agent registering again without it | **No** — an agent that came back has not gone away |
 
 `coppice node list` and `coppice node show <id>` both fold the two flags
-into a single `scheduling` label: `drained` when the node is cordoned
-(whether or not the agent is also draining), `draining` when the agent
-alone is shutting down, and `schedulable` when neither flag is set.
+into a single `scheduling` label: `drained` when the node has a drain
+record (`drained, agent draining` if the agent is also draining),
+`agent draining` when the agent alone is shutting down, and `open` when
+neither flag is set.
 `coppice node show <id>` additionally reports the running and accruing
 counts.
 
@@ -31,15 +32,15 @@ the log position at which the flag lands.
 ## Draining a node by hand
 
 ```sh
-coppice node drain <node-id> --wait          # cordon, then wait up to 10 m
+coppice node drain <node-id> --wait          # drain, then wait up to 10 m
 coppice node drain <node-id> --wait 30m      # a longer deadline
-coppice node drain <node-id>                 # cordon and return at once
+coppice node drain <node-id>                 # drain and return at once
 coppice node undrain <node-id>               # take it back into service
 ```
 
 `--wait` polls the node once a second and prints a line whenever the
 running or accruing counts change. It exits 0 once both are zero and
-non-zero, with the outstanding counts, at the deadline; the cordon stays
+non-zero, with the outstanding counts, at the deadline; the drain stays
 in place either way. Draining an already drained node succeeds.
 
 The verbs are `POST /api/v1/nodes/{id}/drain`, `/undrain`, and `/remove`
@@ -84,18 +85,18 @@ registration carries it and the coordinator replicates it then.
 ## Decommissioning: removing the record
 
 Node records are kept after the agent goes away so that a node drained
-for maintenance comes back to its own record, cordon included. They are
+for maintenance comes back to its own record, drain included. They are
 removed two ways:
 
 - **Explicitly.** `coppice node remove <node-id>` deletes the record of a
-  node that is cordoned or draining *and* holds no live allocation; a
+  node that is draining by either flag *and* holds no live allocation; a
   node still taking work or still holding work is refused (409). Drain,
   let `--wait` finish, stop the agent, remove. Removing a node whose agent
   is still running is allowed but pointless: it registers again as a fresh
   record on its next connection. Use `coppice node revoke-identity` to stop
   that.
-- **By retention.** The leader's housekeeping evicts any node that no
-  longer accepts placements, holds no live allocation, and has been
+- **By retention.** The leader's housekeeping evicts any node that is
+  draining by either flag, holds no live allocation, and has been
   silent for `node_retention` — 24 h by default, set at formation:
 
   ```toml
@@ -108,10 +109,10 @@ removed two ways:
   churns instances. Silence is measured by the current leader from the
   last report it saw, so a leader change restarts the clock; eviction can
   be delayed by that, never hastened. A node drained for longer than the
-  window and then brought back registers as a new, schedulable record —
+  window and then brought back registers as a new, open record —
   extend the window or undrain on return.
 
-A node the coordinator declared lost is cordoned by that declaration and
+A node the coordinator declared lost is drained by that declaration and
 is collected by the same rule once its window elapses.
 
 ## Health probes

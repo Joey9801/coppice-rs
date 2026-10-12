@@ -74,6 +74,14 @@ impl NodeHealth {
     }
 }
 
+/// An operator's drain of one node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct NodeDrain {
+    /// When the drain was first requested; a repeated drain keeps it.
+    pub requested_at: Timestamp,
+}
+
 /// Summary of a compute node's current state, for the list view.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -91,15 +99,14 @@ pub struct NodeSummary {
     pub used: Option<Resources>,
     /// Operator-assigned labels.
     pub labels: BTreeMap<String, String>,
-    /// The admin cordon: `false` means an operator has cordoned the node, or
-    /// it has been declared lost. Survives agent restarts. A node takes new
-    /// placements only when `schedulable && !draining`.
-    pub schedulable: bool,
+    /// The operator's drain, set by `node drain` or by a loss declaration;
+    /// `None` while the node is open. Survives agent restarts. A draining
+    /// node admits only bounded backfill.
+    pub drain: Option<NodeDrain>,
     /// The agent's own announcement that it is shutting down, cleared on
-    /// re-registration. Distinct from the admin cordon: an operator did not
-    /// necessarily ask for this. A node takes new placements only when
-    /// `schedulable && !draining`.
-    pub draining: bool,
+    /// re-registration. Distinct from the operator's `drain`: an operator
+    /// did not necessarily ask for this. An announced node admits nothing.
+    pub agent_draining: bool,
     /// The node takes only effectively preemptible work (ADR 0044 §4) —
     /// spot capacity, from the agent's `[preemption] preemptible_only`.
     pub preemptible_only: bool,
@@ -260,8 +267,8 @@ mod tests {
                 disk_bytes: 0,
             }),
             labels: BTreeMap::from([("zone".to_string(), "a".to_string())]),
-            schedulable: true,
-            draining: false,
+            drain: None,
+            agent_draining: false,
             preemptible_only: true,
             interruption_deadline: None,
             health: NodeHealth::Unreported,
@@ -280,8 +287,8 @@ mod tests {
                 "allocated": { "cpu_millis": 1000, "memory_bytes": 1_000_000, "disk_bytes": 0 },
                 "used": { "cpu_millis": 2500, "memory_bytes": 3_000_000_000u64, "disk_bytes": 0 },
                 "labels": { "zone": "a" },
-                "schedulable": true,
-                "draining": false,
+                "drain": null,
+                "agent_draining": false,
                 "preemptible_only": true,
                 "interruption_deadline": null,
                 "health": "unknown",

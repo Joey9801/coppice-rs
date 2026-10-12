@@ -1,15 +1,16 @@
 //! Compute node model.
 //!
 //! A node is described by the resources it advertises and the labels used to
-//! satisfy hard placement constraints. Schedulability reflects drain and
-//! maintenance state. See `docs/protocols/agent-coordinator.md`.
+//! satisfy hard placement constraints. An operator's drain is recorded on the
+//! node (ADR 0044 §5). See `docs/protocols/agent-coordinator.md`.
 
 use std::collections::BTreeMap;
 
 use crate::id::NodeId;
 use crate::resource::Resources;
+use crate::time::Timestamp;
 
-/// Authoritative record of a node's membership and schedulability.
+/// Authoritative record of a node's membership and drain state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Node {
     pub id: NodeId,
@@ -18,8 +19,14 @@ pub struct Node {
     /// Labels used for hard/soft placement constraints. `BTreeMap` keeps
     /// iteration order deterministic for the replicated state machine.
     pub labels: BTreeMap<String, String>,
-    /// Whether the scheduler may place new work here.
-    pub schedulable: bool,
+    /// The operator's drain (ADR 0044 §5), or `None` when the node is open.
+    ///
+    /// Desired state owned by the admin: an agent restart never clears it
+    /// (ADR 0009). A draining node admits only bounded backfill that is
+    /// guaranteed gone by the node's horizon; it is distinct from the
+    /// agent's own shutdown announcement, which lives on the state machine's
+    /// node record.
+    pub drain: Option<Drain>,
     /// Advertised `host:port` of the agent's `NodeService` listener
     /// (ADR 0034); readers dial this to fetch job logs. `None` when the agent
     /// hosts no service, so its logs are unreachable off-node.
@@ -38,6 +45,17 @@ pub struct Node {
     /// capacity, and rewritten by every registration. Both the scheduler's
     /// candidate filter and apply's placement validation enforce it.
     pub preemptible_only: bool,
+}
+
+/// An operator's drain of one node (ADR 0044 §5): a *regular* drain, which
+/// lets existing work finish naturally and admits only bounded backfill.
+///
+/// Set by `SetNodeDrain` (and by a loss declaration); cleared by undrain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Drain {
+    /// When the drain was first requested. A repeated drain keeps the
+    /// original stamp.
+    pub requested_at: Timestamp,
 }
 
 /// Static description of the machine an agent runs on, collected once at agent

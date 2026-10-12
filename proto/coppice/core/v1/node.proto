@@ -17,16 +17,16 @@ message Label {
   string value = 2;
 }
 
-// Authoritative record of a node's membership and schedulability.
+// Authoritative record of a node's membership and drain state.
 message Node {
   NodeId id = 1;
   // Total advertised capacity.
   Resources capacity = 2;
   // Canonical form: ascending key, unique keys.
   repeated Label labels = 3;
-  // Whether the scheduler may place new work here. Desired state owned by
-  // the admin — an agent restart must not undo a drain (ADR 0009).
-  bool schedulable = 4;
+  // Was the ADR 0041 cordon flag; replaced by `drain` (ADR 0044 §5).
+  reserved 4;
+  reserved "schedulable";
   // Advertised `host:port` of the agent's `NodeService` listener (ADR 0034):
   // authoritative addressing lives in replicated membership, and readers dial
   // this to fetch job logs. Absent or empty means the agent hosts no service.
@@ -43,6 +43,18 @@ message Node {
   // capacity), from the agent's `[preemption] preemptible_only`. Rewritten by
   // every registration, like capacity and labels.
   bool preemptible_only = 8;
+  // The operator's drain (ADR 0044 §5); absent while the node is open.
+  // Desired state owned by the admin — an agent restart must not undo a drain
+  // (ADR 0009). A draining node admits only bounded backfill.
+  Drain drain = 9;
+}
+
+// An operator's regular drain of one node (ADR 0044 §5): existing work
+// finishes naturally, and only bounded backfill guaranteed gone by the node's
+// horizon is admitted.
+message Drain {
+  // When the drain was first requested; a repeated drain keeps this stamp.
+  int64 requested_at_us = 1;
 }
 
 // Static description of the machine an agent runs on, collected once at

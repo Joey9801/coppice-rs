@@ -319,14 +319,14 @@ fn stale_proposal_is_rejected_then_a_fresh_one_applies() {
     assert!(
         reasons
             .iter()
-            .any(|r| matches!(r, RejectionReason::NodeNotSchedulable(n) if *n == target)),
-        "expected NodeNotSchedulable for the drained node, got {reasons:?}"
+            .any(|r| matches!(r, RejectionReason::NodeDraining(n) if *n == target)),
+        "expected NodeDraining for the drained node, got {reasons:?}"
     );
 
     // Re-scheduling against the new snapshot yields a proposal that applies (the
     // only node is drained, so it is empty — which applies cleanly).
     let fresh = schedule(&sm, ts(TS_US + 3));
-    assert!(fresh.is_empty(), "no schedulable node remains");
+    assert!(fresh.is_empty(), "no open node remains");
     let mut fresh_mint = minter();
     apply_proposal(&mut sm, &fresh, &mut fresh_mint).expect("a fresh proposal applies");
 }

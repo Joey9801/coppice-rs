@@ -350,16 +350,15 @@ pub struct NodeSummary {
     /// whose last sample aged out. Never a zero standing in for absence.
     pub used: Option<Resources>,
     pub labels: BTreeMap<String, String>,
-    /// The admin cordon (`SetNodeSchedulable` / `DeclareNodeLost`): false
-    /// means an operator has cordoned the node, or it has been declared
-    /// lost. Survives agent restarts. A node takes new placements only
-    /// when `schedulable && !draining`.
-    pub schedulable: bool,
-    /// The agent's own announcement that it is shutting down (advisory
-    /// `Drain`/heartbeat), cleared on re-registration. Distinct from the
-    /// admin cordon: an operator did not necessarily ask for this. A node
-    /// takes new placements only when `schedulable && !draining`.
-    pub draining: bool,
+    /// The operator's drain (`SetNodeDrain` / `DeclareNodeLost`, ADR 0044
+    /// §5): `null` while the node is open. Survives agent restarts. A
+    /// draining node admits only bounded backfill.
+    pub drain: Option<NodeDrain>,
+    /// The agent's own announcement that it is shutting down (its
+    /// heartbeat), cleared on re-registration. Distinct from the operator's
+    /// `drain`: an operator did not necessarily ask for this. An announced
+    /// node admits nothing.
+    pub agent_draining: bool,
     /// The node takes only effectively preemptible work (ADR 0044 §4) —
     /// spot capacity, from the agent's `[preemption] preemptible_only`.
     pub preemptible_only: bool,
@@ -380,6 +379,13 @@ pub struct NodeSummary {
     pub running_count: u32,
     /// Allocations currently `Accruing` on this node.
     pub accruing_count: u32,
+}
+
+/// An operator's drain of one node (ADR 0044 §5), as the node views show it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeDrain {
+    /// When the drain was first requested; a repeated drain keeps it.
+    pub requested_at: Timestamp,
 }
 
 /// `GET /api/v1/nodes` — an envelope, never a bare array, so fields can
@@ -583,9 +589,9 @@ pub struct QueueStats {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeCounts {
     pub total: u32,
-    /// Accepts placements: neither cordoned nor agent-draining, and not
-    /// lost.
-    pub schedulable: u32,
+    /// Open to any placement: neither drained by an operator nor announced
+    /// draining by its agent, and not lost.
+    pub open: u32,
     /// Nodes reported [`NodeHealth::Lost`]. Leader-local like the health it
     /// counts: a follower — with no heartbeat marks to judge by — reports 0,
     /// never a fabricated count.
@@ -1935,7 +1941,7 @@ pub struct UpdateJobMetadataResponse {
 }
 
 /// `POST /api/v1/nodes/{node}/drain` and `POST /api/v1/nodes/{node}/undrain`
-/// (ADR 0041) — the admin cordon, as the `SetNodeSchedulable` command spells
+/// (ADR 0044 §5) — the operator's drain, as the `SetNodeDrain` command spells
 /// it.
 ///
 /// **Not a request body.** Both routes take no body; this is the argument
@@ -1943,11 +1949,12 @@ pub struct UpdateJobMetadataResponse {
 /// share, serde-derived only so a test can build and compare one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct SetNodeSchedulableRequest {
+pub struct SetNodeDrainRequest {
     pub node: NodeId,
-    /// `false` cordons the node — new placements stop, running work
-    /// continues; `true` lifts the cordon.
-    pub schedulable: bool,
+    /// `true` drains the node — only bounded backfill is admitted, running
+    /// work continues; `false` undrains it. The control plane stamps the
+    /// drain's `requested_at`; a node already draining keeps its own.
+    pub drain: bool,
 }
 
 /// The answer to a drain or an undrain: empty, like an abort's.
@@ -2914,8 +2921,8 @@ mod tests {
                 disk_bytes: 0,
             }),
             labels: BTreeMap::from([("zone".to_string(), "a".to_string())]),
-            schedulable: true,
-            draining: false,
+            drain: None,
+            agent_draining: false,
             health: NodeHealth::Unknown,
             epoch: 3,
             last_heartbeat: None,
@@ -2934,8 +2941,8 @@ mod tests {
                 "allocated": { "cpu_millis": 1000, "memory_bytes": 1_000_000, "disk_bytes": 0 },
                 "used": { "cpu_millis": 2500, "memory_bytes": 3_000_000_000u64, "disk_bytes": 0 },
                 "labels": { "zone": "a" },
-                "schedulable": true,
-                "draining": false,
+                "drain": null,
+                "agent_draining": false,
                 "preemptible_only": false,
                 "interruption_deadline": null,
                 "health": "unknown",
@@ -2986,7 +2993,7 @@ mod tests {
             capacity: ClusterCapacity {
                 nodes: NodeCounts {
                     total: 1,
-                    schedulable: 1,
+                    open: 1,
                     lost: 0,
                 },
                 capacity: Resources {
@@ -3058,7 +3065,7 @@ mod tests {
                     }],
                 },
                 "capacity": {
-                    "nodes": { "total": 1, "schedulable": 1, "lost": 0 },
+                    "nodes": { "total": 1, "open": 1, "lost": 0 },
                     "capacity": { "cpu_millis": 4000, "memory_bytes": 0, "disk_bytes": 0 },
                     "allocated": { "cpu_millis": 0, "memory_bytes": 0, "disk_bytes": 0 },
                     // Absence, not zero: no node is reporting usage (ADR 0039),

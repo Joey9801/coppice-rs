@@ -12,7 +12,7 @@ use coppice_core::id::{
 };
 use coppice_core::job::{Job, JobState, RetryPolicy};
 use coppice_core::metadata::JobMetadata;
-use coppice_core::node::HostFacts;
+use coppice_core::node::{Drain, HostFacts};
 use coppice_core::preemption::{NoticeSignal, PreemptionSpec};
 use coppice_core::quota::{CostUnits, PriorityMultiplier};
 use coppice_core::resource::Resources;
@@ -265,9 +265,15 @@ fn every_command() -> Vec<Command> {
             node,
             declared_at: ts(),
         }),
-        Command::SetNodeSchedulable(SetNodeSchedulable {
+        Command::SetNodeDrain(SetNodeDrain {
             node,
-            schedulable: false,
+            drain: Some(Drain { requested_at: ts() }),
+            updated_at: ts(),
+            actor: Some(open_posture_actor()),
+        }),
+        Command::SetNodeDrain(SetNodeDrain {
+            node,
+            drain: None,
             updated_at: ts(),
             actor: Some(open_posture_actor()),
         }),

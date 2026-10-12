@@ -597,7 +597,7 @@ mod tests {
                     id: node,
                     capacity: Resources::ZERO,
                     labels: Map::new(),
-                    schedulable: true,
+                    drain: None,
                     service_addr: None,
                     host_facts: None,
                     detected_capacity: None,

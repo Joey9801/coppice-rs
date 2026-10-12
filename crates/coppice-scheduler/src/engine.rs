@@ -158,9 +158,10 @@ struct SimAccrual {
 /// packing loops read capacity and labels without a map lookup.
 struct NodeModel<'a> {
     node: &'a Node,
-    /// Whether this node may take new work: the record's
-    /// `NodeRecord::accepts_placements` gate (ADR 0041), captured once per
-    /// pass so every candidate filter asks the same question apply will.
+    /// Whether this node may take new work: not draining by the record or
+    /// the announcement (`NodeRecord::is_draining`, ADR 0044 §5), captured
+    /// once per pass so every candidate filter asks the same question apply
+    /// will.
     accepts_placements: bool,
     /// Free capacity mirroring `free_capacity`, decremented as the batch seats
     /// work and incremented (then re-pledged) as it revokes accruals.
@@ -250,7 +251,7 @@ impl<'a> Pass<'a> {
             let hosts_accrual = accrual_nodes.contains(id);
             // Nodes that refuse placements matter only as accrual sources to
             // re-plan off of; a drained node with no accruals is dead weight.
-            if !rec.accepts_placements() && !hosts_accrual {
+            if rec.is_draining() && !hosts_accrual {
                 continue;
             }
             let mut accruals: Vec<SimAccrual> = Vec::new();
@@ -282,7 +283,7 @@ impl<'a> Pass<'a> {
             node_index.insert(*id, idx);
             nodes.push(NodeModel {
                 node: &rec.node,
-                accepts_placements: rec.accepts_placements(),
+                accepts_placements: !rec.is_draining(),
                 sim_free: base_free.get(id).copied().unwrap_or(Resources::ZERO),
                 accruals,
                 events: evs,
@@ -1289,7 +1290,7 @@ mod tests {
                     id,
                     capacity,
                     labels: BTreeMap::new(),
-                    schedulable: true,
+                    drain: None,
                     service_addr: None,
                     host_facts: None,
                     detected_capacity: None,

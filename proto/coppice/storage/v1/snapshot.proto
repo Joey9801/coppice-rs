@@ -174,9 +174,9 @@ message NodeRecord {
   // Bumped on (re)registration and on loss declaration (ADR 0009).
   uint64 epoch = 2;
   // The agent's own shutdown announcement (ADR 0041), distinct from the
-  // admin cordon `node.schedulable`: set from the agent's reports and
-  // cleared by a re-registration that does not carry it. Placements are
-  // gated on both.
+  // operator's `node.drain`: set from the agent's reports and cleared by a
+  // re-registration that does not carry it. An announced node admits
+  // nothing; a drained one admits only bounded backfill (ADR 0044 §5).
   bool draining = 3;
   // The provider's interruption deadline the agent last reported (ADR 0044
   // §5), agent wall-clock µs; display-only. Set and cleared with `draining`.

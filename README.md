@@ -201,7 +201,7 @@ scripts/aws-demo/down.sh demo --yes          # destroys everything and verifies 
 ```
 
 The smoke test checks that unauthenticated requests get a 401, that there are
-exactly three voters and three schedulable nodes, that Prometheus sees every
+exactly three voters and three open nodes, that Prometheus sees every
 target, and that a real job runs to `succeeded` with its timeline, logs, and
 usage intact. The cluster costs roughly $0.18 an hour while it is up.
 

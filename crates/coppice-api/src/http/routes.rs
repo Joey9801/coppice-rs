@@ -762,7 +762,7 @@ async fn update_job_metadata<P: ControlPlane>(
     }))
 }
 
-/// `POST /api/v1/nodes/{node}/drain` (ADR 0041) — the admin cordon on.
+/// `POST /api/v1/nodes/{node}/drain` (ADR 0041) — the operator's drain on.
 ///
 /// No body either way; the resulting state is read back from
 /// `GET /api/v1/nodes/{node}`, which is also where `--wait` watches the
@@ -775,17 +775,17 @@ async fn drain_node<P: ControlPlane>(
     RequestActor(actor): RequestActor,
     IdPath(node): IdPath<NodeId>,
 ) -> Result<impl IntoResponse, HttpError> {
-    set_node_schedulable(&*plane, actor, node, false).await
+    set_node_drain(&*plane, actor, node, true).await
 }
 
-/// `POST /api/v1/nodes/{node}/undrain` — the admin cordon off, and the exact
+/// `POST /api/v1/nodes/{node}/undrain` — the operator's drain off, and the exact
 /// twin of [`drain_node`] down to the command it proposes.
 async fn undrain_node<P: ControlPlane>(
     State(plane): State<Arc<P>>,
     RequestActor(actor): RequestActor,
     IdPath(node): IdPath<NodeId>,
 ) -> Result<impl IntoResponse, HttpError> {
-    set_node_schedulable(&*plane, actor, node, true).await
+    set_node_drain(&*plane, actor, node, false).await
 }
 
 /// The half [`drain_node`] and [`undrain_node`] share: pre-check the cluster
@@ -794,15 +794,15 @@ async fn undrain_node<P: ControlPlane>(
 /// One function rather than two so the two directions cannot drift into
 /// different authorization or different error mapping — the direction is a
 /// bool, and it is the only thing that differs.
-async fn set_node_schedulable<P: ControlPlane>(
+async fn set_node_drain<P: ControlPlane>(
     plane: &P,
     actor: coppice_state::Actor,
     node: NodeId,
-    schedulable: bool,
+    drain: bool,
 ) -> Result<impl IntoResponse, HttpError> {
     precheck(plane, &actor, Intent::Drain).await?;
     plane
-        .set_node_schedulable(dto::SetNodeSchedulableRequest { node, schedulable }, actor)
+        .set_node_drain(dto::SetNodeDrainRequest { node, drain }, actor)
         .await
         .map_err(node_write_error)?;
     Ok(Json(dto::DrainNodeResponse {}))
@@ -810,7 +810,7 @@ async fn set_node_schedulable<P: ControlPlane>(
 
 /// `POST /api/v1/nodes/{node}/remove` (ADR 0041) — evict one node's record.
 ///
-/// Apply refuses a node that still accepts placements or holds a live
+/// Apply refuses a node that is not draining or holds a live
 /// allocation (409 — retry after drain), and skips one already gone (200,
 /// idempotent). Does not require the node to be silent: an agent still
 /// alive re-registers on its next registration; `revoke-identity` is what
@@ -1498,18 +1498,21 @@ mod tests {
         /// The one pair of writes this plane really applies (see `state`).
         /// `fail_with` still wins, so the error-mapping tests keep working the
         /// way they do for every other write.
-        async fn set_node_schedulable(
+        async fn set_node_drain(
             &self,
-            req: dto::SetNodeSchedulableRequest,
+            req: dto::SetNodeDrainRequest,
             actor: coppice_state::Actor,
         ) -> Result<(), ApiError> {
             self.record(actor.clone());
-            self.apply(coppice_state::Command::SetNodeSchedulable(
-                coppice_state::command::SetNodeSchedulable {
+            let now = Timestamp::now();
+            self.apply(coppice_state::Command::SetNodeDrain(
+                coppice_state::command::SetNodeDrain {
                     node: req.node,
-                    schedulable: req.schedulable,
+                    drain: req
+                        .drain
+                        .then_some(coppice_core::node::Drain { requested_at: now }),
                     actor: Some(actor),
-                    updated_at: Timestamp::now(),
+                    updated_at: now,
                 },
             ))
         }
@@ -1724,7 +1727,7 @@ mod tests {
                     disk: coppice_core::bytes::ByteSize::ZERO,
                 },
                 labels: Default::default(),
-                schedulable: true,
+                drain: None,
                 service_addr: None,
                 host_facts: None,
                 detected_capacity: None,
@@ -2549,12 +2552,14 @@ mod tests {
     // round trip through the same apply the coordinator proposes into: the
     // write lands, and the very next read is what an operator would see.
 
-    /// A state machine holding one node, schedulable or cordoned, with no
-    /// work on it — the shape both node writes are about.
-    fn state_with_node(id: NodeId, schedulable: bool) -> coppice_state::StateMachine {
+    /// A state machine holding one node, open or drained, with no work on
+    /// it — the shape both node writes are about.
+    fn state_with_node(id: NodeId, drained: bool) -> coppice_state::StateMachine {
         let mut state = coppice_state::StateMachine::default();
         let mut record = utilization_node(id);
-        record.node.schedulable = schedulable;
+        record.node.drain = drained.then_some(coppice_core::node::Drain {
+            requested_at: Timestamp::UNIX_EPOCH,
+        });
         state.nodes.insert(id, record);
         state
     }
@@ -2580,11 +2585,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drain_cordons_the_node_and_undrain_lifts_it() {
+    async fn drain_records_a_drain_and_undrain_clears_it() {
         let node = NodeId::new();
-        let app = app_with_state(None, state_with_node(node, true));
+        let app = app_with_state(None, state_with_node(node, false));
 
-        for (verb, expected) in [("drain", false), ("undrain", true)] {
+        for (verb, drained) in [("drain", true), ("undrain", false)] {
             let response = app
                 .clone()
                 .oneshot(post_empty(&format!("/api/v1/nodes/{node}/{verb}")))
@@ -2597,7 +2602,11 @@ mod tests {
 
             let (status, body) = get_node_via(&app, node).await;
             assert_eq!(status, StatusCode::OK, "{verb}");
-            assert_eq!(body["summary"]["schedulable"], expected, "after {verb}");
+            assert_eq!(
+                body["summary"]["drain"].is_object(),
+                drained,
+                "after {verb}: {body}"
+            );
         }
     }
 
@@ -2606,7 +2615,7 @@ mod tests {
     #[tokio::test]
     async fn draining_an_already_drained_node_succeeds() {
         let node = NodeId::new();
-        let app = app_with_state(None, state_with_node(node, false));
+        let app = app_with_state(None, state_with_node(node, true));
         let response = app
             .clone()
             .oneshot(post_empty(&format!("/api/v1/nodes/{node}/drain")))
@@ -2614,13 +2623,17 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let (_, body) = get_node_via(&app, node).await;
-        assert_eq!(body["summary"]["schedulable"], false);
+        // The original drain stands: a repeat never moves its stamp.
+        assert_eq!(
+            body["summary"]["drain"]["requested_at"], "1970-01-01T00:00:00.000000Z",
+            "{body}"
+        );
     }
 
     #[tokio::test]
     async fn removing_a_drained_empty_node_takes_it_out_of_the_read_model() {
         let node = NodeId::new();
-        let app = app_with_state(None, state_with_node(node, false));
+        let app = app_with_state(None, state_with_node(node, true));
         let response = app
             .clone()
             .oneshot(post_empty(&format!("/api/v1/nodes/{node}/remove")))
@@ -2646,9 +2659,9 @@ mod tests {
     /// operator has something to do about it (drain it first) and then the
     /// identical request lands.
     #[tokio::test]
-    async fn removing_a_schedulable_node_is_refused_with_a_conflict() {
+    async fn removing_an_open_node_is_refused_with_a_conflict() {
         let node = NodeId::new();
-        let app = app_with_state(None, state_with_node(node, true));
+        let app = app_with_state(None, state_with_node(node, false));
         let response = app
             .clone()
             .oneshot(post_empty(&format!("/api/v1/nodes/{node}/remove")))
@@ -2662,7 +2675,7 @@ mod tests {
         // one node is owed the sentence about that node.
         let message = body["message"].as_str().unwrap();
         assert!(
-            message.contains("still accepts placements") && message.contains(&node.to_string()),
+            message.contains("is not draining") && message.contains(&node.to_string()),
             "{message}"
         );
 
@@ -5491,9 +5504,11 @@ mod tests {
             ]
         });
         // The fixture is a quota tree; the writes need a node to name. It is
-        // cordoned already so `remove` has something it can legitimately do.
+        // drained already so `remove` has something it can legitimately do.
         let mut record = utilization_node(node);
-        record.node.schedulable = false;
+        record.node.drain = Some(coppice_core::node::Drain {
+            requested_at: Timestamp::UNIX_EPOCH,
+        });
         state.nodes.insert(node, record);
 
         for verb in ["drain", "undrain", "remove"] {

@@ -17,6 +17,7 @@ import "coppice/command/v1/command.proto";
 import "coppice/core/v1/authz.proto";
 import "coppice/core/v1/ids.proto";
 import "coppice/core/v1/job.proto";
+import "coppice/core/v1/node.proto";
 import "coppice/core/v1/pki.proto";
 import "coppice/core/v1/resource.proto";
 import "coppice/raft/v1/raft.proto";
@@ -277,16 +278,17 @@ service RaftAdminService {
   // than reusing the shared outcome alone.
   rpc ForwardUpdateAuthorization(ForwardUpdateAuthorizationRequest)
       returns (ForwardUpdateAuthorizationResponse);
-  // The ADR 0041 node writes, forwarded the same way: the admin cordon
+  // The ADR 0041 node writes, forwarded the same way: the operator's drain
   // (`POST /api/v1/nodes/{node}/drain` and `.../undrain`, one command with
-  // the flag assigned either way) and node removal (`.../remove`).
+  // the record assigned either way, ADR 0044 §5) and node removal
+  // (`.../remove`).
   //
-  // Named for the commands they propose, not the routes: SetNodeSchedulable
+  // Named for the commands they propose, not the routes: SetNodeDrain
   // serves two routes, and EvictNodes is the same command the leader's
   // retention GC proposes — that one never crosses this hop, since the GC
   // only ever runs on the leader.
-  rpc ForwardSetNodeSchedulable(ForwardSetNodeSchedulableRequest)
-      returns (ForwardSetNodeSchedulableResponse);
+  rpc ForwardSetNodeDrain(ForwardSetNodeDrainRequest)
+      returns (ForwardSetNodeDrainResponse);
   rpc ForwardEvictNodes(ForwardEvictNodesRequest) returns (ForwardEvictNodesResponse);
   // `PUT /api/v1/jobs/{job}/metadata` (full replacement) and `POST
   // .../metadata` (patch), ADR 0042. One RPC for both, since the leader-side
@@ -669,23 +671,39 @@ message ForwardUpdateAuthorizationResponse {
   reserved 2; // was policy_log_index, back when the rename was a 2nd command.
 }
 
-// A follower's forwarding of `POST /api/v1/nodes/{node}/drain` or
-// `.../undrain` (ADR 0041). Neither route has a request body — the path
-// names the node and the route names the direction — so what crosses is the
-// command's two fields.
+// Retired with the ADR 0041 cordon (ADR 0044 §5): replaced by
+// ForwardSetNodeDrainRequest. Kept empty only because the breaking gate never
+// lets a message name disappear.
 message ForwardSetNodeSchedulableRequest {
+  reserved 1, 8, 9, 10;
+  reserved "history_id", "node", "schedulable", "actor";
+}
+
+// Retired with ForwardSetNodeSchedulableRequest.
+message ForwardSetNodeSchedulableResponse {
+  reserved 1;
+  reserved "outcome";
+}
+
+// A follower's forwarding of `POST /api/v1/nodes/{node}/drain` or
+// `.../undrain` (ADR 0044 §5). Neither route has a request body — the path
+// names the node and the route names the direction — so what crosses is the
+// command's fields.
+message ForwardSetNodeDrainRequest {
   bytes history_id = 1; // 16-byte stamped history id (ADR 0016, ADR 0037 §3).
   coppice.core.v1.NodeId node = 8;
-  // Assigned, never toggled: `false` is drain, `true` is undrain, and
-  // proposing the value the record already holds is a successful no-op. That
-  // is what makes a retried forward safe after a lost answer.
-  bool schedulable = 9;
+  // Assigned, never toggled: present is drain, absent is undrain. Draining a
+  // node already draining keeps its original drain and undraining an open
+  // node changes nothing; both are successful no-ops. That is what makes a
+  // retried forward safe after a lost answer. The follower stamps
+  // `requested_at_us` from its clock, as it would `updated_at_us`.
+  coppice.core.v1.Drain drain = 9;
   // As ForwardSubmitJobRequest.actor. Verb::Drain is a cluster verb, so the
   // actor is the entire authorization input.
   coppice.core.v1.Actor actor = 10;
 }
 
-message ForwardSetNodeSchedulableResponse {
+message ForwardSetNodeDrainResponse {
   ForwardWriteOutcome outcome = 1;
 }
 

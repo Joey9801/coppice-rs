@@ -11,7 +11,7 @@ use coppice_core::bytes::ByteSize;
 use coppice_core::env::JobEnv;
 use coppice_core::job::{AbortRequest, Job, JobState, RetryPolicy};
 use coppice_core::metadata::JobMetadata;
-use coppice_core::node::{HostFacts, Node};
+use coppice_core::node::{Drain, HostFacts, Node};
 use coppice_core::preemption::{NoticeSignal, PreemptionSpec};
 use coppice_core::quota::{
     ChargeInterval, ChargeRecord, CostUnits, CostWeights, DecayPolicy, PriorityMultiplier,
@@ -712,7 +712,7 @@ impl From<&Node> for pb::Node {
             id: Some(node.id.into()),
             capacity: Some((&node.capacity).into()),
             labels: labels_to_pb(&node.labels),
-            schedulable: node.schedulable,
+            drain: node.drain.as_ref().map(Into::into),
             service_addr: node.service_addr.clone(),
             host_facts: node.host_facts.as_ref().map(Into::into),
             detected_capacity: node.detected_capacity.as_ref().map(Into::into),
@@ -729,7 +729,7 @@ impl TryFrom<pb::Node> for Node {
             id: req(node.id, "Node.id")?.try_into()?,
             capacity: req(node.capacity, "Node.capacity")?.try_into()?,
             labels: labels_from_pb(node.labels)?,
-            schedulable: node.schedulable,
+            drain: node.drain.map(Drain::try_from).transpose()?,
             // Empty string is a second spelling of "no service"; canonicalize
             // it to None so absent and present-but-empty read identically.
             service_addr: node.service_addr.filter(|s| !s.is_empty()),
@@ -739,6 +739,26 @@ impl TryFrom<pb::Node> for Node {
                 .map(Resources::try_from)
                 .transpose()?,
             preemptible_only: node.preemptible_only,
+        })
+    }
+}
+
+// ---- Drain ----
+
+impl From<&Drain> for pb::Drain {
+    fn from(drain: &Drain) -> Self {
+        pb::Drain {
+            requested_at_us: drain.requested_at.as_micros(),
+        }
+    }
+}
+
+impl TryFrom<pb::Drain> for Drain {
+    type Error = ConvertError;
+
+    fn try_from(drain: pb::Drain) -> Result<Self, ConvertError> {
+        Ok(Drain {
+            requested_at: timestamp(drain.requested_at_us, "Drain.requested_at_us")?,
         })
     }
 }

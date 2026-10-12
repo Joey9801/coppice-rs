@@ -148,7 +148,7 @@ fn rejection_code(kind: RejectionKind) -> ErrorCode {
 /// The ADR 0041 node-write routes' error mapping: the global one, plus
 /// `UnknownNode` reads as a 404 (unknown id, same answer as
 /// `GET /api/v1/nodes/{node}`) instead of the default 409. The other two
-/// node rejections ("still accepts placements", "still holds a live
+/// node rejections ("is not draining", "still holds a live
 /// allocation") are retryable races and keep the default 409.
 pub fn node_write_error(e: ApiError) -> HttpError {
     // The rendered reason, not the `ApiError`'s own Display: a 404 body

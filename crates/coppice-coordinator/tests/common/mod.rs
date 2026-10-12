@@ -1866,9 +1866,9 @@ impl coppice_api::ControlPlane for NoopPlane {
         Err(unattached())
     }
 
-    async fn set_node_schedulable(
+    async fn set_node_drain(
         &self,
-        _req: coppice_api::http::dto::SetNodeSchedulableRequest,
+        _req: coppice_api::http::dto::SetNodeDrainRequest,
         _actor: coppice_state::Actor,
     ) -> Result<(), coppice_api::ApiError> {
         Err(unattached())

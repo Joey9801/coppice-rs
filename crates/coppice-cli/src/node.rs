@@ -82,7 +82,8 @@ pub enum NodeVerb {
         #[arg(long)]
         json: bool,
     },
-    /// Stop scheduling new work onto a node; running work continues.
+    /// Drain a node: running work continues, and only bounded backfill
+    /// guaranteed gone by the node's horizon is admitted.
     Drain {
         /// Node id (`node-<uuid>`).
         node: NodeId,
@@ -101,7 +102,7 @@ pub enum NodeVerb {
         #[arg(long)]
         json: bool,
     },
-    /// Make a drained node schedulable again.
+    /// Clear a node's drain, reopening it to any work.
     Undrain {
         /// Node id (`node-<uuid>`).
         node: NodeId,
@@ -262,7 +263,7 @@ async fn show(client: &Client, node: NodeId, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// `coppice node drain`: stop scheduling new work onto a node.
+/// `coppice node drain`: drain a node (ADR 0044 §5).
 ///
 /// With `--wait`, polls `GET /nodes/{node}` once a second until nothing is
 /// running or accruing on it, or the wait duration elapses.
@@ -283,7 +284,7 @@ async fn drain(client: &Client, node: NodeId, wait: Option<Duration>, json: bool
     Ok(())
 }
 
-/// `coppice node undrain`: make a drained node schedulable again.
+/// `coppice node undrain`: clear a node's drain.
 async fn undrain(client: &Client, node: NodeId, json: bool) -> Result<()> {
     let path = paths::node_undrain(node);
     post_node_action(
@@ -292,7 +293,7 @@ async fn undrain(client: &Client, node: NodeId, json: bool) -> Result<()> {
         "requesting undrain",
         json,
         || client.undrain_node(node),
-        || format!("node {node} schedulable"),
+        || format!("node {node} undrained"),
     )
     .await
 }
@@ -425,15 +426,16 @@ fn health_label(health: &NodeHealth) -> String {
     health.to_string()
 }
 
-/// The list table's scheduling cell: [`schedulable_label`], marked when the
-/// node takes only effectively preemptible work (ADR 0044 §4).
+/// The list table's scheduling cell: [`drain_label`], marked when the node
+/// takes only effectively preemptible work (ADR 0044 §4) and when its host
+/// has reported an interruption (ADR 0044 §5).
 fn scheduling_cell(
-    schedulable: bool,
-    draining: bool,
+    drained: bool,
+    agent_draining: bool,
     preemptible_only: bool,
     interrupted: bool,
 ) -> String {
-    let mut cell = schedulable_label(schedulable, draining).to_string();
+    let mut cell = drain_label(drained, agent_draining).to_string();
     if preemptible_only {
         cell.push_str(", preemptible only");
     }
@@ -443,20 +445,16 @@ fn scheduling_cell(
     cell
 }
 
-/// The scheduling posture, derived from the two independent flags on
-/// [`NodeSummary`]: the admin cordon (`schedulable`) and the agent's
-/// own shutdown announcement (`draining`).
-///
-/// - cordoned (`!schedulable`), regardless of `draining`, reads `"drained"`;
-/// - not cordoned but agent-draining reads `"draining"`;
-/// - neither flag set reads `"schedulable"`.
-fn schedulable_label(schedulable: bool, draining: bool) -> &'static str {
-    if !schedulable {
-        "drained"
-    } else if draining {
-        "draining"
-    } else {
-        "schedulable"
+/// The scheduling posture, naming both independent flags on
+/// [`NodeSummary`]: the operator's drain (`drain`) and the agent's own
+/// shutdown announcement (`agent_draining`). Neither hides the other — an
+/// operator reading the list must be able to tell who is emptying the node.
+fn drain_label(drained: bool, agent_draining: bool) -> &'static str {
+    match (drained, agent_draining) {
+        (false, false) => "open",
+        (true, false) => "drained",
+        (false, true) => "agent draining",
+        (true, true) => "drained, agent draining",
     }
 }
 
@@ -497,8 +495,8 @@ fn render_list(response: &ListNodesResponse) -> String {
                 node.id.to_string(),
                 health_label(&node.health),
                 scheduling_cell(
-                    node.schedulable,
-                    node.draining,
+                    node.drain.is_some(),
+                    node.agent_draining,
                     node.preemptible_only,
                     node.interruption_deadline.is_some(),
                 ),
@@ -544,7 +542,7 @@ fn render_detail(response: &GetNodeResponse) -> String {
     kv(
         &mut out,
         "scheduling",
-        schedulable_label(summary.schedulable, summary.draining),
+        drain_label(summary.drain.is_some(), summary.agent_draining),
     );
     kv(
         &mut out,
@@ -696,8 +694,8 @@ mod tests {
                 disk_bytes: 0,
             }),
             labels,
-            schedulable: true,
-            draining: false,
+            drain: None,
+            agent_draining: false,
             health: dto::NodeHealth::Unknown,
             epoch: 3,
             last_heartbeat: None,
@@ -742,7 +740,7 @@ mod tests {
         assert!(rendered.contains(&node_id().to_string()), "{rendered}");
         // Health is `unknown` today and must not be dressed up as healthy.
         assert!(rendered.contains("unknown"), "{rendered}");
-        assert!(rendered.contains("schedulable"), "{rendered}");
+        assert!(rendered.contains("open"), "{rendered}");
         assert!(rendered.contains("4000m"), "{rendered}");
         assert!(!rendered.contains("preemptible only"), "{rendered}");
         assert!(!rendered.contains("interruption"), "{rendered}");
@@ -751,22 +749,16 @@ mod tests {
         let mut spot = sample_summary();
         spot.preemptible_only = true;
         let rendered = render_list(&to_client(dto::ListNodesResponse { nodes: vec![spot] }));
-        assert!(
-            rendered.contains("schedulable, preemptible only"),
-            "{rendered}"
-        );
+        assert!(rendered.contains("open, preemptible only"), "{rendered}");
     }
 
     #[test]
-    fn schedulable_label_reads_the_cordon_before_the_agent_drain() {
-        // Neither flag set: schedulable.
-        assert_eq!(schedulable_label(true, false), "schedulable");
-        // Agent draining on its own, not cordoned: draining.
-        assert_eq!(schedulable_label(true, true), "draining");
-        // Cordoned, agent not (yet) draining: drained.
-        assert_eq!(schedulable_label(false, false), "drained");
-        // Cordoned and agent draining: still drained — the cordon wins.
-        assert_eq!(schedulable_label(false, true), "drained");
+    fn drain_label_names_both_flags() {
+        assert_eq!(drain_label(false, false), "open");
+        assert_eq!(drain_label(true, false), "drained");
+        assert_eq!(drain_label(false, true), "agent draining");
+        // Neither flag hides the other.
+        assert_eq!(drain_label(true, true), "drained, agent draining");
     }
 
     #[test]

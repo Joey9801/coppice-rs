@@ -24,7 +24,7 @@ use coppice_state::command::{
     Placement, RebindMachineAddress, ReconcileNode, RecordAttemptExited, RecordAttemptNotified,
     RecordAttemptOutcome, RecordAttemptStarted, RecordCaCertificate, RecordEnrolledIdentity,
     RecordKeyTransferIntent, RecordStagedKeyTransferIntent, RegisterNode, RenewIntervalCharges,
-    RetireMachineBinding, RevokeEnrollToken, RevokeIdentity, SetNodeDraining, SetNodeSchedulable,
+    RetireMachineBinding, RevokeEnrollToken, RevokeIdentity, SetNodeDrain, SetNodeDraining,
     SubmitJob, UpdateAuthorization, UpdateJobMetadata, UpdatePolicy,
 };
 use coppice_state::{
@@ -59,7 +59,7 @@ pub fn command_to_pb(command: &Command, cluster_version: u32) -> pb::Command {
         Command::RecordAttemptNotified(c) => Body::RecordAttemptNotified(c.into()),
         Command::RegisterNode(c) => Body::RegisterNode(c.into()),
         Command::DeclareNodeLost(c) => Body::DeclareNodeLost(c.into()),
-        Command::SetNodeSchedulable(c) => Body::SetNodeSchedulable(c.into()),
+        Command::SetNodeDrain(c) => Body::SetNodeDrain(c.into()),
         Command::SetNodeDraining(c) => Body::SetNodeDraining(c.into()),
         Command::EvictTerminalJobs(c) => Body::EvictTerminalJobs(c.into()),
         Command::EvictNodes(c) => Body::EvictNodes(c.into()),
@@ -107,7 +107,7 @@ pub fn command_from_pb(command: pb::Command) -> Result<(u32, Command), ConvertEr
         Body::RecordAttemptNotified(c) => Command::RecordAttemptNotified(c.try_into()?),
         Body::RegisterNode(c) => Command::RegisterNode(c.try_into()?),
         Body::DeclareNodeLost(c) => Command::DeclareNodeLost(c.try_into()?),
-        Body::SetNodeSchedulable(c) => Command::SetNodeSchedulable(c.try_into()?),
+        Body::SetNodeDrain(c) => Command::SetNodeDrain(c.try_into()?),
         Body::SetNodeDraining(c) => Command::SetNodeDraining(c.try_into()?),
         Body::EvictTerminalJobs(c) => Command::EvictTerminalJobs(c.try_into()?),
         Body::EvictNodes(c) => Command::EvictNodes(c.try_into()?),
@@ -563,26 +563,26 @@ impl TryFrom<pb::DeclareNodeLost> for DeclareNodeLost {
     }
 }
 
-impl From<&SetNodeSchedulable> for pb::SetNodeSchedulable {
-    fn from(c: &SetNodeSchedulable) -> Self {
-        pb::SetNodeSchedulable {
+impl From<&SetNodeDrain> for pb::SetNodeDrain {
+    fn from(c: &SetNodeDrain) -> Self {
+        pb::SetNodeDrain {
             node: Some(c.node.into()),
-            schedulable: c.schedulable,
+            drain: c.drain.as_ref().map(Into::into),
             actor: c.actor.as_ref().map(Into::into),
             updated_at_us: c.updated_at.as_micros(),
         }
     }
 }
 
-impl TryFrom<pb::SetNodeSchedulable> for SetNodeSchedulable {
+impl TryFrom<pb::SetNodeDrain> for SetNodeDrain {
     type Error = ConvertError;
 
-    fn try_from(c: pb::SetNodeSchedulable) -> Result<Self, ConvertError> {
-        Ok(SetNodeSchedulable {
-            node: req(c.node, "SetNodeSchedulable.node")?.try_into()?,
-            schedulable: c.schedulable,
+    fn try_from(c: pb::SetNodeDrain) -> Result<Self, ConvertError> {
+        Ok(SetNodeDrain {
+            node: req(c.node, "SetNodeDrain.node")?.try_into()?,
+            drain: c.drain.map(TryInto::try_into).transpose()?,
             actor: c.actor.map(Into::into),
-            updated_at: timestamp(c.updated_at_us, "SetNodeSchedulable.updated_at_us")?,
+            updated_at: timestamp(c.updated_at_us, "SetNodeDrain.updated_at_us")?,
         })
     }
 }

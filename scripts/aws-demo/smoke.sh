@@ -234,7 +234,7 @@ check_coordinators() {
   [ "$voters" = "3" ] || fail "expected exactly 3 voters, found ${voters:-0}"
 }
 
-# --- check: three schedulable agents -----------------------------------------
+# --- check: three open agents -----------------------------------------
 
 # Every coordinator answers the same health verdict now: a replica that does
 # not lead fetches the leader's liveness marks over the internal admin channel
@@ -258,12 +258,12 @@ check_nodes() {
   local total ready
   nodes_body="$(api /api/v1/nodes)"
   total="$(jq -r '[.nodes[]?] | length' <<<"$nodes_body" 2>/dev/null || echo 0)"
-  ready="$(jq -r '[.nodes[]? | select(.schedulable and .health != "lost")] | length' \
+  ready="$(jq -r '[.nodes[]? | select(.drain == null and (.agent_draining | not) and .health != "lost")] | length' \
     <<<"$nodes_body" 2>/dev/null || echo 0)"
-  evidence "GET /api/v1/nodes: $total nodes, $ready schedulable and not lost"
-  jq -r '.nodes[]? | "  \(.id) health=\(.health) schedulable=\(.schedulable) cpu=\(.capacity.cpu_millis)m mem=\(.capacity.memory_bytes) role=\(.labels.role // "-")"' \
+  evidence "GET /api/v1/nodes: $total nodes, $ready open and not lost"
+  jq -r '.nodes[]? | "  \(.id) health=\(.health) drain=\(.drain.requested_at // "none") agent_draining=\(.agent_draining) cpu=\(.capacity.cpu_millis)m mem=\(.capacity.memory_bytes) role=\(.labels.role // "-")"' \
     <<<"$nodes_body" 2>/dev/null | while IFS= read -r line; do evidence "$line"; done
-  [ "$ready" = "3" ] || fail "expected exactly 3 schedulable nodes, found ${ready:-0}" || return 1
+  [ "$ready" = "3" ] || fail "expected exactly 3 open nodes, found ${ready:-0}" || return 1
 
   retry_until 120 10 nodes_all_healthy ||
     fail "expected all 3 nodes to report health=healthy from any coordinator (ADR 0040), found $(nodes_healthy_count "$nodes_body")" ||
@@ -461,7 +461,7 @@ check_job() {
 
 run_check authn "OIDC guards the client API: tokenless 401, Cognito token 200" check_authn
 run_check coordinators "three coordinators are raft voters" check_coordinators
-run_check nodes "three agents are schedulable" check_nodes
+run_check nodes "three agents are open" check_nodes
 run_check prometheus "Prometheus on the ops host scrapes all six processes" check_prometheus
 if [ "$skip_job" = true ]; then
   say "skipping the job check (--skip-job)"

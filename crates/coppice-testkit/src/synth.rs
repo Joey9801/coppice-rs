@@ -26,7 +26,7 @@ use coppice_core::attempt::{Attempt, AttemptOutcome, AttemptState, OutcomeClass}
 use coppice_core::bytes::ByteSize;
 use coppice_core::id::{AllocationId, AttemptId, GroupId, JobId, NodeId, QuotaEntityId};
 use coppice_core::job::{AbortRequest, Job, JobState, RetryPolicy};
-use coppice_core::node::Node;
+use coppice_core::node::{Drain, Node};
 use coppice_core::preemption::PreemptionSpec;
 use coppice_core::quota::{
     self, ChargeInterval, ChargeRecord, CostUnits, DecayPolicy, PriorityMultiplier, Settlement,
@@ -863,7 +863,7 @@ fn build_quota_tree(rng: &mut Rng, total: usize, base_time: Timestamp) -> QuotaT
 }
 
 /// Build `count` nodes with plausible capacity, a few labels each, and ~5%
-/// unschedulable (drained/maintenance).
+/// drained (maintenance).
 fn build_nodes(rng: &mut Rng, count: usize) -> BTreeMap<NodeId, NodeRecord> {
     const ZONES: [&str; 4] = ["us-east-1a", "us-east-1b", "us-west-2a", "eu-west-1a"];
     const POOLS: [&str; 4] = ["default", "spot", "gpu", "batch"];
@@ -884,7 +884,7 @@ fn build_nodes(rng: &mut Rng, count: usize) -> BTreeMap<NodeId, NodeRecord> {
             "instance-type".to_string(),
             (*rng.pick(&INSTANCE_TYPES)).to_string(),
         );
-        let schedulable = rng.chance(95, 100);
+        let drained = !rng.chance(95, 100);
         let epoch = rng.range(1, 6);
         pairs.push((
             id,
@@ -893,7 +893,9 @@ fn build_nodes(rng: &mut Rng, count: usize) -> BTreeMap<NodeId, NodeRecord> {
                     id,
                     capacity,
                     labels,
-                    schedulable,
+                    drain: drained.then_some(Drain {
+                        requested_at: Timestamp::UNIX_EPOCH,
+                    }),
                     service_addr: None,
                     host_facts: None,
                     detected_capacity: None,
