@@ -170,8 +170,9 @@ pub const USAGE_WINDOW_MAX_BUCKETS: usize = 120;
 pub const USAGE_SAMPLE_MAX_AGE: Duration = Duration::from_secs(90);
 
 /// Housekeeping tick cadence (ADR 0012 / ADR 0017): how often a leader sweeps
-/// for terminal jobs past the replicated retention TTL and for nodes past the
-/// liveness deadline.
+/// for terminal jobs past the replicated retention TTL, for nodes past the
+/// liveness deadline, and for running unbounded attempts due an interval
+/// renewal (ADR 0046) — so it is also the bound on renewal lag.
 ///
 /// The default rather than the value, since `[pacing] housekeeping_interval`
 /// can shorten it ([`crate::config::PacingConfig`]) — liveness only, so a
@@ -201,6 +202,24 @@ pub const MAX_EVICTIONS_PER_COMMAND: usize = 512;
 /// the tick itself ([`HOUSEKEEPING_INTERVAL`]): it only ever delays an
 /// eviction, never makes one due.
 pub const MAX_EVICTION_BATCHES_PER_PASS: usize = 16;
+
+/// Most renewals one `RenewIntervalCharges` command may carry (ADR 0046).
+///
+/// The same 512 as [`MAX_EVICTIONS_PER_COMMAND`], for the same reasons: it
+/// bounds the raft entry and the serial apply that charges every listed
+/// attempt's ancestor chain.
+pub const MAX_RENEWALS_PER_COMMAND: usize = 512;
+
+/// Capped renewal commands one housekeeping pass proposes before leaving the
+/// rest to the next tick (ADR 0046).
+///
+/// 16 × [`MAX_RENEWALS_PER_COMMAND`] = 8192 renewals per 60 s tick. A running
+/// unbounded attempt comes due once per interval (30 min by default), so a
+/// steady state of up to ~245 k concurrently running unbounded attempts never
+/// falls behind. Pure liveness: an attempt left for the next tick is renewed
+/// late, and catch-up charges every interval it missed in one step — a
+/// backlog delays a charge, never loses one.
+pub const MAX_RENEWAL_BATCHES_PER_PASS: usize = 16;
 
 /// Agent-liveness deadline before the leader proposes `DeclareNodeLost`
 /// (ADR 0009 health monitor).

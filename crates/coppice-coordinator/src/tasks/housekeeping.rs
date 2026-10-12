@@ -1,6 +1,6 @@
 //! Housekeeping (leader-only; a 60 s tick in every deployment).
 //!
-//! Each tick runs three passes over the latest applied view, in order:
+//! Each tick runs four passes over the latest applied view, in order:
 //!
 //! 1. **Liveness** — nodes past [`AGENT_LIVENESS_DEADLINE`] are declared lost
 //!    (ADR 0009's health monitor).
@@ -8,19 +8,28 @@
 //!    hold no live allocation, and have been silent for
 //!    `policy.node_retention` are evicted (ADR 0041).
 //! 3. **Terminal-job retention** — the pass described below.
+//! 4. **Interval renewal** — running attempts of jobs with no declared
+//!    `max_runtime` whose runtime has reached the end of the intervals they
+//!    have paid for are charged the next one up front, with a
+//!    `RenewIntervalCharges` proposal (ADR 0046). The tick is therefore the
+//!    bound on renewal lag; a job that ends inside the lag is billed the
+//!    excess by its true-up's surcharge.
 //!
-//! All three measure their own clock proposer-side and propose; apply stays
+//! All four measure their own clock proposer-side and propose; apply stays
 //! deterministic and idempotent under a leader change.
 //!
 //! Both eviction passes propose in **capped batches**: at most
 //! [`MAX_EVICTIONS_PER_COMMAND`] ids per command and at most
 //! [`MAX_EVICTION_BATCHES_PER_PASS`] commands per tick, oldest first, with
-//! whatever is left over waiting for the next sweep (issue #155).
+//! whatever is left over waiting for the next sweep (issue #155). The renewal
+//! pass does the same with [`MAX_RENEWALS_PER_COMMAND`] and
+//! [`MAX_RENEWAL_BATCHES_PER_PASS`], most overdue first.
 //!
-//! Scans the view for terminal jobs past retention and removes them from
-//! replicated state with an `EvictTerminalJobs` proposal. What gates that
-//! proposal is the configured `[history]` mode (ADR 0012), which the daemon
-//! threads in as a [`HistorySink`]:
+//! The terminal-job retention pass scans the view for terminal jobs past
+//! retention and removes them from replicated state with an
+//! `EvictTerminalJobs` proposal. What gates that proposal is the configured
+//! `[history]` mode (ADR 0012), which the daemon threads in as a
+//! [`HistorySink`]:
 //!
 //! - a **durable store** (`clickhouse`, still future work) is written first —
 //!   an external network call, therefore outside apply, with retries — and the
@@ -49,15 +58,20 @@ use tokio::time::interval;
 
 use coppice_consensus::{Applied, Consensus, ConsensusStatus, StateView, StateViews};
 use coppice_core::allocation::AllocationState;
-use coppice_core::id::{JobId, NodeId};
+use coppice_core::attempt::AttemptState;
+use coppice_core::id::{AttemptId, JobId, NodeId};
 use coppice_core::job::JobState;
+use coppice_core::quota;
 use coppice_core::time::Timestamp;
-use coppice_state::command::{DeclareNodeLost, EvictNodes, EvictTerminalJobs};
+use coppice_state::command::{
+    DeclareNodeLost, EvictNodes, EvictTerminalJobs, IntervalRenewal, RenewIntervalCharges,
+};
 use coppice_state::Command;
 
 use crate::leadership;
 use crate::limits::{
     AGENT_LIVENESS_DEADLINE, MAX_EVICTIONS_PER_COMMAND, MAX_EVICTION_BATCHES_PER_PASS,
+    MAX_RENEWALS_PER_COMMAND, MAX_RENEWAL_BATCHES_PER_PASS,
 };
 use crate::liveness::NodeLiveness;
 
@@ -146,6 +160,7 @@ pub async fn run<C>(
                     declare_lost_nodes(&consensus, &views, &liveness).await;
                     evict_silent_nodes(&consensus, &views, &liveness).await;
                     run_pass(&consensus, &views, history).await;
+                    renew_interval_charges(&consensus, &views).await;
                 }
             }
         }
@@ -547,6 +562,129 @@ fn due_for_eviction(view: &StateView, now: Timestamp, limit: usize) -> Vec<Termi
     oldest_first(due, limit, |r| (r.terminal_at, r.job))
 }
 
+/// Charge every running unbounded attempt that has reached the end of the
+/// intervals it paid for (ADR 0046).
+async fn renew_interval_charges<C: Consensus>(consensus: &Arc<C>, views: &StateViews) {
+    let view = views.latest();
+    // Proposer-side wall clock, as for every housekeeping pass: apply measures
+    // each attempt's runtime against the stamp this proposal carries.
+    let now = Timestamp::now();
+    let budget = MAX_RENEWALS_PER_COMMAND * MAX_RENEWAL_BATCHES_PER_PASS;
+    let due = due_renewals(&view, now, budget);
+    if due.is_empty() {
+        return;
+    }
+    if due.len() == budget {
+        tracing::debug!(
+            budget,
+            "housekeeping: the renewal backlog filled this pass's budget, \
+             the remainder waits for the next tick"
+        );
+    }
+    propose_renewals(consensus, &due, now, MAX_RENEWALS_PER_COMMAND).await;
+}
+
+/// Propose `due` as `RenewIntervalCharges` commands of at most `per_command`
+/// renewals each, one at a time, stopping at the first rejection or error —
+/// the same shape as [`propose_evictions`], for the same reasons. Every batch
+/// carries the one clock reading `due` was computed against, so apply finds
+/// exactly the intervals the scan found due.
+async fn propose_renewals<C: Consensus>(
+    consensus: &Arc<C>,
+    due: &[IntervalRenewal],
+    now: Timestamp,
+    per_command: usize,
+) {
+    let mut proposed = 0usize;
+    for batch in due.chunks(per_command.max(1)) {
+        let command = Command::RenewIntervalCharges(RenewIntervalCharges {
+            renewals: batch.to_vec(),
+            proposed_at: now,
+        });
+        match consensus.propose(command).await {
+            // No events to count: apply skips an item that raced (the attempt
+            // ended, or a duplicate across a leader change already renewed
+            // it), so this is an upper bound on what was charged.
+            Ok(Applied { outcome: Ok(_), .. }) => proposed += batch.len(),
+            // Apply rejects only an item naming an attempt that is not
+            // interval-charged — a proposer bug, not a race.
+            Ok(Applied {
+                outcome: Err(reason),
+                ..
+            }) => {
+                tracing::warn!(?reason, "housekeeping: RenewIntervalCharges rejected");
+                break;
+            }
+            Err(e) if e.is_retryable() => {
+                tracing::info!(error = %e, "housekeeping: retryable RenewIntervalCharges error");
+                break;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "housekeeping: fatal RenewIntervalCharges error");
+                break;
+            }
+        }
+    }
+    if proposed > 0 {
+        tracing::debug!(
+            count = proposed,
+            "housekeeping: renewed interval charges of running unbounded attempts"
+        );
+    }
+}
+
+/// The running interval-charged attempts due a renewal at `now` (ADR 0046):
+/// those for which [`quota::intervals_due`] over `now − started_at` exceeds
+/// the intervals already paid — exactly the test apply makes against the
+/// proposal's stamp, so a renewal proposed here is never skipped as not due.
+///
+/// Scans only the jobs in `Attempting`, through the attempt each one points
+/// at: a job's live attempt is always its current one (ADR 0030), so this is
+/// the live set without a walk over every attempt ever recorded. At most
+/// `limit` renewals come back, most overdue first — the earliest end of paid
+/// time, ties broken by [`AttemptId`] so two leaders propose the same batch.
+fn due_renewals(view: &StateView, now: Timestamp, limit: usize) -> Vec<IntervalRenewal> {
+    let state = view.state();
+    let due: Vec<(Timestamp, AttemptId, IntervalRenewal)> = state
+        .jobs
+        .values()
+        .filter_map(|job| match job.state {
+            JobState::Attempting(attempt) => Some(attempt),
+            _ => None,
+        })
+        .filter_map(|attempt| {
+            let record = state.attempts.get(&attempt)?;
+            if record.attempt.state != AttemptState::Running {
+                return None;
+            }
+            let started_at = record.started_at?;
+            let interval = record.charge.interval?;
+            if quota::intervals_due(now - started_at, interval.seconds) <= interval.paid {
+                return None;
+            }
+            let paid_s = u64::from(interval.paid).saturating_mul(interval.seconds);
+            let paid_until = started_at
+                + coppice_core::time::Duration::from_secs(
+                    i64::try_from(paid_s).unwrap_or(i64::MAX),
+                );
+            Some((
+                paid_until,
+                attempt,
+                IntervalRenewal {
+                    attempt,
+                    paid: interval.paid,
+                },
+            ))
+        })
+        .collect();
+    oldest_first(due, limit, |(paid_until, attempt, _)| {
+        (*paid_until, *attempt)
+    })
+    .into_iter()
+    .map(|(_, _, renewal)| renewal)
+    .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -563,7 +701,8 @@ mod tests {
 
     use crate::limits::HOUSEKEEPING_INTERVAL;
     use crate::test_support::{
-        allocation_record, job_record, node_record, view_of, FakeConsensus, ProposeOutcome,
+        allocation_record, attempt_record, job_record, node_record, view_of, FakeConsensus,
+        ProposeOutcome,
     };
 
     #[test]
@@ -1094,5 +1233,190 @@ mod tests {
             "one sweep, and a backlog under the cap is one proposal"
         );
         assert_eq!(evictions[0].jobs, vec![evictable]);
+    }
+
+    /// A job in `Attempting` whose current attempt is in `state`, started at
+    /// `started_at`, with interval charging `interval` (`None`: bounded).
+    fn attempting_job(
+        sm: &mut StateMachine,
+        state: AttemptState,
+        started_at: Option<Timestamp>,
+        interval: Option<quota::ChargeInterval>,
+    ) -> AttemptId {
+        let job = JobId::new();
+        let attempt = AttemptId::new();
+        let mut record = job_record(job, "img", Resources::ZERO, None);
+        record.state = JobState::Attempting(attempt);
+        record.attempts.push(attempt);
+        sm.jobs.insert(job, record);
+        let mut a = attempt_record(
+            attempt,
+            job,
+            AllocationId::new(),
+            NodeId::new(),
+            state,
+            started_at,
+        );
+        a.charge.interval = interval;
+        sm.attempts.insert(attempt, a);
+        attempt
+    }
+
+    fn every(seconds: u64, paid: u32) -> Option<quota::ChargeInterval> {
+        // The scan reads only the length and paid count; the true-up
+        // bookkeeping is filler.
+        Some(quota::ChargeInterval {
+            seconds,
+            paid,
+            last_tranche: quota::CostUnits::ZERO,
+            prior_charged_at: Timestamp::UNIX_EPOCH,
+        })
+    }
+
+    /// ADR 0046: only a running, interval-charged attempt whose runtime has
+    /// reached the end of its paid intervals is due, and the renewal names
+    /// the paid count the scan saw — apply's compare-and-set token.
+    #[test]
+    fn renewals_are_due_only_for_running_unbounded_attempts_past_their_paid_time() {
+        let now = Timestamp::UNIX_EPOCH + Duration::from_days(1);
+        let mut sm = StateMachine::default();
+        let at = |secs: i64| Some(now - Duration::from_secs(secs));
+
+        let due = attempting_job(&mut sm, AttemptState::Running, at(1800), every(1800, 1));
+        let behind = attempting_job(&mut sm, AttemptState::Running, at(9000), every(1800, 2));
+        let inside = attempting_job(&mut sm, AttemptState::Running, at(1799), every(1800, 1));
+        let renewed = attempting_job(&mut sm, AttemptState::Running, at(1800), every(1800, 2));
+        let bounded = attempting_job(&mut sm, AttemptState::Running, at(90_000), None);
+        let not_started = attempting_job(&mut sm, AttemptState::Dispatching, None, every(1800, 1));
+        let finalizing = attempting_job(
+            &mut sm,
+            AttemptState::Finalizing,
+            at(90_000),
+            every(1800, 1),
+        );
+        // A terminal job's attempts are never scanned, whatever they record.
+        let mut gone = job_record(JobId::new(), "img", Resources::ZERO, None);
+        gone.state = JobState::Succeeded;
+        sm.jobs.insert(gone.spec.id, gone);
+
+        let view = view_of(sm);
+        let renewals = due_renewals(&view, now, usize::MAX);
+        let ids: BTreeSet<AttemptId> = renewals.iter().map(|r| r.attempt).collect();
+        assert_eq!(ids, BTreeSet::from([due, behind]));
+        for not_due in [inside, renewed, bounded, not_started, finalizing] {
+            assert!(!ids.contains(&not_due));
+        }
+        // The most overdue first: `behind` paid up to 3600 s of a 9000 s run.
+        assert_eq!(
+            renewals,
+            vec![
+                IntervalRenewal {
+                    attempt: behind,
+                    paid: 2
+                },
+                IntervalRenewal {
+                    attempt: due,
+                    paid: 1
+                },
+            ]
+        );
+        // And the budget bounds it.
+        assert_eq!(due_renewals(&view, now, 1).len(), 1);
+    }
+
+    /// A backlog over the per-command cap becomes several commands, every one
+    /// stamped with the single clock reading the scan used.
+    #[tokio::test]
+    async fn renewals_are_proposed_in_capped_batches_at_one_instant() {
+        let now = Timestamp::UNIX_EPOCH + Duration::from_days(1);
+        let due: Vec<IntervalRenewal> = (0..5)
+            .map(|paid| IntervalRenewal {
+                attempt: AttemptId::new(),
+                paid,
+            })
+            .collect();
+        let (consensus, _publisher) = FakeConsensus::new(ProposeOutcome::Accepted);
+        let consensus = Arc::new(consensus);
+        propose_renewals(&consensus, &due, now, 2).await;
+
+        let proposed: Vec<RenewIntervalCharges> = consensus
+            .proposed()
+            .into_iter()
+            .filter_map(|c| match c {
+                Command::RenewIntervalCharges(r) => Some(r),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            proposed
+                .iter()
+                .map(|r| r.renewals.len())
+                .collect::<Vec<_>>(),
+            vec![2, 2, 1]
+        );
+        assert_eq!(
+            proposed
+                .iter()
+                .flat_map(|r| r.renewals.clone())
+                .collect::<Vec<_>>(),
+            due
+        );
+        assert!(proposed.iter().all(|r| r.proposed_at == now));
+    }
+
+    /// The loop end to end: a tick proposes a renewal for a running unbounded
+    /// attempt that has outrun its paid interval.
+    #[tokio::test(start_paused = true)]
+    async fn a_tick_renews_a_due_running_unbounded_attempt() {
+        let (consensus, mut publisher) = FakeConsensus::new(ProposeOutcome::Accepted);
+        let consensus = Arc::new(consensus);
+        let views = consensus.views();
+
+        let mut sm = StateMachine::default();
+        // Started a day before the wall clock with one 30-minute interval
+        // paid: due on any machine that runs the test.
+        let started = Timestamp::now() - Duration::from_days(1);
+        let attempt = attempting_job(
+            &mut sm,
+            AttemptState::Running,
+            Some(started),
+            every(1800, 1),
+        );
+        publisher.publish_now(&sm, 1);
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let status = consensus.status();
+        let join = tokio::spawn(run(
+            Arc::clone(&consensus),
+            views,
+            HistorySink::None,
+            HOUSEKEEPING_INTERVAL,
+            NodeLiveness::new(),
+            status,
+            shutdown_rx,
+        ));
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(HOUSEKEEPING_INTERVAL).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        shutdown_tx.send(true).expect("the loop is still running");
+        join.await.expect("the loop joins on shutdown");
+
+        let renewals: Vec<RenewIntervalCharges> = consensus
+            .proposed()
+            .into_iter()
+            .filter_map(|c| match c {
+                Command::RenewIntervalCharges(r) => Some(r),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(renewals.len(), 1);
+        assert_eq!(
+            renewals[0].renewals,
+            vec![IntervalRenewal { attempt, paid: 1 }]
+        );
     }
 }

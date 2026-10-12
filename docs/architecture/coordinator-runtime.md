@@ -79,7 +79,7 @@ followers, which is what lets followers serve reads and event streams.
 | Ingestion / normalizer | `coppice-coordinator` | yes | the ObservedSet diff, dedupe state | agent inbound reports |
 | Dispatch loop | `coppice-coordinator` | yes | in-flight dispatch bookkeeping | the event stream |
 | Scheduler driver | `coppice-coordinator` | yes | the current scheduling pass | its own loop + view updates |
-| Housekeeping | `coppice-coordinator` | yes | the eviction cadence and the leader health monitor | a 60 s tick |
+| Housekeeping | `coppice-coordinator` | yes | the eviction cadence, the leader health monitor, and interval-charge renewal | a 60 s tick |
 | Leaf renewal | `coppice-coordinator` | no | this replica's own cluster-owned machine-plane material at `<data_dir>/pki` ([ADR 0037](../decisions/0037-coordinator-discovery-and-self-converging-membership.md) §4) | a timer at ~2/3 of the served leaf's remaining lifetime |
 | Snapshot builder | `coppice-consensus` | no | snapshot serialization/IO | openraft's `SnapshotPolicy`, or an explicit `trigger_snapshot` |
 
@@ -275,6 +275,20 @@ followers, which is what lets followers serve reads and event streams.
    an already-lost node every tick). The deadline is a node-local constant
    today; [configuration.md](../operations/configuration.md) records it as
    replicated policy, where it migrates once the policy schema grows it.
+   The same tick also runs **interval renewal**
+   ([ADR 0046](../decisions/0046-interval-charging-for-unbounded-jobs.md)):
+   it scans the jobs in `Attempting`, and for each current attempt that is
+   `Running` with an interval-charged record whose runtime has reached the end
+   of its paid intervals (`⌊(now − started_at) / seconds⌋ + 1 > paid`), it
+   proposes an actor-less `RenewIntervalCharges` item carrying the observed
+   `paid` count as a compare-and-set token, so a duplicate across a leader
+   change is a no-op. The pass uses the same capped shape as eviction, most
+   overdue first: at most `MAX_RENEWALS_PER_COMMAND` (512) renewals per
+   command and `MAX_RENEWAL_BATCHES_PER_PASS` (16) commands per tick, all
+   stamped with the one clock reading the scan used. Renewal lag is therefore
+   at most one tick; a job that ends inside it pays the excess through its
+   true-up's surcharge, and catch-up after a leader outage charges every
+   missed interval in one step.
 
 12. **Snapshot builder.** Serializes the `Arc`'d state handed out by the
     apply task and writes it through the storage layer, keeping CPU and IO
