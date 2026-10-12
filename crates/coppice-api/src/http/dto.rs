@@ -217,6 +217,11 @@ pub struct AttemptView {
     pub rate_ucu_per_second: u64,
     /// Upfront charge for this attempt (trued-up at finalization).
     pub charged_ucu: u64,
+    /// The attempt's effective preemptibility, recorded at placement
+    /// (ADR 0044 §1): the job's `preemptible` and every ancestor entity's
+    /// switch, as they stood then. When `true` the charge carries the
+    /// preemptibility discount.
+    pub preemptible: bool,
 }
 
 /// Read-model projection of an allocation.
@@ -1298,6 +1303,9 @@ pub struct QuotaEntityNode {
     pub penalty: f64,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
+    /// The entity's own preemption switch (ADR 0044 §1); `false` switches
+    /// preemption off for its whole subtree. Default `true`.
+    pub preemptible: bool,
     /// Live job counts over this entity's **subtree** (itself + descendants),
     /// by displayed phase — a job under a descendant counts for every
     /// ancestor.
@@ -1412,6 +1420,23 @@ pub struct JobSpecView {
     /// command's verified actor (ADR 0023) — never client-supplied. `null`
     /// for a job whose submit command carried no actor.
     pub submitted_by: Option<String>,
+    /// The job's `[preemption]` declarations as stored (ADR 0044 §1), with
+    /// the notice resolved — a job that declared none shows the floor it was
+    /// given.
+    pub preemption: PreemptionView,
+}
+
+/// A stored job's `[preemption]` declarations (ADR 0044 §1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreemptionView {
+    /// What the job declared. Whether a given attempt was actually
+    /// preemptible is that attempt's `preemptible`, which also folds in the
+    /// quota entities' switches.
+    pub preemptible: bool,
+    /// The notice the job is given, in whole seconds.
+    pub notice_seconds: i64,
+    /// The notice signal's name, `SIGUSR1` style.
+    pub notice_signal: String,
 }
 
 /// A committed abort request on a job (mirrors the `abortRequested` field of
@@ -1518,7 +1543,11 @@ pub struct CostReport {
     /// Runtime penalty folded in for a job with no declared `max_runtime`
     /// (ADR 0029); `1.0` when the job is bounded.
     pub unbounded_multiplier: f64,
-    /// The µCU/second actually priced: rate × priority × unbounded.
+    /// Preemptibility discount folded in for an effectively preemptible job
+    /// (ADR 0044 §1); `1.0` when the job is not.
+    pub preemptible_multiplier: f64,
+    /// The µCU/second actually priced: rate × priority × unbounded ×
+    /// preemptible.
     pub effective_rate_ucu_per_second: u64,
     /// Duration the upfront placement charge covers: the job's `max_runtime`.
     /// For an unbounded job it is the renewal interval (captured on the latest
@@ -1673,6 +1702,29 @@ pub struct SubmitJobRequest {
     /// against the ADR's limits at admission, and again at apply.
     #[serde(default)]
     pub metadata: JobMetadata,
+    /// The `[preemption]` table (ADR 0044 §1); absent is all defaults. Fixed
+    /// at submission and part of the ADR 0026 submission identity.
+    #[serde(default)]
+    pub preemption: Option<PreemptionRequest>,
+}
+
+/// A submission's `[preemption]` table (ADR 0044 §1).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreemptionRequest {
+    /// Permission for the platform to choose this job as a victim and to
+    /// place it on `preemptible_only` nodes. Default `false`.
+    #[serde(default)]
+    pub preemptible: bool,
+    /// Notice in whole seconds, within the cluster's
+    /// `preemption_notice_floor ..= preemption_notice_cap`; absent is the
+    /// floor.
+    #[serde(default)]
+    pub notice_seconds: Option<i64>,
+    /// One of `SIGHUP`, `SIGINT`, `SIGUSR1`, `SIGUSR2`, `SIGTERM`; absent is
+    /// `SIGUSR1`.
+    #[serde(default)]
+    pub notice_signal: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -1861,6 +1913,11 @@ pub struct ConfigureQuotaEntityRequest {
     /// Soft quota as a stock in µCU (ADR 0019); the caller converts human
     /// rates.
     pub quota_ucu: u64,
+    /// The entity's preemption switch (ADR 0044 §1); `false` switches
+    /// preemption off for its subtree. Absent leaves an existing entity's
+    /// switch as it is and creates a new entity switched on.
+    #[serde(default)]
+    pub preemptible: Option<bool>,
 }
 
 /// `POST /api/v1/quota-entities` response — the echoed entity id plus the
@@ -3118,6 +3175,7 @@ mod tests {
                         quota: coppice_core::quota::CostUnits(1),
                         actor: None,
                         updated_at: ts(1),
+                        preemptible: None,
                     },
                 ))
                 .unwrap();
@@ -3455,6 +3513,7 @@ mod tests {
             updated_at: ts(9_000_000),
             queued_count: 3,
             running_count: 2,
+            preemptible: true,
         };
         let json = serde_json::to_value(&node).unwrap();
         assert_eq!(
@@ -3464,6 +3523,7 @@ mod tests {
                 "name": "platform",
                 "path": "acme/platform",
                 "parent": "quota-00000000-0000-0000-0000-000000000002",
+                "preemptible": true,
                 "origin": "configured",
                 "principal": null,
                 "quota_ucu": 1_000_000,
@@ -3524,6 +3584,7 @@ mod tests {
             updated_at: ts(2_000_000),
             queued_count: 1,
             running_count: 0,
+            preemptible: true,
         };
         let json = serde_json::to_value(&node).unwrap();
         assert_eq!(json["over_quota_ratio"], serde_json::Value::Null);
@@ -3683,6 +3744,7 @@ mod tests {
             refund_fraction: 0.75,
             actual_ucu: None,
             true_up: None,
+            preemptible_multiplier: 1.0,
         };
         let json = serde_json::to_value(&report).unwrap();
         assert_eq!(
@@ -3692,6 +3754,7 @@ mod tests {
                 "rate_breakdown": { "cpu": 1_000_000, "memory": 0, "disk": 0 },
                 "priority_multiplier": 2.0,
                 "unbounded_multiplier": 1.0,
+                "preemptible_multiplier": 1.0,
                 "effective_rate_ucu_per_second": 2_000_000,
                 "charge_window_seconds": 3600,
                 "charge_window_is_default": false,

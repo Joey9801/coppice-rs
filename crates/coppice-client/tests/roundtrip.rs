@@ -243,7 +243,7 @@ fn quota_entity_node_json(id: QuotaEntityId) -> serde_json::Value {
         "origin": "configured",
         "principal": null, "quota_ucu": 0, "usage_ucu": 0, "over_quota_ratio": 0.0,
         "penalty": 1.0, "created_at": "1970-01-01T00:00:00.000000Z",
-        "updated_at": "1970-01-01T00:00:00.000000Z", "queued_count": 0, "running_count": 0
+        "updated_at": "1970-01-01T00:00:00.000000Z", "preemptible": true, "queued_count": 0, "running_count": 0
     })
 }
 
@@ -260,7 +260,7 @@ fn quota_entity_response_json(id: QuotaEntityId) -> serde_json::Value {
 fn cost_report_json() -> serde_json::Value {
     serde_json::json!({
         "rate_ucu_per_second": 0, "rate_breakdown": { "cpu": 0, "memory": 0, "disk": 0 },
-        "priority_multiplier": 1.0, "unbounded_multiplier": 1.0,
+        "priority_multiplier": 1.0, "unbounded_multiplier": 1.0, "preemptible_multiplier": 1.0,
         "effective_rate_ucu_per_second": 0, "charge_window_seconds": 0,
         "charge_window_is_default": true, "estimated_ucu": 0, "charged_ucu": 0,
         "refund_fraction": 0.0, "actual_ucu": null, "true_up": null
@@ -273,7 +273,8 @@ fn job_spec_json() -> serde_json::Value {
         "requests": { "cpu_millis": 0, "memory_bytes": 0, "disk_bytes": 0 }, "priority": 0,
         "max_runtime_seconds": null, "quota_entity": quota_id().to_string(),
         "quota_entity_path": "acme/team",
-        "retry": { "max_retries": 0, "retry_user_errors": false }, "submitted_by": null
+        "retry": { "max_retries": 0, "retry_user_errors": false }, "submitted_by": null,
+        "preemption": { "preemptible": false, "notice_seconds": 60, "notice_signal": "SIGUSR1" }
     })
 }
 

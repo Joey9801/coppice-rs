@@ -19,6 +19,7 @@ pub mod id;
 pub mod job;
 pub mod metadata;
 pub mod node;
+pub mod preemption;
 pub mod quota;
 pub mod resource;
 pub mod time;

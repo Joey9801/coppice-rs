@@ -164,4 +164,15 @@ message PolicyConfig {
   // in, seconds (ADR 0046). Validated > 0 at policy commit. Explicit
   // presence, following fields 9–12: absent decodes to 1800 (30 minutes).
   optional uint64 unbounded_charge_interval_s = 13;
+  // Q32.32 multiplier folded into the charge multiplier of an effectively
+  // preemptible attempt at placement (ADR 0044 §1), the preemptibility
+  // discount. Validated ≤ 2^32 (1.0) at policy commit. Explicit presence:
+  // absent decodes to the default 0.75 (3 · 2^30).
+  optional uint64 preemptible_multiplier_q32_32 = 14;
+  // Bounds on a job's declared preemption notice, microseconds
+  // (ADR 0044 §1): `floor ≤ notice ≤ cap`, and a job that declares none is
+  // given the floor. Validated floor ≤ cap at policy commit. Explicit
+  // presence: absent decodes to 60 s and 5 min.
+  optional int64 preemption_notice_floor_us = 15;
+  optional int64 preemption_notice_cap_us = 16;
 }

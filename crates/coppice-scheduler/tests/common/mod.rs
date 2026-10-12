@@ -129,6 +129,7 @@ pub fn configure_entity_cmd(entity: QuotaEntityId, parent: Option<QuotaEntityId>
         quota: CostUnits(1_000_000_000_000),
         updated_at: base_ts(),
         actor: None,
+        preemptible: None,
     })
 }
 
@@ -167,6 +168,7 @@ pub fn submit_cmd(
             submitted_by: None,
             metadata: Default::default(),
             env: Default::default(),
+            preemption: Default::default(),
         },
         multiplier,
         submitted_at: at,

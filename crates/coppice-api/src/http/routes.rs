@@ -1559,6 +1559,7 @@ mod tests {
                     quota: coppice_core::quota::CostUnits(req.quota_ucu),
                     actor: Some(actor),
                     updated_at: Timestamp::now(),
+                    preemptible: None,
                 },
             ))?;
             Ok(dto::ConfigureQuotaEntityResponse {
@@ -2747,6 +2748,7 @@ mod tests {
                 abort_requested: None,
                 submitted_by: None,
                 metadata: Default::default(),
+                preemption: Default::default(),
             },
             state: coppice_core::job::JobState::Queued,
             multiplier: coppice_core::quota::PriorityMultiplier::ONE,
@@ -3390,6 +3392,7 @@ mod tests {
                 usage: coppice_core::quota::UsageState::new(Timestamp::from_micros(0).unwrap()),
                 created_at: Timestamp::from_micros(1_000_000).unwrap(),
                 updated_at: Timestamp::from_micros(1_000_000).unwrap(),
+                preemptible: true,
             },
         );
         state
@@ -5184,6 +5187,7 @@ mod tests {
             usage: coppice_core::quota::UsageState::new(at),
             created_at: at,
             updated_at: at,
+            preemptible: true,
         };
 
         let mut state = coppice_state::StateMachine::default();

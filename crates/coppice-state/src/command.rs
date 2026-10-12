@@ -449,6 +449,10 @@ pub struct ConfigureQuotaEntity {
     pub name: String,
     /// A stock in µCU; the CLI converts human rates (ADR 0019).
     pub quota: CostUnits,
+    /// The entity's preemption switch (ADR 0044 §1). `None` leaves an
+    /// existing entity's switch as it is and creates a new entity switched
+    /// on, so a quota-only update never silently re-enables preemption.
+    pub preemptible: Option<bool>,
     /// Who asked — see the module note on actor-carrying commands.
     pub actor: Option<Actor>,
     pub updated_at: Timestamp,

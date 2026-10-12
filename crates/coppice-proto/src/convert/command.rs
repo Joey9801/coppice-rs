@@ -9,7 +9,10 @@
 
 use std::collections::BTreeSet;
 
-use coppice_core::quota::{CostUnits, PriorityMultiplier, DEFAULT_UNBOUNDED_CHARGE_INTERVAL_S};
+use coppice_core::quota::{
+    CostUnits, PriorityMultiplier, DEFAULT_PREEMPTIBLE_MULTIPLIER,
+    DEFAULT_UNBOUNDED_CHARGE_INTERVAL_S,
+};
 use coppice_core::resource::Resources;
 use coppice_core::time::Duration;
 use coppice_state::authz::{Actor, Binding, Role, Subject};
@@ -26,6 +29,7 @@ use coppice_state::command::{
 };
 use coppice_state::{
     CaCertBundle, EnrollRole, PolicyConfig, RevokedIdentity, DEFAULT_GROUPS_CLAIM,
+    DEFAULT_PREEMPTION_NOTICE_CAP, DEFAULT_PREEMPTION_NOTICE_FLOOR,
 };
 
 use super::core::{
@@ -760,6 +764,7 @@ impl From<&ConfigureQuotaEntity> for pb::ConfigureQuotaEntity {
             quota_ucu: c.quota.0,
             actor: c.actor.as_ref().map(Into::into),
             updated_at_us: c.updated_at.as_micros(),
+            preemptible: c.preemptible,
         }
     }
 }
@@ -773,6 +778,7 @@ impl TryFrom<pb::ConfigureQuotaEntity> for ConfigureQuotaEntity {
             parent: c.parent.map(TryInto::try_into).transpose()?,
             name: c.name,
             quota: CostUnits(c.quota_ucu),
+            preemptible: c.preemptible,
             actor: c.actor.map(Into::into),
             updated_at: timestamp(c.updated_at_us, "ConfigureQuotaEntity.updated_at_us")?,
         })
@@ -1190,6 +1196,9 @@ impl From<&PolicyConfig> for pbcore::PolicyConfig {
             refund_fraction_milli: Some(policy.refund_fraction_milli),
             groups_claim: Some(policy.groups_claim.clone()),
             unbounded_charge_interval_s: Some(policy.unbounded_charge_interval_s),
+            preemptible_multiplier_q32_32: Some(policy.preemptible_multiplier.0),
+            preemption_notice_floor_us: Some(policy.preemption_notice_floor.as_micros()),
+            preemption_notice_cap_us: Some(policy.preemption_notice_cap.as_micros()),
         }
     }
 }
@@ -1232,6 +1241,17 @@ impl TryFrom<pbcore::PolicyConfig> for PolicyConfig {
             groups_claim: policy
                 .groups_claim
                 .unwrap_or_else(|| DEFAULT_GROUPS_CLAIM.to_string()),
+            // ADR 0044 §1: absent decodes to the documented defaults,
+            // following fields 9–12 above.
+            preemptible_multiplier: policy
+                .preemptible_multiplier_q32_32
+                .map_or(DEFAULT_PREEMPTIBLE_MULTIPLIER, PriorityMultiplier),
+            preemption_notice_floor: policy
+                .preemption_notice_floor_us
+                .map_or(DEFAULT_PREEMPTION_NOTICE_FLOOR, Duration::from_micros),
+            preemption_notice_cap: policy
+                .preemption_notice_cap_us
+                .map_or(DEFAULT_PREEMPTION_NOTICE_CAP, Duration::from_micros),
         })
     }
 }

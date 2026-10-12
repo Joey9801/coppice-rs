@@ -153,6 +153,7 @@ proptest! {
             usage: UsageState { usage: CostUnits(usage), last_update: ts(0) },
             created_at: ts(0),
             updated_at: ts(0),
+            preemptible: true,
         };
         entities.insert(leaf, entity(usage_lo));
         let lo = penalty_product(&entities, leaf, &policy, ts(0));
@@ -206,6 +207,7 @@ fn penalty_product_is_depth_capped() {
                 },
                 created_at: ts(0),
                 updated_at: ts(0),
+                preemptible: true,
             },
         );
     }

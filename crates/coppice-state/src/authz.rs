@@ -418,6 +418,7 @@ mod tests {
             usage: UsageState::new(at),
             created_at: at,
             updated_at: at,
+            preemptible: true,
         };
         BTreeMap::from([
             (qid(ORG), entity(None, "org")),
@@ -827,6 +828,7 @@ mod tests {
             usage: UsageState::new(at),
             created_at: at,
             updated_at: at,
+            preemptible: true,
         };
         let entities = BTreeMap::from([(qid(1), entity(2)), (qid(2), entity(1))]);
         let bindings = vec![bound(principal("ana"), Role::Admin, Some(0xBEEF))];

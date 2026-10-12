@@ -73,6 +73,7 @@ pub fn attempt_record(
         started_at,
         ended_at: None,
         settlement: None,
+        effective_preemptible: false,
     }
 }
 
@@ -129,6 +130,7 @@ pub fn job_record(
             abort_requested: None,
             submitted_by: None,
             metadata: Default::default(),
+            preemption: Default::default(),
         },
         state: JobState::Queued,
         multiplier: PriorityMultiplier(0),

@@ -30,7 +30,7 @@ use coppice_core::job::{Job, JobState};
 use coppice_core::node::Node;
 use coppice_core::quota::{
     ChargeRecord, CostUnits, CostWeights, DecayPolicy, PriorityMultiplier, Settlement, UsageState,
-    DEFAULT_PENALTY_EXPONENT_MILLI, DEFAULT_REFUND_FRACTION_MILLI,
+    DEFAULT_PENALTY_EXPONENT_MILLI, DEFAULT_PREEMPTIBLE_MULTIPLIER, DEFAULT_REFUND_FRACTION_MILLI,
     DEFAULT_UNBOUNDED_CHARGE_INTERVAL_S, DEFAULT_UNBOUNDED_RUNTIME_MULTIPLIER,
 };
 use coppice_core::time::{Duration, Timestamp};
@@ -243,6 +243,26 @@ impl StateMachine {
             current = self.quota_entities.get(&id).and_then(|e| e.parent);
         }
         chain
+    }
+
+    /// A job's *effective* preemptibility (ADR 0044 §1): its own
+    /// `preemptible` and-ed with the switch on its quota entity and every
+    /// ancestor of it.
+    ///
+    /// The one resolver both sides of placement use — the scheduler's
+    /// candidate filter and tie-break, and apply's `commit_placements`, which
+    /// records the result on the attempt — so they cannot disagree about
+    /// which jobs a `preemptible_only` node takes. A pure function of the
+    /// snapshot, computed where it is needed and never stored on the state
+    /// machine. Walks the same bounded chain as
+    /// [`entity_chain`](Self::entity_chain); an entity absent from the tree
+    /// contributes nothing, so it cannot switch preemption off.
+    pub fn effective_preemptible(&self, job: &Job) -> bool {
+        job.preemption.preemptible
+            && self
+                .entity_chain(job.quota_entity)
+                .iter()
+                .all(|id| self.quota_entities.get(id).map_or(true, |e| e.preemptible))
     }
 
     /// An entity's path (ADR 0045): its ancestors' names, root first, joined
@@ -695,6 +715,12 @@ pub struct AttemptRecord {
     /// place a job's refund is answerable from (ADR 0029's explainability
     /// contract). Absent while the attempt is live.
     pub settlement: Option<Settlement>,
+    /// The attempt's effective preemptibility (ADR 0044 §1), resolved at
+    /// placement by [`StateMachine::effective_preemptible`] and recorded so a
+    /// later edit to the job's entities neither exposes nor protects work
+    /// already placed. When `true`, the policy's `preemptible_multiplier` is
+    /// already folded into [`multiplier`](Self::multiplier).
+    pub effective_preemptible: bool,
 }
 
 /// An allocation's replicated record plus its commit-order sequence.
@@ -752,6 +778,12 @@ pub struct QuotaEntity {
     /// The most recent `ConfigureQuotaEntity`'s proposer stamp. Equal to
     /// `created_at` on a freshly created entity.
     pub updated_at: Timestamp,
+    /// Whether jobs under this entity may be preemptible (ADR 0044 §1),
+    /// default `true`. `false` switches preemption off for the whole
+    /// subtree: no job charging it or any descendant is effectively
+    /// preemptible, whatever it declared. Read at placement only, so an edit
+    /// never reaches an attempt already placed.
+    pub preemptible: bool,
 }
 
 /// The default name of the token claim carrying a principal's groups
@@ -812,6 +844,19 @@ pub struct PolicyConfig {
     pub node_retention: Duration,
     /// Default SIGTERM→SIGKILL grace for aborts.
     pub abort_grace: Duration,
+    /// Q32.32 discount folded into an effectively preemptible attempt's
+    /// charge multiplier at placement (ADR 0044 §1), exactly where the
+    /// unbounded-runtime multiplier is folded and multiplying with it when
+    /// both apply. Validated ≤ 1.0 at policy commit; default 0.75; 1.0
+    /// disables the discount.
+    pub preemptible_multiplier: PriorityMultiplier,
+    /// The shortest notice a job may declare, and the notice a job that
+    /// declares none is given (ADR 0044 §1). Default 60 s.
+    pub preemption_notice_floor: Duration,
+    /// The longest notice a job may declare (ADR 0044 §1): it bounds how
+    /// long a termination can hold capacity. Validated ≥ the floor at policy
+    /// commit. Default 5 min.
+    pub preemption_notice_cap: Duration,
     /// Name of the token claim carrying a principal's groups (ADR 0022/0023),
     /// `"groups"` by default.
     ///
@@ -836,10 +881,21 @@ impl Default for PolicyConfig {
             terminal_retention: Duration::from_hours(72),
             node_retention: Duration::from_hours(24),
             abort_grace: Duration::from_secs(30),
+            preemptible_multiplier: DEFAULT_PREEMPTIBLE_MULTIPLIER,
+            preemption_notice_floor: DEFAULT_PREEMPTION_NOTICE_FLOOR,
+            preemption_notice_cap: DEFAULT_PREEMPTION_NOTICE_CAP,
             groups_claim: DEFAULT_GROUPS_CLAIM.to_string(),
         }
     }
 }
+
+/// Default [`PolicyConfig::preemption_notice_floor`]: 60 s (ADR 0044 §6).
+/// Also the value an absent field decodes to.
+pub const DEFAULT_PREEMPTION_NOTICE_FLOOR: Duration = Duration::from_secs(60);
+
+/// Default [`PolicyConfig::preemption_notice_cap`]: 5 min (ADR 0044 §6).
+/// Also the value an absent field decodes to.
+pub const DEFAULT_PREEMPTION_NOTICE_CAP: Duration = Duration::from_mins(5);
 
 /// Why a committed command was refused.
 ///
@@ -869,6 +925,9 @@ pub enum RejectionReason {
     InvalidJobMetadata(String),
     #[error("invalid job environment: {0}")]
     InvalidJobEnv(String),
+    /// The job's `[preemption]` table broke a policy bound (ADR 0044 §1).
+    #[error("invalid job preemption: {0}")]
+    InvalidJobPreemption(String),
     #[error("job {0} is terminal")]
     JobTerminal(JobId),
     #[error("job {0} is not queued")]

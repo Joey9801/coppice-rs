@@ -41,7 +41,37 @@
 //!
 //! [env]                     # optional, immutable environment overlay
 //! LOG_LEVEL = "debug"       # values are strings; overlays the image's own ENV
+//!
+//! [preemption]              # optional, ADR 0044 §1; absent = not preemptible
+//! preemptible = true        # default false; true opts in to being preempted,
+//!                           # to the price discount, and to preemptible-only nodes
+//! notice = "2m"             # optional humantime duration, whole seconds; absent is
+//!                           # the cluster's notice floor (default 60s, cap 300s)
+//! notice_signal = "SIGUSR2" # optional; one of SIGHUP, SIGINT, SIGUSR1, SIGUSR2,
+//!                           # SIGTERM; absent is SIGUSR1
 //! ```
+//!
+//! ## Reserved environment names
+//!
+//! Every `COPPICE_*` environment name is reserved for the platform: the server
+//! rejects a spec whose `[env]` sets one. The agent injects these into every
+//! attempt's container (ADR 0044 §2), after the overlay:
+//!
+//! - `COPPICE_JOB_ID`: the job's id.
+//! - `COPPICE_ATTEMPT_ID`: this attempt's id.
+//! - `COPPICE_ATTEMPT_INDEX`: this attempt's zero-based index within the job.
+//! - `COPPICE_PREVIOUS_ATTEMPT_ID`: the previous attempt's id; unset on the
+//!   first attempt.
+//! - `COPPICE_PREVIOUS_ATTEMPT_OUTCOME`: how the previous attempt ended (for
+//!   example whether it was preempted); unset on the first attempt.
+//! - `COPPICE_PREEMPTIBLE`: `true` when this attempt is effectively
+//!   preemptible (the job's flag and every ancestor quota entity's switch),
+//!   else `false`.
+//! - `COPPICE_NOTICE_SIGNAL`: the notice signal's name, such as `SIGUSR1`.
+//! - `COPPICE_NOTICE_S`: the notice length in whole seconds.
+//!
+//! A preemptible job should handle the notice signal by checkpointing and
+//! exiting within the notice; the platform kills it when the notice runs out.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -53,10 +83,10 @@ use serde::Deserialize;
 use coppice_client::{
     paths, AbortJobRequest, AttemptId, Client, FollowOptions, JobCursor, JobDetail, JobEnv,
     JobFilter, JobId, JobMetadata, JobPhase, ListJobsParams, ListJobsResponse, LogAvailability,
-    LogEntry, LogOrder, LogSourceRecord, LogStreamName, LogsParams, NodeId, QuotaEntityRef,
-    ReplaceJobMetadataRequest, RequestsResource, Resources, RetryPolicy, SubmitJobRequest,
-    TimelineEvent, TimelineEventBody, TimelineParams, Timestamp, UpdateJobMetadataRequest,
-    UsageAvailability, UsageParams, UsagePoint, UsageSourceRecord,
+    LogEntry, LogOrder, LogSourceRecord, LogStreamName, LogsParams, NodeId, NoticeSignal,
+    PreemptionRequest, QuotaEntityRef, ReplaceJobMetadataRequest, RequestsResource, Resources,
+    RetryPolicy, SubmitJobRequest, TimelineEvent, TimelineEventBody, TimelineParams, Timestamp,
+    UpdateJobMetadataRequest, UsageAvailability, UsageParams, UsagePoint, UsageSourceRecord,
 };
 use coppice_core::bytes::ByteSize;
 
@@ -118,6 +148,31 @@ pub struct JobSpec {
     /// carry secrets.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// Preemption declarations (ADR 0044 §1), as a `[preemption]` table.
+    /// Absent is the wire default: not preemptible, the cluster's notice floor,
+    /// `SIGUSR1`.
+    #[serde(default)]
+    pub preemption: Option<PreemptionSpec>,
+}
+
+/// Optional preemption declarations. Present as a `[preemption]` table; each
+/// field defaults individually.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreemptionSpec {
+    /// Permission to be chosen as a preemption victim (and to be placed on
+    /// preemptible-only nodes), in return for a price discount. Default false.
+    #[serde(default)]
+    pub preemptible: bool,
+    /// Notice before the kill. A humane duration string (`"2m"`); whole
+    /// seconds only. Absent = the cluster's notice floor; the server rejects a
+    /// value outside its floor..=cap range.
+    #[serde(default, with = "humantime_serde")]
+    pub notice: Option<Duration>,
+    /// The signal sent when the notice starts: `SIGHUP`, `SIGINT`, `SIGUSR1`,
+    /// `SIGUSR2` or `SIGTERM`. Absent = `SIGUSR1`.
+    #[serde(default)]
+    pub notice_signal: Option<NoticeSignal>,
 }
 
 /// Requested resources. All three dimensions are required — a defaulted request
@@ -189,6 +244,25 @@ impl JobSpec {
             i64::try_from(max_runtime.as_secs())
                 .map_err(|_| anyhow::anyhow!("max_runtime is too large to express in seconds"))?;
         }
+        if let Some(preemption) = &self.preemption {
+            if let Some(notice) = preemption.notice {
+                if notice.subsec_nanos() != 0 {
+                    bail!(
+                        "preemption.notice must be a whole number of seconds (the wire \
+                         field has no sub-second precision)"
+                    );
+                }
+                i64::try_from(notice.as_secs()).map_err(|_| {
+                    anyhow::anyhow!("preemption.notice is too large to express in seconds")
+                })?;
+            }
+            if let Some(NoticeSignal::Unknown(name)) = &preemption.notice_signal {
+                bail!(
+                    "preemption.notice_signal {name:?} is not one of SIGHUP, SIGINT, \
+                     SIGUSR1, SIGUSR2, SIGTERM"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -225,6 +299,16 @@ impl JobSpec {
                 max_retries: retry.max_retries,
                 retry_user_errors: retry.retry_user_errors,
             });
+        }
+        if let Some(preemption) = &self.preemption {
+            let mut table = PreemptionRequest::new(preemption.preemptible);
+            if let Some(notice) = preemption.notice {
+                table = table.with_notice(notice);
+            }
+            if let Some(signal) = &preemption.notice_signal {
+                table = table.with_notice_signal(signal.clone());
+            }
+            request = request.with_preemption(table);
         }
         request
     }
@@ -1376,6 +1460,22 @@ fn render_status(detail: &JobDetail) -> String {
         Some(duration) => kv("max runtime", &format!("{}s", duration.as_secs())),
         None => kv("max runtime", "unbounded"),
     }
+    kv(
+        "preemption",
+        &if spec.preemption.preemptible {
+            format!(
+                "preemptible, notice {}s, signal {}",
+                spec.preemption.notice.as_secs(),
+                spec.preemption.notice_signal
+            )
+        } else {
+            format!(
+                "not preemptible (notice {}s, signal {})",
+                spec.preemption.notice.as_secs(),
+                spec.preemption.notice_signal
+            )
+        },
+    );
     kv("submitted at", &detail.submitted_at.to_string());
     kv("state since", &detail.state_since.to_string());
     if let Some(terminal_at) = detail.terminal_at {
@@ -1387,6 +1487,15 @@ fn render_status(detail: &JobDetail) -> String {
     kv(
         "cost (charged)",
         &format!("{} uCU", detail.cost.charged_ucu),
+    );
+    // The two multipliers that can lift or cut the base rate; `1` means the
+    // job is bounded / not (effectively) preemptible respectively.
+    kv(
+        "multipliers",
+        &format!(
+            "unbounded x{}, preemptible x{}",
+            detail.cost.unbounded_multiplier, detail.cost.preemptible_multiplier
+        ),
     );
     // The settled figure exists once the job is terminal: the charge less
     // what the true-up refunded (or plus what it surcharged).
@@ -1436,6 +1545,9 @@ fn render_status(detail: &JobDetail) -> String {
         let _ = writeln!(out, "attempts:");
         for attempt in &detail.attempts {
             let mut line = format!("  {} {} node {}", attempt.id, attempt.state, attempt.node);
+            if attempt.preemptible {
+                line.push_str(" preemptible");
+            }
             if let Some(started) = attempt.started_at {
                 let _ = write!(line, " started {started}");
             }
@@ -1852,6 +1964,94 @@ EMPTY = ""
         assert!(spec.env.is_empty());
         let request = spec.request(JobId::new());
         assert!(request.env.is_empty());
+    }
+
+    /// A full `[preemption]` table reaches the wire request.
+    #[test]
+    fn preemption_table_maps_onto_the_request() {
+        let spec = parse(&format!(
+            "{MINIMAL_SPEC}\n[preemption]\npreemptible = true\nnotice = \"2m\"\n\
+             notice_signal = \"SIGUSR2\"\n"
+        ))
+        .expect("full preemption table parses");
+        let request = spec.request(JobId::new());
+        let table = request.preemption.expect("table present");
+        assert!(table.preemptible);
+        assert_eq!(table.notice, Some(Duration::from_secs(120)));
+        assert_eq!(table.notice_signal, Some(NoticeSignal::Sigusr2));
+    }
+
+    /// An absent table is `None` on the wire, not an all-defaults table; a
+    /// table with only some keys leaves the rest to the server's defaults.
+    #[test]
+    fn absent_preemption_table_is_none_and_partial_tables_default() {
+        let spec = parse(MINIMAL_SPEC).unwrap();
+        assert!(spec.request(JobId::new()).preemption.is_none());
+
+        let spec = parse(&format!(
+            "{MINIMAL_SPEC}\n[preemption]\npreemptible = true\n"
+        ))
+        .unwrap();
+        let table = spec.request(JobId::new()).preemption.unwrap();
+        assert_eq!(table, PreemptionRequest::new(true));
+
+        let spec = parse(&format!("{MINIMAL_SPEC}\n[preemption]\n")).unwrap();
+        let table = spec.request(JobId::new()).preemption.unwrap();
+        assert_eq!(table, PreemptionRequest::default());
+    }
+
+    #[test]
+    fn bad_preemption_tables_are_rejected() {
+        // Unknown key.
+        let bad = format!("{MINIMAL_SPEC}\n[preemption]\npreemtible = true\n");
+        assert!(toml::from_str::<JobSpec>(&bad).is_err());
+        // Bare-integer notice, as for max_runtime.
+        let bad = format!("{MINIMAL_SPEC}\n[preemption]\nnotice = 120\n");
+        assert!(toml::from_str::<JobSpec>(&bad).is_err());
+        // Sub-second notice.
+        let bad = format!("{MINIMAL_SPEC}\n[preemption]\nnotice = \"1500ms\"\n");
+        let err = parse(&bad).expect_err("sub-second notice rejected");
+        assert!(
+            format!("{err:#}").contains("whole number of seconds"),
+            "{err:#}"
+        );
+        // Signal outside the closed set (including wrong case).
+        for signal in ["SIGKILL", "sigusr1", "USR1"] {
+            let bad = format!("{MINIMAL_SPEC}\n[preemption]\nnotice_signal = \"{signal}\"\n");
+            let err = parse(&bad).expect_err("unlisted signal rejected");
+            assert!(format!("{err:#}").contains("notice_signal"), "{err:#}");
+        }
+    }
+
+    #[test]
+    fn status_renders_the_preemption_spec_and_multipliers() {
+        let job = CoreJobId::new();
+        let mut detail = sample_job_detail(job, dto::JobStateKind::Attempting);
+        let plain = render_status(&as_client(detail.clone()));
+        assert!(
+            plain.contains("preemption      not preemptible (notice 60s, signal SIGUSR1)"),
+            "{plain}"
+        );
+        assert!(
+            plain.contains("multipliers     unbounded x1, preemptible x1"),
+            "{plain}"
+        );
+
+        detail.spec.preemption = dto::PreemptionView {
+            preemptible: true,
+            notice_seconds: 120,
+            notice_signal: "SIGUSR2".to_string(),
+        };
+        detail.cost.preemptible_multiplier = 0.5;
+        let rendered = render_status(&as_client(detail));
+        assert!(
+            rendered.contains("preemption      preemptible, notice 120s, signal SIGUSR2"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("multipliers     unbounded x1, preemptible x0.5"),
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -2586,6 +2786,11 @@ EMPTY = ""
                     retry_user_errors: false,
                 },
                 submitted_by: None,
+                preemption: dto::PreemptionView {
+                    preemptible: false,
+                    notice_seconds: 60,
+                    notice_signal: "SIGUSR1".to_string(),
+                },
             },
             submitted_at: ts,
             state_since: ts,
@@ -2611,6 +2816,7 @@ EMPTY = ""
                 },
                 priority_multiplier: 1.0,
                 unbounded_multiplier: 1.0,
+                preemptible_multiplier: 1.0,
                 effective_rate_ucu_per_second: 10,
                 charge_window_seconds: 3600,
                 charge_window_is_default: false,

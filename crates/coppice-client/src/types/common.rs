@@ -274,6 +274,59 @@ impl AttemptState {
     }
 }
 
+/// The signal a preemptible job's container is sent when its notice starts
+/// (ADR 0044 §1): a closed set of five, spelled `SIGUSR1` style on the wire.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    strum::Display,
+    strum::EnumString,
+)]
+#[non_exhaustive]
+pub enum NoticeSignal {
+    /// `SIGHUP`.
+    #[serde(rename = "SIGHUP")]
+    #[strum(serialize = "SIGHUP")]
+    Sighup,
+    /// `SIGINT`.
+    #[serde(rename = "SIGINT")]
+    #[strum(serialize = "SIGINT")]
+    Sigint,
+    /// `SIGUSR1`, the default.
+    #[serde(rename = "SIGUSR1")]
+    #[strum(serialize = "SIGUSR1")]
+    Sigusr1,
+    /// `SIGUSR2`.
+    #[serde(rename = "SIGUSR2")]
+    #[strum(serialize = "SIGUSR2")]
+    Sigusr2,
+    /// `SIGTERM`.
+    #[serde(rename = "SIGTERM")]
+    #[strum(serialize = "SIGTERM")]
+    Sigterm,
+    /// A value this client does not know — a newer server's vocabulary, kept
+    /// verbatim rather than rejected. Sent verbatim too, so the server's own
+    /// validation answers for it. See [`super`] for why this carries the
+    /// spelling rather than being a bare unit variant.
+    #[serde(untagged)]
+    #[strum(default)]
+    Unknown(String),
+}
+
+impl NoticeSignal {
+    /// Whether this value fell into the `Unknown` catch-all.
+    pub fn is_unknown(&self) -> bool {
+        matches!(self, NoticeSignal::Unknown(_))
+    }
+}
+
 /// Why an attempt reached its terminal state.
 #[derive(
     Debug,
@@ -447,6 +500,11 @@ pub struct AttemptView {
     pub rate_ucu_per_second: u64,
     /// The upfront charge for this attempt, trued up at finalization.
     pub charged_ucu: u64,
+    /// The attempt's effective preemptibility, recorded at placement (ADR
+    /// 0044 §1): the job's `preemptible` and every ancestor entity's switch,
+    /// as they stood then. When `true` the charge carries the preemptibility
+    /// discount.
+    pub preemptible: bool,
 }
 
 /// One placement of a job onto a node.

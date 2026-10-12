@@ -23,7 +23,8 @@
 //!   prices ride the same command under the same rule, seeded only while the
 //!   replicated weights are still all-zero (the booted "everything is free"
 //!   default); the `[retention]` windows ride it too, each seeded only while
-//!   the replicated field still holds its booted default;
+//!   the replicated field still holds its booted default, and so do the
+//!   `[preemption]` knobs (ADR 0044 §6);
 //! - each quota entity is named by its **path** (ADR 0045) and created
 //!   **only when its path does not already resolve** in replicated state —
 //!   an existing entity is left untouched (reconfiguration is not an
@@ -101,6 +102,72 @@ pub struct FormationPolicy {
     /// defaults.
     #[serde(default)]
     pub retention: Option<RetentionSpec>,
+    /// The preemption pricing and notice bounds, as the `[preemption]` table
+    /// (ADR 0044 §6). Absent = leave all three at their booted defaults.
+    #[serde(default)]
+    pub preemption: Option<PreemptionPolicySpec>,
+}
+
+/// The `[preemption]` table: the replicated preemption knobs of ADR 0044 §1.
+///
+/// ```toml
+/// [preemption]
+/// preemptible_multiplier = 0.75  # PolicyConfig::preemptible_multiplier, ≤ 1.0
+/// notice_floor = "60s"          # PolicyConfig::preemption_notice_floor
+/// notice_cap = "5m"             # PolicyConfig::preemption_notice_cap
+/// ```
+///
+/// Every field is optional; an omitted one leaves its booted default. Like
+/// `[retention]`, each is seeded **only while the replicated field still
+/// holds that default**, so a re-run of `init` never overwrites an
+/// operator's later edit. The multiplier is a float here and becomes Q32.32
+/// at this parse edge, like the priority multipliers; no float is
+/// replicated.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreemptionPolicySpec {
+    /// The discount folded into an effectively preemptible attempt's charge.
+    /// `0.0 ..= 1.0`; default 0.75, and 1.0 disables the discount.
+    #[serde(default)]
+    pub preemptible_multiplier: Option<f64>,
+    /// The shortest notice a job may declare, and the notice a job that
+    /// declares none is given. Default 60 s.
+    #[serde(default, with = "humantime_serde::option")]
+    pub notice_floor: Option<std::time::Duration>,
+    /// The longest notice a job may declare. Default 5 min.
+    #[serde(default, with = "humantime_serde::option")]
+    pub notice_cap: Option<std::time::Duration>,
+}
+
+impl PreemptionPolicySpec {
+    /// The fields apply would refuse, refused here instead so the document
+    /// is named rather than formation failing halfway through: a multiplier
+    /// outside `0.0 ..= 1.0`, and a floor above the cap when both are given
+    /// (a lone bound is checked against the other's effective value in
+    /// [`FormationPolicy::commands`]).
+    fn validate(&self) -> Result<()> {
+        if let Some(m) = self.preemptible_multiplier {
+            if !m.is_finite() || !(0.0..=1.0).contains(&m) {
+                bail!("[preemption] preemptible_multiplier must be between 0.0 and 1.0 (got {m})");
+            }
+        }
+        if let (Some(floor), Some(cap)) = (self.notice_floor, self.notice_cap) {
+            if floor > cap {
+                bail!(
+                    "[preemption] notice_floor ({}) is above notice_cap ({})",
+                    humantime_serde::re::humantime::format_duration(floor),
+                    humantime_serde::re::humantime::format_duration(cap)
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// The Q32.32 form of the multiplier, rounded like the priority table.
+    fn multiplier(&self) -> Option<PriorityMultiplier> {
+        self.preemptible_multiplier
+            .map(|m| PriorityMultiplier((m * Q32_SCALE).round() as u64))
+    }
 }
 
 /// The `[retention]` table: how long replicated records outlive what they
@@ -533,6 +600,11 @@ pub struct QuotaEntitySpec {
     /// entity without waiting on path resolution.
     #[serde(default)]
     pub id: Option<QuotaEntityId>,
+    /// The entity's preemption switch (ADR 0044 §1), applied when the entity
+    /// is created; absent creates it switched on. Like the quota, it never
+    /// touches an entity that already exists.
+    #[serde(default)]
+    pub preemptible: Option<bool>,
 }
 
 impl FormationPolicy {
@@ -570,6 +642,9 @@ impl FormationPolicy {
         }
         if let Some(retention) = &self.retention {
             retention.validate()?;
+        }
+        if let Some(preemption) = &self.preemption {
+            preemption.validate()?;
         }
         let mut seen_path = std::collections::BTreeSet::new();
         let mut seen_id = std::collections::BTreeSet::new();
@@ -702,7 +777,34 @@ impl FormationPolicy {
                     window != booted.terminal_retention
                         && state.policy.terminal_retention == booted.terminal_retention
                 });
-        if seeds_multipliers || seeds_weights || seeds_node_retention || seeds_terminal_retention {
+        // The `[preemption]` knobs (ADR 0044 §6), under the same rule.
+        let preemption = self.preemption.unwrap_or_default();
+        let seeds_preemptible_multiplier = preemption.multiplier().is_some_and(|m| {
+            m != booted.preemptible_multiplier
+                && state.policy.preemptible_multiplier == booted.preemptible_multiplier
+        });
+        let seeds_notice_floor = preemption
+            .notice_floor
+            .map(Duration::from)
+            .is_some_and(|floor| {
+                floor != booted.preemption_notice_floor
+                    && state.policy.preemption_notice_floor == booted.preemption_notice_floor
+            });
+        let seeds_notice_cap = preemption
+            .notice_cap
+            .map(Duration::from)
+            .is_some_and(|cap| {
+                cap != booted.preemption_notice_cap
+                    && state.policy.preemption_notice_cap == booted.preemption_notice_cap
+            });
+        if seeds_multipliers
+            || seeds_weights
+            || seeds_node_retention
+            || seeds_terminal_retention
+            || seeds_preemptible_multiplier
+            || seeds_notice_floor
+            || seeds_notice_cap
+        {
             let mut policy = state.policy.clone();
             if seeds_multipliers {
                 policy.priority_multipliers = self.multiplier_table();
@@ -715,6 +817,24 @@ impl FormationPolicy {
             }
             if let (true, Some(window)) = (seeds_terminal_retention, retention.terminal) {
                 policy.terminal_retention = Duration::from(window);
+            }
+            if let (true, Some(m)) = (seeds_preemptible_multiplier, preemption.multiplier()) {
+                policy.preemptible_multiplier = m;
+            }
+            if let (true, Some(floor)) = (seeds_notice_floor, preemption.notice_floor) {
+                policy.preemption_notice_floor = Duration::from(floor);
+            }
+            if let (true, Some(cap)) = (seeds_notice_cap, preemption.notice_cap) {
+                policy.preemption_notice_cap = Duration::from(cap);
+            }
+            // A lone bound may cross the other's current value; apply would
+            // refuse the whole command, so name the document instead.
+            if policy.preemption_notice_floor > policy.preemption_notice_cap {
+                bail!(
+                    "[preemption] would leave notice_floor ({}) above notice_cap ({})",
+                    policy.preemption_notice_floor,
+                    policy.preemption_notice_cap
+                );
             }
             commands.push(Command::UpdatePolicy(UpdatePolicy {
                 policy,
@@ -737,6 +857,7 @@ impl FormationPolicy {
                     quota: CostUnits(entity.spec.quota),
                     updated_at: now,
                     actor: None,
+                    preemptible: entity.spec.preemptible,
                 }));
             }
         }
@@ -1031,6 +1152,19 @@ quota = 1000000000000
         // The retention windows the demo states explicitly (ADR 0012, 0041).
         let retention = policy.retention.expect("[retention]");
         assert!(retention.node.is_some() && retention.terminal.is_some());
+        // The preemption knobs it states are exactly the booted defaults
+        // (ADR 0044 §6), so seeding them is a no-op on a fresh cluster.
+        let preemption = policy.preemption.expect("[preemption]");
+        let booted = PolicyConfig::default();
+        assert_eq!(preemption.multiplier(), Some(booted.preemptible_multiplier));
+        assert_eq!(
+            preemption.notice_floor.map(Duration::from),
+            Some(booted.preemption_notice_floor)
+        );
+        assert_eq!(
+            preemption.notice_cap.map(Duration::from),
+            Some(booted.preemption_notice_cap)
+        );
         // Both launch roles are seeded, each under the label that makes
         // re-applying the policy a no-op (ADR 0037 §5).
         let labels: Vec<&str> = policy
@@ -1153,6 +1287,80 @@ quota = 1000000000000
             .is_empty());
     }
 
+    /// The `[preemption]` table (ADR 0044 §6) seeds its three knobs under
+    /// the `[retention]` rule, and refuses a document apply would refuse.
+    #[test]
+    fn preemption_knobs_seed_only_from_the_booted_default() {
+        let doc = b"[preemption]\npreemptible_multiplier = 0.25\nnotice_floor = \"30s\"\nnotice_cap = \"2m\"\n";
+        let policy = FormationPolicy::parse_toml(doc).expect("[preemption] parses");
+        let now = Timestamp::now();
+        let fresh = StateMachine::default();
+        match &policy.commands(&fresh, now, CHEAP_KDF).expect("valid")[..] {
+            [Command::UpdatePolicy(up)] => {
+                assert_eq!(
+                    up.policy.preemptible_multiplier,
+                    PriorityMultiplier(1 << 30)
+                );
+                assert_eq!(up.policy.preemption_notice_floor, Duration::from_secs(30));
+                assert_eq!(up.policy.preemption_notice_cap, Duration::from_mins(2));
+                assert_eq!(up.policy.node_retention, fresh.policy.node_retention);
+            }
+            other => panic!("expected one UpdatePolicy, got {other:?}"),
+        }
+
+        // An operator's edit to one knob survives; the others still seed.
+        let mut edited = StateMachine::default();
+        edited.policy.preemptible_multiplier = PriorityMultiplier::ONE;
+        match &policy.commands(&edited, now, CHEAP_KDF).expect("valid")[..] {
+            [Command::UpdatePolicy(up)] => {
+                assert_eq!(up.policy.preemptible_multiplier, PriorityMultiplier::ONE);
+                assert_eq!(up.policy.preemption_notice_floor, Duration::from_secs(30));
+            }
+            other => panic!("expected one UpdatePolicy, got {other:?}"),
+        }
+
+        // Applied already: nothing to propose.
+        let mut applied = StateMachine::default();
+        applied.policy.preemptible_multiplier = PriorityMultiplier(1 << 30);
+        applied.policy.preemption_notice_floor = Duration::from_secs(30);
+        applied.policy.preemption_notice_cap = Duration::from_mins(2);
+        assert!(policy
+            .commands(&applied, now, CHEAP_KDF)
+            .expect("valid")
+            .is_empty());
+
+        // Refusals: a surcharge, an inverted range, and a lone floor that
+        // would cross the booted 5 min cap.
+        for bad in [
+            &b"[preemption]\npreemptible_multiplier = 1.5\n"[..],
+            b"[preemption]\nnotice_floor = \"10m\"\nnotice_cap = \"1m\"\n",
+        ] {
+            assert!(FormationPolicy::parse_toml(bad).is_err());
+        }
+        let lone = FormationPolicy::parse_toml(b"[preemption]\nnotice_floor = \"10m\"\n").unwrap();
+        assert!(lone.commands(&fresh, now, CHEAP_KDF).is_err());
+    }
+
+    /// A `[[quota_entity]]` may be created with preemption switched off
+    /// (ADR 0044 §1); absent leaves apply's default, on.
+    #[test]
+    fn quota_entity_preemptible_rides_creation() {
+        let doc = b"[[quota_entity]]\npath = \"prod\"\nquota = 1\npreemptible = false\n\n[[quota_entity]]\npath = \"dev\"\nquota = 1\n";
+        let policy = FormationPolicy::parse_toml(doc).unwrap();
+        let commands = policy
+            .commands(&StateMachine::default(), Timestamp::now(), CHEAP_KDF)
+            .unwrap();
+        let switches: BTreeMap<String, Option<bool>> = commands
+            .iter()
+            .filter_map(|c| match c {
+                Command::ConfigureQuotaEntity(c) => Some((c.name.clone(), c.preemptible)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(switches["prod"], Some(false));
+        assert_eq!(switches["dev"], None);
+    }
+
     #[test]
     fn multiplier_table_is_exact_for_power_of_two_factors() {
         let policy = FormationPolicy::parse_toml(SAMPLE.as_bytes()).unwrap();
@@ -1224,6 +1432,7 @@ quota = 1000000000000
                 usage: coppice_core::quota::UsageState::new(now),
                 created_at: now,
                 updated_at: now,
+                preemptible: true,
             },
         );
         assert!(policy
@@ -1635,6 +1844,7 @@ ttl = "15m"
                     usage: coppice_core::quota::UsageState::new(Timestamp::now()),
                     created_at: Timestamp::now(),
                     updated_at: Timestamp::now(),
+                    preemptible: true,
                 },
             );
         }
@@ -1699,6 +1909,7 @@ ttl = "15m"
                 usage: coppice_core::quota::UsageState::new(now),
                 created_at: now,
                 updated_at: now,
+                preemptible: true,
             },
         );
         let commands = policy
@@ -1772,6 +1983,7 @@ ttl = "15m"
                     usage: coppice_core::quota::UsageState::new(now),
                     created_at: now,
                     updated_at: now,
+                    preemptible: true,
                 },
             );
         }
@@ -1796,6 +2008,7 @@ ttl = "15m"
                 usage: coppice_core::quota::UsageState::new(now),
                 created_at: now,
                 updated_at: now,
+                preemptible: true,
             },
         );
         let toml = entity_toml("a", Some(declared));
@@ -1829,6 +2042,7 @@ ttl = "15m"
                     usage: coppice_core::quota::UsageState::new(now),
                     created_at: now,
                     updated_at: now,
+                    preemptible: true,
                 },
             );
         }
@@ -1967,6 +2181,7 @@ scope = "default"
                 usage: coppice_core::quota::UsageState::new(now),
                 created_at: now,
                 updated_at: now,
+                preemptible: true,
             },
         );
         // An operator has since replaced the list with something else

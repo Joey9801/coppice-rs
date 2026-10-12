@@ -17,6 +17,7 @@ use coppice_core::id::{AllocationId, AttemptId, JobId, NodeId, QuotaEntityId};
 use coppice_core::job::{AbortRequest, Job, JobState};
 use coppice_core::metadata::{self, JobMetadata};
 use coppice_core::node::Node;
+use coppice_core::preemption;
 use coppice_core::quota::{
     self, ChargeInterval, ChargeRecord, CostUnits, Settlement, TrueUp, UsageState,
 };
@@ -120,6 +121,10 @@ impl StateMachine {
         // enough to keep replicated state inside the limits whatever the
         // proposer did.
         env::validate(&c.job.env).map_err(|e| RejectionReason::InvalidJobEnv(e.to_string()))?;
+        // ADR 0044 §1: a job that declares no notice is given the policy
+        // floor, resolved here from the replicated policy at this command's
+        // log position so every replica stores the same concrete value.
+        let mut submitted = c.job.clone();
         if let Some(existing) = self.jobs.get(&c.job.id) {
             // The job id is the submission's idempotency identity (ADR 0026):
             // a client retry after an unknown outcome, or a re-proposal across
@@ -128,7 +133,15 @@ impl StateMachine {
             // an accepted no-op with no events, so the retrying client gets
             // success and the original JobId. An id reused with a different
             // payload is a distinct intent and rejects.
-            return if same_submission(&existing.spec, &c.job) {
+            //
+            // A retry that leaves the notice unset means "whatever it was
+            // given", so it is compared with the stored job's resolved notice
+            // — not the current floor, which may have moved since. An
+            // explicit notice is compared as written.
+            if submitted.preemption.notice.is_none() {
+                submitted.preemption.notice = existing.spec.preemption.notice;
+            }
+            return if same_submission(&existing.spec, &submitted) {
                 // Even the accepted no-op re-checks authority at its own log
                 // position (ADR 0023): a retry racing a revocation rejects
                 // rather than silently succeeding. The original commit — and
@@ -144,6 +157,22 @@ impl StateMachine {
                 Err(RejectionReason::SubmitSpecMismatch(c.job.id))
             };
         }
+        // A fresh submission resolves an unset notice to the current floor.
+        let notice = preemption::resolve_notice(
+            submitted.preemption.notice,
+            self.policy.preemption_notice_floor,
+        );
+        submitted.preemption.notice = Some(notice);
+        // A fresh submission's notice is re-checked against the bounds: the
+        // API checked them against its own view, but the policy may have
+        // moved since. (A retry above is judged on identity alone — the
+        // original commit already passed this check.)
+        preemption::validate_notice(
+            notice,
+            self.policy.preemption_notice_floor,
+            self.policy.preemption_notice_cap,
+        )
+        .map_err(|e| RejectionReason::InvalidJobPreemption(e.to_string()))?;
         if !self.quota_entities.contains_key(&c.job.quota_entity) {
             return Err(RejectionReason::UnknownQuotaEntity(c.job.quota_entity));
         }
@@ -154,7 +183,7 @@ impl StateMachine {
             },
         )?;
         let job = c.job.id;
-        let mut spec = c.job.clone();
+        let mut spec = submitted;
         // Ownership is stamped from the *verified* actor, never from what the
         // client put in the payload (ADR 0023).
         if let Some(actor) = c.actor.as_ref() {
@@ -416,13 +445,16 @@ impl StateMachine {
             let Some(spec) = p.allocations.first() else {
                 continue;
             };
-            let Some((entity, multiplier, max_runtime, requests)) =
+            let Some((entity, multiplier, max_runtime, requests, preemptible)) =
                 self.jobs.get(&p.job).map(|j| {
                     (
                         j.spec.quota_entity,
                         j.multiplier,
                         j.spec.max_runtime,
                         j.spec.requests,
+                        // ADR 0044 §1: resolved now, at placement, and
+                        // recorded on the attempt below.
+                        self.effective_preemptible(&j.spec),
                     )
                 })
             else {
@@ -450,6 +482,16 @@ impl StateMachine {
                         Some(seconds),
                     )
                 }
+            };
+            // ADR 0044 §1: the preemptibility discount folds in at the same
+            // point and in the same arithmetic as the unbounded-runtime
+            // multiplier above, `m' = ⌊m' × pm / 2³²⌋`, multiplying with it
+            // when both apply. The folded value is what the attempt record
+            // keeps, so a later policy edit never reprices this attempt.
+            let multiplier = if preemptible {
+                multiplier.saturating_mul(self.policy.preemptible_multiplier)
+            } else {
+                multiplier
             };
             let seq = self.next_allocation_seq;
             self.next_allocation_seq += 1;
@@ -526,6 +568,7 @@ impl StateMachine {
                     started_at: None,
                     ended_at: None,
                     settlement: None,
+                    effective_preemptible: preemptible,
                 },
             );
             events.push(Event::AttemptStateChanged {
@@ -1227,6 +1270,10 @@ impl StateMachine {
             // Usage and `created_at` are preserved: reconfiguration is not an
             // amnesty, and the creation instant never moves.
             e.quota = c.quota;
+            // ADR 0044 §1: absent leaves the switch as it is.
+            if let Some(preemptible) = c.preemptible {
+                e.preemptible = preemptible;
+            }
             e.updated_at = c.updated_at;
             return Ok(Applied {
                 events: vec![Event::QuotaEntityConfigured { entity: c.entity }],
@@ -1275,6 +1322,7 @@ impl StateMachine {
                 usage: UsageState::new(c.updated_at),
                 created_at: c.updated_at,
                 updated_at: c.updated_at,
+                preemptible: c.preemptible.unwrap_or(true),
             },
         );
         Ok(Applied {
@@ -1306,6 +1354,28 @@ impl StateMachine {
                 "refund_fraction_milli {} exceeds maximum {}",
                 c.policy.refund_fraction_milli,
                 quota::FULL_REFUND_MILLI
+            )));
+        }
+        // ADR 0044 §1: the preemptibility multiplier may only discount
+        // (≤ 1.0), and the notice bounds must be a non-empty range.
+        if c.policy.preemptible_multiplier > quota::PriorityMultiplier::ONE {
+            return Err(RejectionReason::InvalidPolicy(format!(
+                "preemptible_multiplier {} is above 1.0 ({})",
+                c.policy.preemptible_multiplier.0,
+                quota::PriorityMultiplier::ONE.0
+            )));
+        }
+        if c.policy.preemption_notice_floor.is_negative() {
+            return Err(RejectionReason::InvalidPolicy(format!(
+                "preemption_notice_floor {} µs is negative",
+                c.policy.preemption_notice_floor.as_micros()
+            )));
+        }
+        if c.policy.preemption_notice_floor > c.policy.preemption_notice_cap {
+            return Err(RejectionReason::InvalidPolicy(format!(
+                "preemption_notice_floor {} µs is above preemption_notice_cap {} µs",
+                c.policy.preemption_notice_floor.as_micros(),
+                c.policy.preemption_notice_cap.as_micros()
             )));
         }
         self.authorize(c.actor.as_ref(), Verb::UpdatePolicy)?;
@@ -2209,4 +2279,5 @@ fn same_submission(existing: &Job, retried: &Job) -> bool {
         && existing.retry == retried.retry
         && existing.metadata == retried.metadata
         && existing.env == retried.env
+        && existing.preemption == retried.preemption
 }

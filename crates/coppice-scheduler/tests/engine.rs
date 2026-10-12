@@ -52,6 +52,7 @@ fn submit_exact_runtime(
         submitted_by: None,
         metadata: Default::default(),
         env: Default::default(),
+        preemption: Default::default(),
     };
     apply_ok(
         sm,

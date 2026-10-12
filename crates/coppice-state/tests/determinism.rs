@@ -25,7 +25,8 @@ use coppice_core::bytes::ByteSize;
 use coppice_core::env::JobEnv;
 use coppice_core::job::RetryPolicy;
 use coppice_core::metadata::JobMetadata;
-use coppice_core::quota::CostUnits;
+use coppice_core::preemption::{NoticeSignal, PreemptionSpec};
+use coppice_core::quota::{CostUnits, PriorityMultiplier};
 use coppice_core::resource::Resources;
 use coppice_core::time::{Duration, Timestamp};
 use coppice_proto::convert::{state_from_records, state_to_records, StateRecords};
@@ -83,6 +84,23 @@ fn arb_env() -> impl Strategy<Value = JobEnv> {
     proptest::collection::btree_map("[A-Z_][A-Z0-9_]{0,5}", "[a-z ]{0,8}", 0..4)
 }
 
+/// An arbitrary `[preemption]` table (ADR 0044 §1). The notice ranges past
+/// the default 5 min cap and below the floor, so some submissions are
+/// refused by apply's bounds re-check and some leave the notice for apply to
+/// resolve — all of it must be deterministic.
+fn arb_preemption() -> impl Strategy<Value = PreemptionSpec> {
+    (
+        any::<bool>(),
+        proptest::option::of(0i64..600),
+        0usize..NoticeSignal::ALL.len(),
+    )
+        .prop_map(|(preemptible, notice_s, sig)| PreemptionSpec {
+            preemptible,
+            notice: notice_s.map(Duration::from_secs),
+            notice_signal: NoticeSignal::ALL[sig],
+        })
+}
+
 /// An arbitrary metadata edit: replacement and patch, both shapes, against
 /// a job that may or may not exist by the time it applies.
 fn arb_metadata_update(job: coppice_core::id::JobId) -> impl Strategy<Value = Command> {
@@ -122,6 +140,7 @@ fn arb_job_chain(i: u64) -> impl Strategy<Value = Vec<Command>> {
         arb_ts(),
         proptest::option::of((0usize..=6, arb_metadata_update(jid(1_000 + i as u128)))),
         arb_env(),
+        arb_preemption(),
     )
         .prop_map(
             move |(
@@ -134,12 +153,20 @@ fn arb_job_chain(i: u64) -> impl Strategy<Value = Vec<Command>> {
                 ts,
                 metadata_at,
                 env,
+                preemption,
             )| {
                 let job = jid(1_000 + i as u128);
                 let attempt = aid(2_000 + i as u128);
                 let alloc = alid(3_000 + i as u128);
                 let mut chain = vec![
-                    submit_cmd_with_env(job, cpu(cpu_millis), max_rt, RetryPolicy::default(), env),
+                    submit_cmd_full(
+                        job,
+                        cpu(cpu_millis),
+                        max_rt,
+                        RetryPolicy::default(),
+                        env,
+                        preemption,
+                    ),
                     place_cmd(
                         placement(job, attempt, alloc, node_of(node_ix), cpu(cpu_millis)),
                         ts,
@@ -251,17 +278,43 @@ fn arb_global() -> impl Strategy<Value = Command> {
                 evicted_at: ts,
             })
         }),
-        (0u128..4, arb_ts()).prop_map(|(e, ts)| {
+        (0u128..4, proptest::option::of(any::<bool>()), arb_ts()).prop_map(
+            |(e, preemptible, ts)| {
+                Command::ConfigureQuotaEntity(ConfigureQuotaEntity {
+                    entity: qid(0xE0 + e),
+                    parent: Some(ROOT),
+                    // Distinct per entity, so most of these land rather than
+                    // tripping the ADR 0045 sibling-uniqueness rule.
+                    name: format!("team-{e}"),
+                    quota: CostUnits(1_000_000_000),
+                    updated_at: ts,
+                    actor: None,
+                    preemptible,
+                })
+            }
+        ),
+        // The root's preemption switch (ADR 0044 §1): every job charges the
+        // root, so flipping it mid-sequence changes what later placements
+        // resolve and record, while earlier attempts keep what they recorded.
+        (proptest::option::of(any::<bool>()), arb_ts()).prop_map(|(preemptible, ts)| {
             Command::ConfigureQuotaEntity(ConfigureQuotaEntity {
-                entity: qid(0xE0 + e),
-                parent: Some(ROOT),
-                // Distinct per entity, so most of these land rather than
-                // tripping the ADR 0045 sibling-uniqueness rule.
-                name: format!("team-{e}"),
-                quota: CostUnits(1_000_000_000),
+                entity: ROOT,
+                parent: None,
+                name: entity_name(ROOT),
+                quota: CostUnits(1_000_000_000_000),
                 updated_at: ts,
                 actor: None,
+                preemptible,
             })
+        }),
+        // The preemption knobs (ADR 0044 §1), including refused ones: a
+        // multiplier above 1.0 and a floor above the cap.
+        (0u64..(2 << 32), 0i64..400, 0i64..400).prop_map(|(m, floor_s, cap_s)| {
+            let mut policy = test_policy(4);
+            policy.preemptible_multiplier = PriorityMultiplier(m);
+            policy.preemption_notice_floor = Duration::from_secs(floor_s);
+            policy.preemption_notice_cap = Duration::from_secs(cap_s);
+            update_policy_cmd(policy)
         }),
         (1u32..6, arb_ts()).prop_map(|(to, ts)| {
             Command::BumpClusterVersion(BumpClusterVersion {

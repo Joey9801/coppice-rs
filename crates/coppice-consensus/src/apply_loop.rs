@@ -371,6 +371,7 @@ mod tests {
                 quota: coppice_core::quota::CostUnits(1_000_000_000_000),
                 actor: None,
                 updated_at: ts(1),
+                preemptible: None,
             })
         };
         let mut metadata = coppice_core::metadata::JobMetadata::new();
@@ -393,6 +394,7 @@ mod tests {
                 submitted_by: Some("alice".into()),
                 metadata: metadata.clone(),
                 env: Default::default(),
+                preemption: Default::default(),
             },
             multiplier: coppice_core::quota::PriorityMultiplier::ONE,
             actor: None,

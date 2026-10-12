@@ -110,6 +110,7 @@ pub fn configure_entity_cmd(entity: QuotaEntityId, parent: Option<QuotaEntityId>
         quota: CostUnits(1_000_000_000_000),
         updated_at: base_ts(),
         actor: None,
+        preemptible: None,
     })
 }
 
@@ -181,6 +182,18 @@ pub fn submit_cmd_with_env(
     retry: RetryPolicy,
     env: coppice_core::env::JobEnv,
 ) -> Command {
+    submit_cmd_full(job, requests, max_runtime_s, retry, env, Default::default())
+}
+
+/// `submit_cmd_with_env` with an explicit `[preemption]` table (ADR 0044).
+pub fn submit_cmd_full(
+    job: JobId,
+    requests: Resources,
+    max_runtime_s: Option<i64>,
+    retry: RetryPolicy,
+    env: coppice_core::env::JobEnv,
+    preemption: coppice_core::preemption::PreemptionSpec,
+) -> Command {
     Command::SubmitJob(SubmitJob {
         job: Job {
             id: job,
@@ -196,6 +209,7 @@ pub fn submit_cmd_with_env(
             submitted_by: None,
             metadata: Default::default(),
             env,
+            preemption,
         },
         multiplier: PriorityMultiplier::ONE,
         submitted_at: base_ts(),

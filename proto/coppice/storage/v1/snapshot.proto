@@ -146,6 +146,12 @@ message AttemptRecord {
   // Set when the attempt reaches Terminal: what its charge settled to.
   // Absent while the attempt is live.
   optional coppice.core.v1.Settlement settlement = 8;
+  // The attempt's effective preemptibility (ADR 0044 §1): the job's
+  // `preemptible` and-ed with every ancestor quota entity's switch, resolved
+  // at placement and recorded here so a later policy or entity edit neither
+  // exposes nor protects work already placed. When true, the policy's
+  // preemptible multiplier is already folded into `multiplier_q32_32`.
+  bool effective_preemptible = 9;
 }
 
 // An allocation's replicated record plus its commit-order sequence. Keyed
@@ -185,6 +191,10 @@ message QuotaEntityRecord {
   // instant (they back no scheduling or accounting arithmetic).
   int64 created_at_us = 6;
   int64 updated_at_us = 7;
+  // Whether jobs under this entity may be preemptible (ADR 0044 §1): false
+  // switches preemption off for the whole subtree. Explicit presence: absent
+  // decodes to the default, true.
+  optional bool preemptible = 8;
 }
 
 // The state machine's scalar fields: replicated policy, feature gate, and

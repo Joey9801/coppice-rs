@@ -114,6 +114,9 @@ pub struct QuotaEntityNode {
     pub created_at: Timestamp,
     /// When the entity was last configured.
     pub updated_at: Timestamp,
+    /// The entity's own preemption switch (ADR 0044 §1); `false` switches
+    /// preemption off for its whole subtree. Default `true`.
+    pub preemptible: bool,
     /// Live job counts over this entity's **subtree** (itself + descendants):
     /// a job under a descendant counts for every ancestor.
     pub queued_count: u32,
@@ -240,6 +243,11 @@ pub struct ConfigureQuotaEntityRequest {
     pub name: String,
     /// Soft quota as a stock in µCU; the caller converts human rates.
     pub quota_ucu: u64,
+    /// The entity's preemption switch (ADR 0044 §1); `false` switches
+    /// preemption off for its subtree. Absent leaves an existing entity's
+    /// switch as it is and creates a new entity switched on.
+    #[serde(default)]
+    pub preemptible: Option<bool>,
 }
 
 impl ConfigureQuotaEntityRequest {
@@ -253,7 +261,14 @@ impl ConfigureQuotaEntityRequest {
             parent: None,
             name: name.into(),
             quota_ucu,
+            preemptible: None,
         }
+    }
+
+    /// Set the entity's preemption switch explicitly.
+    pub fn with_preemptible(mut self, preemptible: bool) -> Self {
+        self.preemptible = Some(preemptible);
+        self
     }
 
     /// Place the entity under `parent` (by id or path) in the quota tree.
@@ -313,6 +328,7 @@ mod tests {
             penalty: 1.0,
             created_at: ts(1_000_000),
             updated_at: ts(9_000_000),
+            preemptible: false,
             queued_count: 3,
             running_count: 2,
         };
@@ -332,6 +348,7 @@ mod tests {
                 "penalty": 1.0,
                 "created_at": "1970-01-01T00:00:01.000000Z",
                 "updated_at": "1970-01-01T00:00:09.000000Z",
+                "preemptible": false,
                 "queued_count": 3,
                 "running_count": 2,
             })
@@ -377,6 +394,7 @@ mod tests {
             penalty: f64::INFINITY,
             created_at: ts(1_000_000),
             updated_at: ts(2_000_000),
+            preemptible: false,
             queued_count: 1,
             running_count: 0,
         };
@@ -449,6 +467,7 @@ mod tests {
         assert_eq!(req.entity, entity);
         assert!(req.parent.is_none());
         assert_eq!(req.quota_ucu, 1000);
+        assert_eq!(req.preemptible, None);
 
         // The client-minted id is required (idempotency identity).
         let missing_entity: Result<ConfigureQuotaEntityRequest, _> =
@@ -486,6 +505,8 @@ mod tests {
         assert_eq!(req.parent, Some(QuotaEntityRef::Id(parent)));
         assert_eq!(req.name, "team");
         assert_eq!(req.quota_ucu, 1000);
+        assert_eq!(req.preemptible, None);
+        assert_eq!(req.with_preemptible(false).preemptible, Some(false));
     }
 
     /// `with_parent` accepts a path as readily as an id (ADR 0045).

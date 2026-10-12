@@ -267,6 +267,10 @@ pub const DEFAULT_UNBOUNDED_CHARGE_INTERVAL_S: u64 = 1800;
 /// Default unbounded-runtime multiplier: 2.0 in Q32.32 (ADR 0029).
 pub const DEFAULT_UNBOUNDED_RUNTIME_MULTIPLIER: PriorityMultiplier = PriorityMultiplier(2 << 32);
 
+/// Default preemptibility discount: 0.75 in Q32.32 (ADR 0044 §1), folded into
+/// an effectively preemptible attempt's charge multiplier at placement.
+pub const DEFAULT_PREEMPTIBLE_MULTIPLIER: PriorityMultiplier = PriorityMultiplier(3 << 30);
+
 /// The cost *rate* of a resource request, in µCU per second: the weighted sum
 /// over dimensions, each term `⌊quantity · weight / 2³²⌋`, saturating.
 pub fn resource_rate(requests: &Resources, weights: &CostWeights) -> u64 {

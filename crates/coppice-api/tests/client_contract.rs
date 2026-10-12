@@ -111,6 +111,7 @@ fn attempt_view(
         ended_at: Some(ts(2_000_000)),
         rate_ucu_per_second: 42,
         charged_ucu: 4200,
+        preemptible: n % 2 == 1,
     }
 }
 
@@ -245,6 +246,11 @@ fn job_read_models_round_trip_through_the_client() {
             ("EMPTY".to_string(), String::new()),
             ("RUST_LOG".to_string(), "info".to_string()),
         ]),
+        preemption: dto::PreemptionView {
+            preemptible: true,
+            notice_seconds: 120,
+            notice_signal: "SIGUSR2".to_string(),
+        },
     };
     round_trip::<dto::JobSpecView, client::JobSpecView>(&spec);
 
@@ -296,6 +302,7 @@ fn job_read_models_round_trip_through_the_client() {
         rate_breakdown: breakdown,
         priority_multiplier: 1.5,
         unbounded_multiplier: 1.25,
+        preemptible_multiplier: 0.5,
         effective_rate_ucu_per_second: 187,
         charge_window_seconds: 3600,
         charge_window_is_default: false,
@@ -619,6 +626,7 @@ fn quota_read_models_round_trip_through_the_client() {
         penalty: 1.0,
         created_at: ts(1_000_000),
         updated_at: ts(9_000_000),
+        preemptible: false,
         queued_count: 3,
         running_count: 2,
     };
@@ -1011,6 +1019,7 @@ fn infinite_quota_figures_round_trip_as_null_both_ways() {
         penalty: f64::INFINITY,
         created_at: ts(1_000_000),
         updated_at: ts(2_000_000),
+        preemptible: true,
         queued_count: 1,
         running_count: 0,
     };
@@ -1104,7 +1113,12 @@ fn submit_job_request_decodes_into_the_server_type() {
     .with_env(client::JobEnv::from_iter([
         ("RUST_LOG", "info"),
         ("EMPTY", ""),
-    ]));
+    ]))
+    .with_preemption(
+        client::PreemptionRequest::new(true)
+            .with_notice(Duration::from_secs(120))
+            .with_notice_signal(client::NoticeSignal::Sigusr2),
+    );
     assert!(full.validate().is_ok());
     request_round_trip::<client::SubmitJobRequest, dto::SubmitJobRequest>(&full);
 
@@ -1130,6 +1144,33 @@ fn submit_job_request_decodes_into_the_server_type() {
     );
     assert!(path_addressed.validate().is_ok());
     request_round_trip::<client::SubmitJobRequest, dto::SubmitJobRequest>(&path_addressed);
+
+    // A table that only sets `preemptible` leaves notice and signal to the
+    // server's defaults on both sides.
+    let defaults_table = client::SubmitJobRequest::new(
+        client::JobId::new(),
+        "alpine",
+        ["true"],
+        client::Resources::default(),
+        client::QuotaEntityId::new(),
+    )
+    .with_preemption(client::PreemptionRequest::new(true));
+    request_round_trip::<client::SubmitJobRequest, dto::SubmitJobRequest>(&defaults_table);
+}
+
+/// The notice signal is a closed set on the wire: the client's typed enum
+/// knows exactly the five spellings the server documents, and an unlisted one
+/// is kept verbatim rather than rejected.
+#[test]
+fn notice_signal_spellings_are_known_to_the_client() {
+    for wire in ["SIGHUP", "SIGINT", "SIGUSR1", "SIGUSR2", "SIGTERM"] {
+        let signal: client::NoticeSignal = serde_json::from_value(json!(wire)).unwrap();
+        assert!(!signal.is_unknown(), "{wire}");
+        assert_eq!(serde_json::to_value(&signal).unwrap(), json!(wire));
+        assert_eq!(signal.to_string(), wire);
+    }
+    let other: client::NoticeSignal = serde_json::from_value(json!("SIGKILL")).unwrap();
+    assert!(other.is_unknown());
 }
 
 #[test]
@@ -1191,6 +1232,15 @@ fn configure_quota_entity_request_decodes_into_the_server_type() {
     request_round_trip::<client::ConfigureQuotaEntityRequest, dto::ConfigureQuotaEntityRequest>(
         &path_scoped,
     );
+
+    // The preemption switch is optional: absent, on, and off all cross.
+    for switch in [true, false] {
+        let switched = client::ConfigureQuotaEntityRequest::new(entity, "team-a", 1_000_000)
+            .with_preemptible(switch);
+        request_round_trip::<client::ConfigureQuotaEntityRequest, dto::ConfigureQuotaEntityRequest>(
+            &switched,
+        );
+    }
 }
 
 #[test]

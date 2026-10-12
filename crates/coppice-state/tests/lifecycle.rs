@@ -1591,6 +1591,7 @@ fn quota_entity_timestamps_stamp_on_create_and_advance_only_updated() {
             quota: CostUnits(1_000_000_000_000),
             updated_at: at,
             actor: None,
+            preemptible: None,
         })
     };
 

@@ -27,6 +27,7 @@ use coppice_core::bytes::ByteSize;
 use coppice_core::id::{AllocationId, AttemptId, GroupId, JobId, NodeId, QuotaEntityId};
 use coppice_core::job::{AbortRequest, Job, JobState, RetryPolicy};
 use coppice_core::node::Node;
+use coppice_core::preemption::PreemptionSpec;
 use coppice_core::quota::{
     self, ChargeInterval, ChargeRecord, CostUnits, DecayPolicy, PriorityMultiplier, Settlement,
     UsageState,
@@ -352,6 +353,13 @@ pub fn synth_state(cfg: &SynthConfig) -> StateMachine {
             // fixtures stay stable.
             metadata: Default::default(),
             env: Default::default(),
+            // A stored job always carries its resolved notice (ADR 0044 §1);
+            // the policy-default floor keeps fixtures stable without another
+            // RNG draw.
+            preemption: PreemptionSpec {
+                notice: Some(Duration::from_secs(60)),
+                ..PreemptionSpec::default()
+            },
         };
         // Stamped like the real terminal path: a job aborted before any
         // attempt existed terminates in the abort apply itself, so its
@@ -658,6 +666,7 @@ fn build_attempt(
             started_at,
             ended_at,
             settlement,
+            effective_preemptible: false,
         },
     ));
     let allocation = Allocation {
@@ -792,6 +801,7 @@ fn build_quota_tree(rng: &mut Rng, total: usize, base_time: Timestamp) -> QuotaT
                 usage,
                 created_at: base_time,
                 updated_at: base_time,
+                preemptible: true,
             },
         ));
         root_ids.push(id);
@@ -815,6 +825,7 @@ fn build_quota_tree(rng: &mut Rng, total: usize, base_time: Timestamp) -> QuotaT
                 usage,
                 created_at: base_time,
                 updated_at: base_time,
+                preemptible: true,
             },
         ));
         team_ids.push(id);
@@ -838,6 +849,7 @@ fn build_quota_tree(rng: &mut Rng, total: usize, base_time: Timestamp) -> QuotaT
                 usage,
                 created_at: base_time,
                 updated_at: base_time,
+                preemptible: true,
             },
         ));
         leaf_ids.push(id);
