@@ -108,7 +108,12 @@ function NodeRow({ node }: { node: NodeSummary }) {
       <TableCell onClick={stop}>
         <IdLink id={node.id} />
       </TableCell>
-      <TableCell>{statusPill(node)}</TableCell>
+      <TableCell>
+        <div className="flex flex-wrap items-center gap-1.5">
+          {statusPill(node)}
+          {node.preemptibleOnly ? <SpotBadge /> : null}
+        </div>
+      </TableCell>
       <TableCell>
         {labels.length === 0 ? (
           <span className="text-muted-foreground">—</span>
@@ -156,6 +161,18 @@ function NodeRow({ node }: { node: NodeSummary }) {
         )}
       </TableCell>
     </TableRow>
+  )
+}
+
+function SpotBadge() {
+  return (
+    <Badge
+      variant="outline"
+      className="text-[10px]"
+      title="Spot capacity — accepts only effectively preemptible work"
+    >
+      spot
+    </Badge>
   )
 }
 

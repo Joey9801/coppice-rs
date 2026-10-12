@@ -97,6 +97,14 @@ function NodeDetailBody({ detail, nodeId }: { detail: NodeDetail; nodeId: string
             <span className="font-mono text-lg break-all">{summary.id}</span>
             <StatePill state={summary.health} />
             {summary.schedulable === false ? <StatePill state="Draining" /> : null}
+            {summary.preemptibleOnly ? (
+              <Badge
+                variant="outline"
+                title="Spot capacity — accepts only effectively preemptible work"
+              >
+                preemptible only
+              </Badge>
+            ) : null}
           </span>
         }
         description={<HeaderDescription summary={summary} />}

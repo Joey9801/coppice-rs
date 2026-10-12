@@ -66,6 +66,9 @@ export function EntityForm(props: EntityFormProps) {
     entity ? String(ucuToCostUnits(entity.quotaUcu)) : '',
   )
 
+  // The entity's own preemption switch (ADR 0044 §1); a new entity starts on.
+  const [preemptible, setPreemptible] = useState(entity ? entity.preemptible : true)
+
   const parentOptions = flattenTree(buildEntityTree(allEntities))
 
   const parentPath = effectiveParent?.path ?? null
@@ -97,6 +100,7 @@ export function EntityForm(props: EntityFormProps) {
       parent: entity ? entity.parent : effectiveParentId,
       name: entity ? entity.name : segment,
       quotaUcu: costUnitsToUcu(quotaCu),
+      preemptible,
     }
     mutation.mutate(input, { onSuccess: () => onDone() })
   }
@@ -224,6 +228,26 @@ export function EntityForm(props: EntityFormProps) {
         />
         <p className="text-xs text-muted-foreground">
           Soft quota — usage above it drives a scheduling penalty but never blocks jobs.
+        </p>
+      </div>
+
+      <div className="space-y-1.5">
+        <label
+          className="flex items-center gap-2 text-sm font-medium text-foreground"
+          htmlFor={`${uid}-preemptible`}
+        >
+          <input
+            id={`${uid}-preemptible`}
+            type="checkbox"
+            className="size-4 accent-primary"
+            checked={preemptible}
+            onChange={(e) => setPreemptible(e.target.checked)}
+          />
+          Allow preemption
+        </label>
+        <p className="text-xs text-muted-foreground">
+          Switching this off stops jobs anywhere under this entity from being preempted, whatever
+          they declare.
         </p>
       </div>
 

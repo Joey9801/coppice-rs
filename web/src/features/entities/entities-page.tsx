@@ -234,6 +234,15 @@ function EntityRow({
               SSO
             </Badge>
           ) : null}
+          {!node.preemptible ? (
+            <Badge
+              variant="outline"
+              className="text-[10px] text-muted-foreground"
+              title="Preemption is switched off for this entity's whole subtree"
+            >
+              preemption off
+            </Badge>
+          ) : null}
           {isUsersRoot(node) ? (
             <Badge variant="outline" className="text-[10px] text-muted-foreground">
               auto-populated

@@ -35,6 +35,7 @@ function spec(overrides: Partial<JobSpec> = {}): JobSpec {
     quotaEntity: 'quota-00000000-0000-0000-0000-000000000001',
     quotaEntityPath: 'acme/team-a',
     retry: { maxRetries: 0, retryUserErrors: false },
+    preemption: { preemptible: false, noticeSeconds: 60, noticeSignal: 'SIGUSR1' },
     ...overrides,
   }
 }
@@ -61,5 +62,25 @@ describe('JobSpecCard env', () => {
     fireEvent.click(screen.getByText('1 variable'))
     const value = screen.getByText((_, el) => el?.tagName === 'DD' && el.textContent === 'a  b\nc')
     expect(value).toHaveClass('whitespace-pre-wrap')
+  })
+})
+
+describe('JobSpecCard preemption', () => {
+  it('shows a non-preemptible job with its default notice', () => {
+    render(<JobSpecCard job={job()} />)
+    expect(screen.getByText('not preemptible')).toBeInTheDocument()
+  })
+
+  it('shows preemptible, the formatted notice and the signal', () => {
+    render(
+      <JobSpecCard
+        job={job({
+          preemption: { preemptible: true, noticeSeconds: 120, noticeSignal: 'SIGTERM' },
+        })}
+      />,
+    )
+    expect(screen.getByText('preemptible')).toBeInTheDocument()
+    expect(screen.getByText(/2m.*notice/)).toBeInTheDocument()
+    expect(screen.getByText('SIGTERM')).toBeInTheDocument()
   })
 })

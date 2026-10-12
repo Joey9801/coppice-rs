@@ -97,6 +97,11 @@ function EntityDetailBody({
             {/* The path is the title: ancestors link up the tree. */}
             <EntityBreadcrumb chain={chain} className="gap-x-1.5" />
             {entity.origin === 'sso' ? <Badge variant="secondary">SSO</Badge> : null}
+            {!entity.preemptible ? (
+              <Badge variant="outline" className="text-muted-foreground">
+                preemption off
+              </Badge>
+            ) : null}
           </span>
         }
         description={
@@ -108,6 +113,9 @@ function EntityDetailBody({
             {entity.principal ? (
               <span className="text-muted-foreground">· {entity.principal}</span>
             ) : null}
+            <span className="text-muted-foreground">
+              · Preemption: {entity.preemptible ? 'on' : 'off'} (subtree)
+            </span>
           </span>
         }
         actions={
@@ -268,6 +276,11 @@ function ChildrenCard({
                         {child.origin === 'sso' ? (
                           <Badge variant="secondary" className="text-[10px]">
                             SSO
+                          </Badge>
+                        ) : null}
+                        {!child.preemptible ? (
+                          <Badge variant="outline" className="text-[10px] text-muted-foreground">
+                            preemption off
                           </Badge>
                         ) : null}
                       </span>

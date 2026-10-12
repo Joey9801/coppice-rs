@@ -278,6 +278,7 @@ describe('getQuotaEntity', () => {
       penalty: null,
       created_at: '2026-01-01T00:00:00.000000Z',
       updated_at: '2026-01-01T00:00:00.000000Z',
+      preemptible: true,
       queued_count: 0,
       running_count: 1,
     }
@@ -332,6 +333,7 @@ describe('getJob queue explainer', () => {
           quota_entity: 'quota-00000000-0000-0000-0000-000000000001',
           quota_entity_path: 'acme/root',
           retry: { max_retries: 0, retry_user_errors: false },
+          preemption: { preemptible: false, notice_seconds: 60, notice_signal: 'SIGUSR1' },
         },
         submitted_at: '2026-01-01T00:00:00.000000Z',
         state_since: '2026-01-01T00:00:00.000000Z',
@@ -362,6 +364,7 @@ describe('getJob queue explainer', () => {
           rate_breakdown: { cpu: 0, memory: 0, disk: 0 },
           priority_multiplier: 1,
           unbounded_multiplier: 1,
+          preemptible_multiplier: 1,
           effective_rate_ucu_per_second: 0,
           charge_window_seconds: 0,
           charge_window_is_default: true,
@@ -411,6 +414,7 @@ describe('getJob spec env', () => {
           quota_entity: 'quota-00000000-0000-0000-0000-000000000001',
           quota_entity_path: 'acme/root',
           retry: { max_retries: 0, retry_user_errors: false },
+          preemption: { preemptible: false, notice_seconds: 60, notice_signal: 'SIGUSR1' },
         },
         submitted_at: '2026-01-01T00:00:00.000000Z',
         state_since: '2026-01-01T00:00:00.000000Z',
@@ -426,6 +430,7 @@ describe('getJob spec env', () => {
           rate_breakdown: { cpu: 0, memory: 0, disk: 0 },
           priority_multiplier: 1,
           unbounded_multiplier: 1,
+          preemptible_multiplier: 1,
           effective_rate_ucu_per_second: 0,
           charge_window_seconds: 0,
           charge_window_is_default: true,
@@ -458,6 +463,7 @@ describe('getJob attempts', () => {
       ended_at: '2026-01-01T00:05:00.000000Z',
       rate_ucu_per_second: 1,
       charged_ucu: 240,
+      preemptible: false,
       ...overrides,
     })
     fetchMock.mockResolvedValueOnce(
@@ -474,6 +480,7 @@ describe('getJob attempts', () => {
           quota_entity: 'quota-00000000-0000-0000-0000-000000000001',
           quota_entity_path: 'acme/root',
           retry: { max_retries: 0, retry_user_errors: false },
+          preemption: { preemptible: false, notice_seconds: 60, notice_signal: 'SIGUSR1' },
         },
         submitted_at: '2026-01-01T00:00:00.000000Z',
         state_since: '2026-01-01T00:05:00.000000Z',
@@ -500,6 +507,7 @@ describe('getJob attempts', () => {
           rate_breakdown: { cpu: 0, memory: 0, disk: 0 },
           priority_multiplier: 1,
           unbounded_multiplier: 1,
+          preemptible_multiplier: 1,
           effective_rate_ucu_per_second: 0,
           charge_window_seconds: 0,
           charge_window_is_default: true,
@@ -519,6 +527,141 @@ describe('getJob attempts', () => {
     expect(ended!.endedAt).toBeInstanceOf(Date)
     expect(ended!.endedAt!.toISOString()).toBe('2026-01-01T00:05:00.000Z')
     expect(live!.endedAt).toBeNull()
+  })
+})
+
+describe('preemption fields (ADR 0044)', () => {
+  it('maps job spec, attempt, cost, entity and node preemption fields from the wire', async () => {
+    const jobId = 'job-00000000-0000-0000-0000-000000000001'
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        id: jobId,
+        state: 'succeeded',
+        spec: {
+          image: 'busybox',
+          command: [],
+          entrypoint: null,
+          env: {},
+          requests: { cpu_millis: 100, memory_bytes: 1, disk_bytes: 1 },
+          priority: 0,
+          max_runtime_seconds: null,
+          quota_entity: 'quota-00000000-0000-0000-0000-000000000001',
+          quota_entity_path: 'acme/root',
+          retry: { max_retries: 0, retry_user_errors: false },
+          preemption: { preemptible: true, notice_seconds: 120, notice_signal: 'SIGTERM' },
+        },
+        submitted_at: '2026-01-01T00:00:00.000000Z',
+        state_since: '2026-01-01T00:05:00.000000Z',
+        terminal_at: '2026-01-01T00:05:00.000000Z',
+        retries_used: 0,
+        abort_requested: null,
+        entity_chain: [],
+        attempts: [
+          {
+            id: 'attempt-00000000-0000-0000-0000-00000000000a',
+            job: jobId,
+            node: 'node-00000000-0000-0000-0000-000000000001',
+            allocation: 'alloc-00000000-0000-0000-0000-000000000001',
+            state: 'Terminal',
+            outcome: { kind: 'Exited', exit_code: 0, class: 'Success' },
+            started_at: '2026-01-01T00:01:00.000000Z',
+            ended_at: '2026-01-01T00:05:00.000000Z',
+            rate_ucu_per_second: 1,
+            charged_ucu: 240,
+            preemptible: true,
+          },
+        ],
+        queue: null,
+        accrual: null,
+        cost: {
+          rate_ucu_per_second: 2,
+          rate_breakdown: { cpu: 2, memory: 0, disk: 0 },
+          priority_multiplier: 1,
+          unbounded_multiplier: 1,
+          preemptible_multiplier: 0.5,
+          effective_rate_ucu_per_second: 1,
+          charge_window_seconds: 0,
+          charge_window_is_default: true,
+          estimated_ucu: 0,
+          charged_ucu: 0,
+          refund_fraction: 0,
+          actual_ucu: null,
+          true_up: null,
+        },
+      }),
+    )
+    const job = await createRealClient().getJob(jobId)
+    expect(job.spec.preemption).toEqual({
+      preemptible: true,
+      noticeSeconds: 120,
+      noticeSignal: 'SIGTERM',
+    })
+    expect(job.attempts[0]!.preemptible).toBe(true)
+    expect(job.cost.preemptibleMultiplier).toBe(0.5)
+
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        entities: [
+          {
+            id: 'quota-00000000-0000-0000-0000-000000000001',
+            name: 'acme',
+            path: 'acme',
+            parent: null,
+            quota_ucu: 0,
+            usage_ucu: 0,
+            over_quota_ratio: 0,
+            penalty: 1,
+            created_at: '2026-01-01T00:00:00.000000Z',
+            updated_at: '2026-01-01T00:00:00.000000Z',
+            preemptible: false,
+            queued_count: 0,
+            running_count: 0,
+          },
+        ],
+      }),
+    )
+    const entities = await createRealClient().listQuotaEntities()
+    expect(entities[0]!.preemptible).toBe(false)
+
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        nodes: [
+          {
+            id: 'node-00000000-0000-0000-0000-000000000001',
+            capacity: { cpu_millis: 1, memory_bytes: 1, disk_bytes: 1 },
+            allocated: { cpu_millis: 0, memory_bytes: 0, disk_bytes: 0 },
+            used: null,
+            labels: {},
+            schedulable: true,
+            draining: false,
+            preemptible_only: true,
+            health: 'healthy',
+            epoch: 1,
+            last_heartbeat: null,
+            running_count: 0,
+            accruing_count: 0,
+          },
+        ],
+      }),
+    )
+    const nodes = await createRealClient().listNodes()
+    expect(nodes[0]!.preemptibleOnly).toBe(true)
+  })
+
+  it('sends the entity preemption switch only when set', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ entity: 'quota-x', path: 'x', log_index: 3 }))
+    fetchMock.mockRejectedValueOnce(new Error('stop after the write'))
+    await createRealClient()
+      .configureQuotaEntity({
+        entity: 'quota-x',
+        parent: null,
+        name: 'x',
+        quotaUcu: 1,
+        preemptible: false,
+      })
+      .catch(() => {})
+    const body = JSON.parse(String((fetchMock.mock.calls[0]![1] as RequestInit).body))
+    expect(body.preemptible).toBe(false)
   })
 })
 
@@ -894,6 +1037,7 @@ describe('job metadata (ADR 0042)', () => {
         quota_entity: 'quota-00000000-0000-0000-0000-000000000001',
         quota_entity_path: 'acme/root',
         retry: { max_retries: 0, retry_user_errors: false },
+        preemption: { preemptible: false, notice_seconds: 60, notice_signal: 'SIGUSR1' },
       },
       submitted_at: '2026-01-01T00:00:00.000000Z',
       state_since: '2026-01-01T00:00:00.000000Z',
@@ -909,6 +1053,7 @@ describe('job metadata (ADR 0042)', () => {
         rate_breakdown: { cpu: 1, memory: 0, disk: 0 },
         priority_multiplier: 1,
         unbounded_multiplier: 1,
+        preemptible_multiplier: 1,
         effective_rate_ucu_per_second: 1,
         charge_window_seconds: 3600,
         charge_window_is_default: false,

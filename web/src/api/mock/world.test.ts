@@ -30,6 +30,8 @@ function fits(part: Resources, whole: Resources): boolean {
 function assertInvariants(world: MockWorld, nowUs: number): void {
   const nodes = world.buildNodeSummaries()
   const nodeIds = new Set(nodes.map((n) => n.id))
+  const spotNodes = new Set(nodes.filter((n) => n.preemptibleOnly).map((n) => n.id))
+  const entitiesById = new Map(world.listQuotaEntities().map((e) => [e.id, e]))
 
   // Per-node: allocated (Σ funded of non-Released) ≤ capacity.
   for (const node of nodes) {
@@ -84,6 +86,15 @@ function assertInvariants(world: MockWorld, nowUs: number): void {
     for (const attempt of detail.attempts) {
       expect(attempt.job).toBe(detail.id)
       expect(nodeIds.has(attempt.node)).toBe(true)
+
+      // ADR 0044: an attempt is preemptible only if the job opted in and no
+      // entity on its path switched preemption off; spot-only nodes host
+      // nothing else.
+      if (attempt.preemptible) {
+        expect(detail.spec.preemption.preemptible).toBe(true)
+        for (const link of chain) expect(entitiesById.get(link.id)?.preemptible).toBe(true)
+      }
+      if (spotNodes.has(attempt.node)) expect(attempt.preemptible).toBe(true)
     }
 
     // The retry budget bounds total attempts (maxRetries + the first one).
@@ -220,6 +231,32 @@ describe('MockWorld construction', () => {
     const terminal = stats.byState.Succeeded + stats.byState.Failed + stats.byState.Aborted
     expect(terminal).toBeGreaterThan(100)
     expect(stats.byState.Failed).toBeGreaterThan(0)
+  })
+
+  it('seeds a mix of preemption declarations, an off-switch entity, and spot nodes', () => {
+    const world = new MockWorld(NOW_US)
+    const details = world.listJobs({ limit: 1000 }).jobs.map((j) => world.buildJobDetail(j.id))
+    expect(details.some((d) => d.spec.preemption.preemptible)).toBe(true)
+    expect(details.some((d) => !d.spec.preemption.preemptible)).toBe(true)
+    expect(details.some((d) => d.attempts.some((a) => a.preemptible))).toBe(true)
+    // A job that opted in under a switched-off entity is never preemptible.
+    const off = new Set(
+      world
+        .listQuotaEntities()
+        .filter((e) => !e.preemptible)
+        .map((e) => e.id),
+    )
+    expect(off.size).toBeGreaterThan(0)
+    const underOff = details.filter(
+      (d) => d.spec.preemption.preemptible && d.entityChain.some((link) => off.has(link.id)),
+    )
+    expect(underOff.length).toBeGreaterThan(0)
+    for (const d of underOff) {
+      for (const a of d.attempts) expect(a.preemptible).toBe(false)
+      expect(d.cost.preemptibleMultiplier).toBe(1)
+    }
+    const spot = world.buildNodeSummaries().filter((n) => n.preemptibleOnly)
+    expect(spot.length).toBeGreaterThanOrEqual(1)
   })
 
   it('reconciles the accruing breakdown with the phase counts', () => {

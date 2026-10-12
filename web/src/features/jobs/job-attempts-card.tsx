@@ -2,6 +2,7 @@ import type { AttemptId, AttemptView } from '@/api/types'
 import { formatUcu, shortId } from '@/lib/format'
 import { IdLink, outcomePill, StatePill, TimeAgo } from '@/components'
 import { cn } from '@/lib/utils'
+import { Badge } from '@/components/ui/badge'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import {
   Table,
@@ -54,6 +55,15 @@ export function JobAttemptsCard({
                           <span className="ml-2 rounded-full bg-primary/10 px-1.5 py-0.5 text-[10px] font-medium text-primary">
                             current
                           </span>
+                        ) : null}
+                        {attempt.preemptible ? (
+                          <Badge
+                            variant="outline"
+                            className="ml-2 text-[10px]"
+                            title="Placed as effectively preemptible: eligible for preemption and charged at the preemptible discount"
+                          >
+                            preemptible
+                          </Badge>
                         ) : null}
                       </TableCell>
                       <TableCell>

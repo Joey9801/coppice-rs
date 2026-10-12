@@ -22,6 +22,7 @@ function node(id: string, name: string, path: string, parent: string | null): Qu
     penalty: 1,
     createdAt: new Date(0),
     updatedAt: new Date(0),
+    preemptible: true,
     queuedCount: 0,
     runningCount: 0,
   }
@@ -52,7 +53,17 @@ describe('EntityForm (segment names, ADR 0045)', () => {
       parent: RESEARCH.id,
       name: 'newteam',
       quotaUcu: 5_000_000,
+      preemptible: true,
     })
+  })
+
+  it('submits the preemption switch as toggled', () => {
+    render(<EntityForm mode="edit" entity={EVALS} allEntities={ALL} onDone={() => {}} />)
+    const box = screen.getByLabelText(/allow preemption/i)
+    expect(box).toBeChecked()
+    fireEvent.click(box)
+    fireEvent.click(submit())
+    expect(mutate.mock.calls[0]![0]).toMatchObject({ entity: EVALS.id, preemptible: false })
   })
 
   it('explains a slash and blocks submit', () => {
@@ -90,6 +101,7 @@ describe('EntityForm (segment names, ADR 0045)', () => {
       parent: EVALS.parent,
       name: 'evals',
       quotaUcu: 7_000_000,
+      preemptible: true,
     })
   })
 

@@ -35,6 +35,8 @@ import type {
   JobFilter,
   JobList,
   JobMetadata,
+  JobPreemption,
+  NoticeSignal,
   JobPhase,
   JobState,
   JobStateKind,
@@ -131,6 +133,8 @@ const AGE_HORIZON_US = 24 * HOUR_US
  */
 const UNBOUNDED_CHARGE_INTERVAL_US = 30 * MINUTE_US
 const UNBOUNDED_RUNTIME_MULTIPLIER = 2
+/** Discount for an effectively preemptible job (ADR 0044 default policy). */
+const PREEMPTIBLE_MULTIPLIER = 0.75
 const REFUND_FRACTION = 0.75
 
 /**
@@ -303,6 +307,8 @@ interface QEntity {
   principal: string | null
   createdAtUs: number
   updatedAtUs: number
+  /** The entity's own preemption switch (ADR 0044 §1); false switches off its subtree. */
+  preemptible: boolean
   /**
    * Stored decayed-usage ring (oldest first), appended every QUOTA_BUCKET_US
    * and seeded at construction — a stable recording, never regenerated.
@@ -317,6 +323,8 @@ interface MNode {
   capacity: Resources
   labels: Record<string, string>
   schedulable: boolean
+  /** Spot capacity (ADR 0044 §4): hosts only effectively preemptible attempts. */
+  preemptibleOnly: boolean
   health: NodeHealth
   epoch: number
   lastHeartbeatUs: number | null
@@ -378,6 +386,8 @@ interface MAttempt {
   endedAtUs: number | null
   rateUcuPerSecond: number
   chargedUcu: number
+  /** Effective preemptibility recorded at placement (ADR 0044 §1). */
+  preemptible: boolean
   /** Usage samples recorded while this attempt ran (bounded ring). */
   usage: MockUsageSample[]
 }
@@ -392,6 +402,7 @@ interface JobSpecInternal {
   maxRuntimeUs: number | null
   quotaEntity: string
   retry: { maxRetries: number; retryUserErrors: boolean }
+  preemption: JobPreemption
 }
 
 interface MJob {
@@ -677,6 +688,7 @@ export class MockWorld {
       principal: fields.principal ?? null,
       createdAtUs: this.nowUs,
       updatedAtUs: this.nowUs,
+      preemptible: true,
       usageHistory: [],
       charges: [],
     }
@@ -714,6 +726,9 @@ export class MockWorld {
         origin: 'configured',
       })
       divisionEntities.set(division, ent)
+      // One division switches preemption off for its whole subtree, so the
+      // mock has jobs that opted in yet were never effectively preemptible.
+      if (division === Object.keys(TEAMS)[0]) ent.preemptible = false
     }
 
     leafSpecs.forEach((spec, i) => {
@@ -830,6 +845,7 @@ export class MockWorld {
       const draining = i === 3 // one node draining (schedulable false, still runs work)
       const lost = i === 7 // one node Lost (stale heartbeat)
       const noSampler = i === 10 // one node with no usage sampler wired up
+      const spot = i === 5 || i === 12 // two spot-only nodes (preemptible work only)
       // Two nodes advertise less than they detect, the way an operator's
       // `[capacity]` override or a system reservation does on a real cluster —
       // the case the detail view's detected column exists to explain.
@@ -857,6 +873,7 @@ export class MockWorld {
         },
         labels: { zone: this.rng.pick(zones), pool },
         schedulable: !draining,
+        preemptibleOnly: spot,
         health: lost ? 'Lost' : 'Healthy',
         epoch: lost ? this.rng.int(4, 9) : this.rng.int(1, 3),
         lastHeartbeatUs: lost
@@ -910,7 +927,7 @@ export class MockWorld {
     return free
   }
 
-  private makeSpec(): JobSpecInternal {
+  private makeSpec(): Omit<JobSpecInternal, 'preemption'> {
     const shape = this.rng.weighted(SHAPES)
     const priority = this.rng.weighted([
       [0, 6],
@@ -950,7 +967,7 @@ export class MockWorld {
     const id = this.rng.mintId('job')
     const job: MJob = {
       id,
-      spec: this.makeSpec(),
+      spec: { ...this.makeSpec(), preemption: this.makePreemption(id) },
       state,
       submittedAtUs,
       terminalAtUs: null,
@@ -1008,6 +1025,43 @@ export class MockWorld {
     return metadata
   }
 
+  /**
+   * A job's `[preemption]` declarations. Drawn from a per-job seed rather
+   * than `this.rng`, so adding them never shifts the rest of the seeded world.
+   */
+  private makePreemption(jobId: string): JobPreemption {
+    const rng = new Rng(hashSeed(jobId + 'preemption'))
+    const preemptible = rng.bool(0.5)
+    return {
+      preemptible,
+      noticeSeconds: preemptible ? rng.pick([30, 60, 60, 120, 300]) : 60,
+      noticeSignal: rng.pick<NoticeSignal>(['SIGUSR1', 'SIGUSR1', 'SIGUSR1', 'SIGTERM', 'SIGHUP']),
+    }
+  }
+
+  /** The entity and every ancestor have preemption switched on. */
+  private entityChainPreemptible(entityId: string): boolean {
+    for (
+      let cur = this.entities.get(entityId);
+      cur;
+      cur = cur.parent ? this.entities.get(cur.parent) : undefined
+    ) {
+      if (!cur.preemptible) return false
+    }
+    return true
+  }
+
+  /** What an attempt placed now would record: the job opted in and no entity switched it off. */
+  private effectivelyPreemptible(job: MJob): boolean {
+    return job.spec.preemption.preemptible && this.entityChainPreemptible(job.spec.quotaEntity)
+  }
+
+  /** Nodes that may host the job: spot-only nodes take effectively preemptible work only. */
+  private hostableNodes(job: MJob, nodes: MNode[]): MNode[] {
+    const ok = this.effectivelyPreemptible(job)
+    return nodes.filter((n) => ok || !n.preemptibleOnly)
+  }
+
   private newAttempt(job: MJob, node: string, state: AttemptState): MAttempt {
     const rate = computeRate(job.spec.requests)
     const attempt: MAttempt = {
@@ -1021,6 +1075,7 @@ export class MockWorld {
       endedAtUs: null,
       rateUcuPerSecond: rate,
       chargedUcu: 0,
+      preemptible: this.effectivelyPreemptible(job),
       usage: [],
     }
     this.attempts.set(attempt.id, attempt)
@@ -1064,13 +1119,14 @@ export class MockWorld {
 
   private buildRunningJobs(target: number): void {
     const free = this.nodeFreeCapacity()
-    const placeable = this.placeableNodes()
+    const allPlaceable = this.placeableNodes()
     let made = 0
     let attempts = 0
     while (made < target && attempts < target * 6) {
       attempts += 1
       const submittedAtUs = this.nowUs - this.rng.range(5 * MINUTE_US, 20 * HOUR_US)
       const job = this.newJob({ kind: 'Queued' }, submittedAtUs)
+      const placeable = this.hostableNodes(job, allPlaceable)
       const nodeId = this.findFit(job.spec.requests, free, placeable)
       if (!nodeId) {
         this.jobs.delete(job.id)
@@ -1095,13 +1151,14 @@ export class MockWorld {
 
   private buildFinalizingJobs(target: number): void {
     const free = this.nodeFreeCapacity()
-    const placeable = this.placeableNodes()
+    const allPlaceable = this.placeableNodes()
     let made = 0
     let tries = 0
     while (made < target && tries < target * 6) {
       tries += 1
       const submittedAtUs = this.nowUs - this.rng.range(20 * MINUTE_US, 8 * HOUR_US)
       const job = this.newJob({ kind: 'Queued' }, submittedAtUs)
+      const placeable = this.hostableNodes(job, allPlaceable)
       const nodeId = this.findFit(job.spec.requests, free, placeable)
       if (!nodeId) {
         this.jobs.delete(job.id)
@@ -1123,10 +1180,11 @@ export class MockWorld {
 
   private buildPreparingJobs(target: number): void {
     const free = this.nodeFreeCapacity()
-    const placeable = this.placeableNodes()
+    const allPlaceable = this.placeableNodes()
     for (let i = 0; i < target; i += 1) {
       const submittedAtUs = this.nowUs - this.rng.range(30 * SECOND_US, 15 * MINUTE_US)
       const job = this.newJob({ kind: 'Queued' }, submittedAtUs)
+      const placeable = this.hostableNodes(job, allPlaceable)
       // A job with free capacity lands `Ready` (fully funded, not started);
       // one that must wait accrues against the node with the most headroom
       // (partial funding) — both are pre-start, but they are different waits.
@@ -1209,7 +1267,7 @@ export class MockWorld {
 
       if (abortStory !== 0) this.maybeAddRetries(job, startedAtUs)
 
-      const node = this.rng.pick([...this.nodes.values()])
+      const node = this.rng.pick(this.hostableNodes(job, [...this.nodes.values()]))
       const attempt = this.newAttempt(job, node.id, 'Terminal')
       attempt.outcome = this.finalOutcome(state, job)
       attempt.chargedUcu = this.jobChargeModel(job).upfrontUcu
@@ -1245,7 +1303,7 @@ export class MockWorld {
   private maybeAddRetries(job: MJob, currentStartUs: number): void {
     if (job.spec.retry.maxRetries === 0 || !this.rng.bool(0.15)) return
     const retries = this.rng.int(1, job.spec.retry.maxRetries)
-    const node = this.rng.pick([...this.nodes.values()])
+    const node = this.rng.pick(this.hostableNodes(job, [...this.nodes.values()]))
     for (let r = 0; r < retries; r += 1) {
       const startedAtUs =
         currentStartUs - (retries - r) * this.rng.range(2 * MINUTE_US, 30 * MINUTE_US)
@@ -1694,7 +1752,7 @@ export class MockWorld {
       let fitCpu = Number.MAX_SAFE_INTEGER
       let accrualNode: string | null = null
       let accrualCpu = -1
-      for (const node of placeable) {
+      for (const node of this.hostableNodes(job, placeable)) {
         const f = free.get(node.id)
         if (!f) continue
         if (fitsRes(job.spec.requests, f) && f.cpuMillis < fitCpu) {
@@ -2483,6 +2541,7 @@ export class MockWorld {
         quotaEntity: job.spec.quotaEntity,
         quotaEntityPath: this.entityPath(job.spec.quotaEntity),
         retry: { ...job.spec.retry },
+        preemption: { ...job.spec.preemption },
       },
       submittedAt: at(job.submittedAtUs),
       stateSince: at(this.stateSince(job, attempt)),
@@ -2597,6 +2656,7 @@ export class MockWorld {
       endedAt: a.endedAtUs === null ? null : at(a.endedAtUs),
       rateUcuPerSecond: a.rateUcuPerSecond,
       chargedUcu: a.chargedUcu,
+      preemptible: a.preemptible,
     }
   }
 
@@ -2660,7 +2720,8 @@ export class MockWorld {
     const bounded = job.spec.maxRuntimeUs !== null
     const priorityMultiplier = this.multiplier(job.spec.priority)
     const unboundedMultiplier = bounded ? 1 : UNBOUNDED_RUNTIME_MULTIPLIER
-    const effectiveRate = base * priorityMultiplier * unboundedMultiplier
+    const preemptibleMultiplier = this.effectivelyPreemptible(job) ? PREEMPTIBLE_MULTIPLIER : 1
+    const effectiveRate = base * priorityMultiplier * unboundedMultiplier * preemptibleMultiplier
     const chargeWindowUs = job.spec.maxRuntimeUs ?? UNBOUNDED_CHARGE_INTERVAL_US
     const upfrontUcu = Math.round(effectiveRate * (chargeWindowUs / SECOND_US))
     const refundFraction = bounded ? REFUND_FRACTION : 1
@@ -2670,6 +2731,7 @@ export class MockWorld {
       bounded,
       priorityMultiplier,
       unboundedMultiplier,
+      preemptibleMultiplier,
       effectiveRate,
       chargeWindowUs,
       upfrontUcu,
@@ -2686,6 +2748,7 @@ export class MockWorld {
       rateBreakdown: { cpu: m.terms.cpu, memory: m.terms.memory, disk: m.terms.disk },
       priorityMultiplier: m.priorityMultiplier,
       unboundedMultiplier: m.unboundedMultiplier,
+      preemptibleMultiplier: m.preemptibleMultiplier,
       effectiveRateUcuPerSecond: m.effectiveRate,
       chargeWindowSeconds: secondsOf(m.chargeWindowUs),
       chargeWindowIsDefault: job.spec.maxRuntimeUs === null,
@@ -2803,6 +2866,7 @@ export class MockWorld {
       penalty: Math.max(1, ratio * ratio),
       createdAt: at(ent.createdAtUs),
       updatedAt: at(ent.updatedAtUs),
+      preemptible: ent.preemptible,
       queuedCount,
       runningCount,
     }
@@ -2912,6 +2976,7 @@ export class MockWorld {
         )
       }
       ent.quotaUcu = input.quotaUcu
+      if (input.preemptible !== undefined) ent.preemptible = input.preemptible
       ent.updatedAtUs = this.nowUs
       // usageUcu deliberately preserved — reconfiguration is not an amnesty.
       return this.buildQuotaEntityNodeFor(ent.id)
@@ -2931,6 +2996,7 @@ export class MockWorld {
       depth,
       origin: 'configured',
     })
+    if (input.preemptible !== undefined) ent.preemptible = input.preemptible
     this.seedEmptyQuotaHistory(ent)
     this.recomputeLeaves()
     return this.buildQuotaEntityNodeFor(ent.id)
@@ -2971,6 +3037,7 @@ export class MockWorld {
       used: this.nodeUsedOrNull(node.id),
       labels: { ...node.labels },
       schedulable: node.schedulable,
+      preemptibleOnly: node.preemptibleOnly,
       health: node.health,
       epoch: node.epoch,
       lastHeartbeat: node.lastHeartbeatUs === null ? null : at(node.lastHeartbeatUs),
