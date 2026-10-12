@@ -88,6 +88,24 @@ message StartJob {
   // image's own `ENV`. Writers emit ascending name order; readers accept any
   // order and reject duplicate or empty names.
   repeated coppice.core.v1.EnvVar env = 9;
+
+  // The resumption identity (ADR 0044 §2), derived by the coordinator from
+  // the job's attempt lineage and injected by the agent as the reserved
+  // `COPPICE_*` environment block, over the job's own `env` (which may not
+  // use the prefix).
+  //
+  // This attempt's position in the job's lineage: 0, 1, 2, … — counting
+  // attempts that never ran.
+  uint32 attempt_index = 10;
+  // The most recent earlier attempt that reached Running, and how it ended.
+  // Both present or both absent: absent when no earlier attempt ran.
+  coppice.core.v1.AttemptId previous_attempt = 11;
+  coppice.core.v1.AttemptOutcome previous_attempt_outcome = 12;
+  // The attempt's effective preemptibility, as recorded at placement.
+  bool preemptible = 13;
+  // The job's declared notice contract (ADR 0044 §1).
+  coppice.core.v1.NoticeSignal notice_signal = 14;
+  uint64 notice_us = 15;
 }
 
 // Stop the work under an allocation (SIGTERM, grace, SIGKILL). Idempotent,

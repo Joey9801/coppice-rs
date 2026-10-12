@@ -132,6 +132,30 @@ impl AttemptOutcome {
             Revoked | NodeLost | AgentError => OutcomeClass::Platform,
         }
     }
+
+    /// The outcome's snake_case name — `exited`, `node_lost`, `revoked`, … —
+    /// as the reserved `COPPICE_PREVIOUS_ATTEMPT_OUTCOME` variable spells it
+    /// (`docs/decisions/0044-job-preemption-and-spot-capacity.md` §2).
+    ///
+    /// The one mapping from outcome to that name, so a new outcome
+    /// (`preempted`, with the termination mechanism) is named here and
+    /// nowhere else. Data-carrying variants drop their payload: the name says
+    /// *what* happened, not the exit code.
+    pub fn name(&self) -> &'static str {
+        use AttemptOutcome::*;
+        match self {
+            Exited { .. } => "exited",
+            MemoryLimitExceeded => "memory_limit_exceeded",
+            RuntimeLimitExceeded => "runtime_limit_exceeded",
+            DiskLimitExceeded => "disk_limit_exceeded",
+            Aborted => "aborted",
+            Revoked => "revoked",
+            PullFailed { .. } => "pull_failed",
+            StartFailed { .. } => "start_failed",
+            NodeLost => "node_lost",
+            AgentError => "agent_error",
+        }
+    }
 }
 
 #[cfg(test)]
@@ -157,6 +181,16 @@ mod tests {
         assert!(Accruing.may_transition_to(&Ready));
         assert!(!Ready.may_transition_to(&Accruing));
         assert!(!Accruing.may_transition_to(&Dispatching));
+    }
+
+    #[test]
+    fn outcome_names_are_snake_case_and_drop_payloads() {
+        use AttemptOutcome::*;
+        assert_eq!(Exited { code: 3 }.name(), "exited");
+        assert_eq!(NodeLost.name(), "node_lost");
+        assert_eq!(Revoked.name(), "revoked");
+        assert_eq!(PullFailed { user_error: true }.name(), "pull_failed");
+        assert_eq!(MemoryLimitExceeded.name(), "memory_limit_exceeded");
     }
 
     #[test]

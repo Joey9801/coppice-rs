@@ -919,6 +919,17 @@ The complete list of changes outside the new modules:
    job value overlays the image's own `ENV` of the same name, and any
    image env the job does not name passes through untouched.
    `FakeExecutor` gains the same field for parity.
+   Before the `StartSpec` is built, the session lays the reserved
+   resumption-identity block of
+   [ADR 0044](../decisions/0044-job-preemption-and-spot-capacity.md) §2
+   over the job's map — `COPPICE_JOB_ID`, `COPPICE_ATTEMPT_ID`,
+   `COPPICE_ATTEMPT_INDEX`, `COPPICE_PREVIOUS_ATTEMPT_ID` and
+   `COPPICE_PREVIOUS_ATTEMPT_OUTCOME` (both unset when no earlier attempt
+   ran), `COPPICE_PREEMPTIBLE`, `COPPICE_NOTICE_SIGNAL`, `COPPICE_NOTICE_S`
+   — from `StartJob`'s identity fields. Apply refuses a job env naming the
+   `COPPICE_` prefix, so the block never shadows a user value; a
+   `StartJob` whose identity fields are malformed is dropped before the
+   journal write, like a malformed env.
 7. `Config` additions (all defaulted; a bare v1 config stays valid):
 
    ```toml

@@ -312,6 +312,11 @@ struct FakeInner {
     /// reports `Running { runtime: now - started }` like the Docker executor
     /// (`now - StartedAt`) and [`FakeExecutor::advance`] ages containers.
     started_at: std::collections::BTreeMap<AllocationId, Timestamp>,
+    /// The environment each allocation's most recent start was handed, so
+    /// tests can read what the session injected (ADR 0044 §2's reserved
+    /// block) without a real daemon.
+    started_env:
+        std::collections::BTreeMap<AllocationId, std::collections::BTreeMap<String, String>>,
     /// The fake's clock. Stamped onto stop-synthesized exits' `finished_at` and
     /// advanced by tests via [`FakeExecutor::set_now`]/[`FakeExecutor::advance`].
     /// Read from the real clock once at construction — the fake is an edge.
@@ -350,6 +355,7 @@ impl Default for FakeInner {
             usage: None,
             observe_delay: StdDuration::ZERO,
             fail_next_observe: None,
+            started_env: Default::default(),
         }
     }
 }
@@ -414,6 +420,14 @@ impl FakeExecutor {
                 .unwrap_or_else(|e| e.into_inner())
                 .push_back(ExitEvent { allocation, exit });
         }
+    }
+
+    /// The environment the most recent start for `allocation` was handed.
+    pub fn started_env(
+        &self,
+        allocation: AllocationId,
+    ) -> Option<std::collections::BTreeMap<String, String>> {
+        self.lock().started_env.get(&allocation).cloned()
     }
 
     /// Whether a container for `allocation` is currently running.
@@ -489,6 +503,7 @@ impl Executor for FakeExecutor {
         *inner.start_counts.entry(spec.allocation).or_insert(0) += 1;
         let now = inner.now;
         inner.started_at.insert(spec.allocation, now);
+        inner.started_env.insert(spec.allocation, spec.env.clone());
         inner.running.insert(
             spec.allocation,
             ObservedContainer {

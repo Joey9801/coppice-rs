@@ -526,10 +526,22 @@ impl<F: Fs, E: Executor> Session<F, E> {
         // Parsed and validated BEFORE the journal write: a malformed env
         // (duplicate or empty name) must never leave a journaled intent
         // behind for a container that will never start.
-        let Some(env) = start_env(&sj) else {
+        let Some(mut env) = start_env(&sj) else {
             tracing::warn!(node = %self.node, %alloc, "dropping malformed StartJob (duplicate or empty env name)");
             return Ok(Vec::new());
         };
+        // The reserved resumption-identity block (ADR 0044 §2), laid over the
+        // job's own env — which apply guarantees holds no `COPPICE_` name, so
+        // nothing is shadowed — under the same before-the-journal rule.
+        let Some(identity) = resumption_env(&sj) else {
+            tracing::warn!(node = %self.node, %alloc, "dropping malformed StartJob (resumption identity)");
+            return Ok(Vec::new());
+        };
+        env.extend(
+            identity
+                .into_iter()
+                .map(|(name, value)| (name.to_string(), value)),
+        );
 
         if self.drained {
             tracing::info!(node = %self.node, %alloc, "starting committed StartJob while drained (intent predates the drain)");
@@ -1020,6 +1032,53 @@ fn start_env(sj: &pb::StartJob) -> Option<std::collections::BTreeMap<String, Str
         }
     }
     Some(env)
+}
+
+/// The reserved `COPPICE_*` environment block of ADR 0044 §2 — the
+/// *resumption identity* — built from a `StartJob`'s identity fields, in
+/// ascending name order.
+///
+/// `COPPICE_PREVIOUS_ATTEMPT_ID` and `_OUTCOME` are set together or not at
+/// all. `None` for a malformed command: an id that does not parse, a
+/// previous id without its outcome (or the reverse), or a notice signal
+/// outside the closed allowlist — the caller drops such a `StartJob` before
+/// journaling anything, as it does a malformed env.
+pub fn resumption_env(sj: &pb::StartJob) -> Option<Vec<(&'static str, String)>> {
+    use coppice_core::env::reserved;
+    let job: JobId = sj.job.clone()?.try_into().ok()?;
+    let attempt: AttemptId = sj.attempt.clone()?.try_into().ok()?;
+    let signal =
+        coppice_proto::convert::notice_signal_from_pb(sj.notice_signal, "StartJob.notice_signal")
+            .ok()?;
+    let previous = match (&sj.previous_attempt, &sj.previous_attempt_outcome) {
+        (None, None) => None,
+        (Some(id), Some(outcome)) => {
+            let id: AttemptId = id.clone().try_into().ok()?;
+            let outcome: AttemptOutcome = (*outcome).try_into().ok()?;
+            Some((id, outcome))
+        }
+        _ => return None,
+    };
+    let mut block = vec![
+        (reserved::ATTEMPT_ID, attempt.to_string()),
+        (reserved::ATTEMPT_INDEX, sj.attempt_index.to_string()),
+        (reserved::JOB_ID, job.to_string()),
+        (reserved::NOTICE_S, (sj.notice_us / 1_000_000).to_string()),
+        (reserved::NOTICE_SIGNAL, signal.name().to_string()),
+        (
+            reserved::PREEMPTIBLE,
+            if sj.preemptible { "1" } else { "0" }.to_string(),
+        ),
+    ];
+    if let Some((id, outcome)) = previous {
+        block.push((reserved::PREVIOUS_ATTEMPT_ID, id.to_string()));
+        block.push((
+            reserved::PREVIOUS_ATTEMPT_OUTCOME,
+            outcome.name().to_string(),
+        ));
+    }
+    block.sort_unstable_by_key(|(name, _)| *name);
+    Some(block)
 }
 
 /// The agent's **accountable live work** over a recovered journal state

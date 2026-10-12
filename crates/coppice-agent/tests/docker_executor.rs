@@ -3802,3 +3802,63 @@ fn is_ascending_suffix(lines: &[String], prefix: &str) -> bool {
     }
     true
 }
+
+/// The reserved resumption-identity block (ADR 0044 §2) reaches PID 1.
+///
+/// Built by the session's own `resumption_env` from a `StartJob` — the exact
+/// function the live start path calls before the `StartSpec` exists — and
+/// laid over the job's env the same way. The container checks every value
+/// itself, and that the previous pair is unset rather than empty for a first
+/// attempt, so exit 0 is the whole assertion.
+#[tokio::test]
+async fn resumption_identity_reaches_the_container() {
+    use coppice_proto::pb::agent::v1 as pbagent;
+    use coppice_proto::pb::core::v1 as pbcore;
+
+    let Some(docker) = harness::docker().await else {
+        return;
+    };
+    let (exec, _tx) = harness::executor(docker).await;
+    let mut sp = harness::spec(harness::BUSYBOX, &["true"], Resources::ZERO);
+    let sj = pbagent::StartJob {
+        job: Some(sp.job.into()),
+        attempt: Some(sp.attempt.into()),
+        attempt_index: 0,
+        preemptible: true,
+        notice_signal: pbcore::NoticeSignal::Sigusr2 as i32,
+        notice_us: 90_000_000,
+        ..Default::default()
+    };
+    let block = coppice_agent::session::resumption_env(&sj).expect("well-formed StartJob");
+    sp.env = [("USER_VAR".to_string(), "kept".to_string())]
+        .into_iter()
+        .chain(block.into_iter().map(|(k, v)| (k.to_string(), v)))
+        .collect();
+    let script = format!(
+        "test \"$COPPICE_JOB_ID\" = {job} && test \"$COPPICE_ATTEMPT_ID\" = {attempt} \
+         && test \"$COPPICE_ATTEMPT_INDEX\" = 0 && test \"$COPPICE_PREEMPTIBLE\" = 1 \
+         && test \"$COPPICE_NOTICE_SIGNAL\" = SIGUSR2 && test \"$COPPICE_NOTICE_S\" = 90 \
+         && test -z \"${{COPPICE_PREVIOUS_ATTEMPT_ID+set}}\" \
+         && test -z \"${{COPPICE_PREVIOUS_ATTEMPT_OUTCOME+set}}\" \
+         && test \"$USER_VAR\" = kept",
+        job = sp.job,
+        attempt = sp.attempt,
+    );
+    sp.command = vec!["sh".into(), "-c".into(), script];
+    let alloc = sp.allocation;
+
+    let r: anyhow::Result<()> = async {
+        exec.start(sp).await?;
+        let info = harness::wait_exit(&exec, alloc, 30).await?;
+        ensure!(
+            info.code == 0,
+            "the container did not see the resumption identity (exit {})",
+            info.code
+        );
+        Ok(())
+    }
+    .await;
+
+    harness::cleanup(&exec, &[alloc]).await;
+    r.unwrap();
+}
