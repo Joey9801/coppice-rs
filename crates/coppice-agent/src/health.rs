@@ -10,15 +10,18 @@
 //! the process is serving. `/readyz` is the *readiness* probe; its phase is
 //! decided by this fixed precedence, first arm that holds wins:
 //!
-//! 1. **`draining`** — the shutdown flag is set. Wins over everything else,
+//! 1. **`interrupted`** — the agent is running an interruption drain plan
+//!    (ADR 0044 §5). Wins over everything else, a shutdown drain included:
+//!    the host is going whatever else happens.
+//! 2. **`draining`** — the shutdown flag is set. Wins over everything below,
 //!    including a healthy registered session, since `running` is the work a
 //!    lifecycle hook polls down to zero.
-//! 2. **`starting` / `reconnecting`** — not registered on a live stream;
+//! 3. **`starting` / `reconnecting`** — not registered on a live stream;
 //!    `starting` before the first registration of this process's life,
 //!    `reconnecting` after.
-//! 3. **`docker-unavailable`** — registered, but the most recent `observe()`
+//! 4. **`docker-unavailable`** — registered, but the most recent `observe()`
 //!    failed.
-//! 4. **`ready`** — registered on a live session with a reachable daemon. The
+//! 5. **`ready`** — registered on a live session with a reachable daemon. The
 //!    only phase that answers 200.
 
 use std::sync::{Arc, Mutex};
@@ -37,6 +40,7 @@ struct State {
     ever_registered: bool,
     docker_ok: bool,
     draining: bool,
+    interrupted: bool,
     running: usize,
 }
 
@@ -49,6 +53,8 @@ pub struct Readiness {
     pub registered: bool,
     pub docker_ok: bool,
     pub draining: bool,
+    /// Whether an interruption drain plan is active (ADR 0044 §5).
+    pub interrupted: bool,
     /// Allocations this agent is still accountable for — the number a drain
     /// waits down to zero.
     pub running: usize,
@@ -66,6 +72,7 @@ pub enum Phase {
     Reconnecting,
     DockerUnavailable,
     Draining,
+    Interrupted,
 }
 
 impl Readiness {
@@ -87,6 +94,7 @@ impl AgentHealth {
             ever_registered: false,
             docker_ok: true,
             draining: false,
+            interrupted: false,
             running: 0,
         })))
     }
@@ -117,6 +125,13 @@ impl AgentHealth {
         self.with(|s| s.draining = draining);
     }
 
+    /// Whether an interruption drain plan is active (ADR 0044 §5): set when a
+    /// notice starts one, cleared only when a restarted agent retires a plan
+    /// whose deadline has passed.
+    pub fn set_interrupted(&self, interrupted: bool) {
+        self.with(|s| s.interrupted = interrupted);
+    }
+
     /// How much accountable live work is outstanding
     /// ([`crate::session::outstanding_live_work`]).
     pub fn set_running(&self, running: usize) {
@@ -127,7 +142,12 @@ impl AgentHealth {
     /// the top of this module.
     pub fn readiness(&self) -> Readiness {
         self.with(|s| {
-            let (phase, reason) = if s.draining {
+            let (phase, reason) = if s.interrupted {
+                (
+                    Phase::Interrupted,
+                    "host interruption: every attempt notified, stopping before the provider deadline",
+                )
+            } else if s.draining {
                 (
                     Phase::Draining,
                     "shutting down: draining, not accepting new placements",
@@ -161,6 +181,7 @@ impl AgentHealth {
                 registered: s.registered,
                 docker_ok: s.docker_ok,
                 draining: s.draining,
+                interrupted: s.interrupted,
                 running: s.running,
                 reason,
             }
@@ -222,6 +243,22 @@ mod tests {
         // ...including over a lost session and a dead daemon.
         health.set_registered(false);
         health.set_docker_ok(false);
+        assert_eq!(health.readiness().phase, Phase::Draining);
+    }
+
+    #[test]
+    fn an_interruption_wins_over_a_shutdown_drain() {
+        let health = health();
+        health.set_registered(true);
+        health.set_draining(true);
+        health.set_interrupted(true);
+        let readiness = health.readiness();
+        assert_eq!(readiness.phase, Phase::Interrupted);
+        assert!(readiness.interrupted && readiness.draining);
+        assert!(!readiness.is_ready());
+        let body = serde_json::to_value(readiness).expect("serialize readiness");
+        assert_eq!(body["phase"], "interrupted");
+        health.set_interrupted(false);
         assert_eq!(health.readiness().phase, Phase::Draining);
     }
 

@@ -28,7 +28,9 @@ use coppice_core::time::{Duration, Timestamp};
 use coppice_proto::pb::agent::v1 as pb;
 use coppice_proto::pb::core::v1 as pbcore;
 
-use crate::executor::{classify_exit, Executor, ExitCause, ExitInfo, StartSpec, StopOutcome};
+use crate::executor::{
+    classify_exit, Attribution, Executor, ExitCause, ExitInfo, StartSpec, StopOutcome,
+};
 use crate::journal::{ExitRec, IntentRec, Journal, JournalState, TombstoneReason, Watermark};
 use crate::observed::{build_observed_set, ObservedAllocation};
 
@@ -127,6 +129,24 @@ pub struct Session<F: Fs, E: Executor> {
     /// never given one — every unit test, and `coppice dev`. Nothing in the
     /// session's own decisions reads it back: it is a report, not state.
     health: Option<crate::health::AgentHealth>,
+    /// Starts handed to the live loop and not yet finished.
+    starting: std::collections::BTreeSet<AllocationId>,
+    pending_starts: Vec<StartSpec>,
+    /// Stops handed to the live loop and not yet finished, so a stop is never
+    /// spawned twice. Not durable: a restart finds the journaled tombstone and
+    /// runs the stop again.
+    stopping: std::collections::BTreeSet<AllocationId>,
+    pending_stops: Vec<notice::StopRequest>,
+    /// Natural exits observed while our stop of the same allocation was in
+    /// flight, held for the stop's result (see [`Session::finish_stop`]).
+    deferred_exits: std::collections::BTreeMap<AllocationId, ExitInfo>,
+    /// Stops that found no container: never retried this session.
+    stop_abandoned: std::collections::BTreeSet<AllocationId>,
+    stop_retry_at: std::collections::BTreeMap<AllocationId, Timestamp>,
+    /// Whether an interruption source is configured; gates the sizing warning.
+    interruption_source: bool,
+    /// The `(notice, abort_grace)` pairs already warned about.
+    sizing_warned: std::collections::BTreeSet<(Duration, Duration)>,
 }
 
 impl<F: Fs, E: Executor> Session<F, E> {
@@ -159,6 +179,15 @@ impl<F: Fs, E: Executor> Session<F, E> {
             detected_capacity: None,
             preemptible_only: false,
             health: None,
+            starting: Default::default(),
+            pending_starts: Vec::new(),
+            stopping: Default::default(),
+            pending_stops: Vec::new(),
+            deferred_exits: Default::default(),
+            stop_abandoned: Default::default(),
+            stop_retry_at: Default::default(),
+            interruption_source: false,
+            sizing_warned: Default::default(),
         }
     }
 
@@ -167,8 +196,16 @@ impl<F: Fs, E: Executor> Session<F, E> {
     /// the daemon supplies one.
     pub fn with_health(mut self, health: crate::health::AgentHealth) -> Session<F, E> {
         health.set_draining(self.draining);
+        health.set_interrupted(self.interruption_deadline().is_some());
         health.set_running(self.outstanding_live_work().len());
         self.health = Some(health);
+        self
+    }
+
+    /// Enables the StartJob notice-sizing warning; the source itself is
+    /// driven by the live loop.
+    pub fn with_interruption_source(mut self, enabled: bool) -> Session<F, E> {
+        self.interruption_source = enabled;
         self
     }
 
@@ -284,6 +321,18 @@ impl<F: Fs, E: Executor> Session<F, E> {
         std::mem::take(&mut self.armed_watchdogs)
     }
 
+    /// Drain the queued starts, for the loop to run on their own tasks; each
+    /// result comes back through [`Session::finish_start`].
+    pub fn take_pending_starts(&mut self) -> Vec<StartSpec> {
+        std::mem::take(&mut self.pending_starts)
+    }
+
+    /// Drain the queued stops; each result comes back through
+    /// [`Session::finish_stop`].
+    pub fn take_pending_stops(&mut self) -> Vec<notice::StopRequest> {
+        std::mem::take(&mut self.pending_stops)
+    }
+
     /// Drain the reaps queued since the last call — journaled exits whose
     /// containers are debris the loop should remove once the accompanying
     /// reports are on the wire (see [`Session::pending_reaps`]). The janitor
@@ -393,8 +442,24 @@ impl<F: Fs, E: Executor> Session<F, E> {
                 Vec::new()
             }
         };
-        let observed = build_observed_set(&self.state, &runtime);
-        let allocations = observed.iter().map(observed_to_pb).collect();
+        let mut observed = build_observed_set(&self.state, &runtime);
+        // A start or stop in flight is unresolved, not terminal (a start has
+        // no container yet; an exit during our stop is the stop's to
+        // classify). Reported with no outcome, which the coordinator neither
+        // adopts nor loses; the AttemptStatus from `finish_start` /
+        // `finish_stop` follows.
+        for o in &mut observed {
+            let in_flight =
+                self.starting.contains(&o.allocation) || self.stopping.contains(&o.allocation);
+            if in_flight && !o.running && !self.state.exits.contains_key(&o.allocation) {
+                o.outcome = None;
+            }
+        }
+        let now = Timestamp::now();
+        let allocations = observed
+            .iter()
+            .map(|o| self.observed_to_pb(o, now))
+            .collect();
 
         // Recovery reap (§5): an exited container whose exit is already
         // journaled is spent evidence — remove it. Exited containers with no
@@ -456,6 +521,10 @@ impl<F: Fs, E: Executor> Session<F, E> {
                 job,
             }) = start_ids(&sj)
             {
+                // A start still in flight reports when it finishes.
+                if self.starting.contains(&alloc) {
+                    return Ok(Vec::new());
+                }
                 return Ok(self.report_current_status(alloc, attempt, job));
             }
         }
@@ -520,18 +589,25 @@ impl<F: Fs, E: Executor> Session<F, E> {
                     exit.runtime,
                 )]);
             }
+            // Refused: resolves as the command that wrote the tombstone — an
+            // abort, or the agent's own preemption stop (ADR 0044 §3).
+            let outcome = self.state.tombstones[&alloc].outcome();
             return Ok(vec![self.terminal_status(
                 alloc,
                 attempt,
                 job,
-                AttemptOutcome::Aborted,
+                outcome,
                 Duration::ZERO,
             )]);
         }
 
         // Already journaled → idempotent: re-report current status, never
-        // re-execute (ADR 0009).
+        // re-execute (ADR 0009). A start still in flight reports when it
+        // finishes.
         if self.state.intents.contains_key(&alloc) {
+            if self.starting.contains(&alloc) {
+                return Ok(Vec::new());
+            }
             return Ok(self.report_current_status(alloc, attempt, job));
         }
 
@@ -581,6 +657,7 @@ impl<F: Fs, E: Executor> Session<F, E> {
         };
         self.journal.journal_intent(&intent)?;
         self.state.intents.insert(alloc, intent);
+        self.warn_notice_sizing(&intent);
 
         let max_runtime = intent.max_runtime;
         let spec = StartSpec {
@@ -597,16 +674,53 @@ impl<F: Fs, E: Executor> Session<F, E> {
                 .unwrap_or(Resources::ZERO),
             max_runtime,
         };
-        match self.executor.start(spec).await {
+        // The intent is durable; the start itself (an image pull can take
+        // minutes) runs on the loop's own task, and its result comes back
+        // through `finish_start`.
+        self.starting.insert(alloc);
+        self.pending_starts.push(spec);
+        Ok(Vec::new())
+    }
+
+    /// A spawned `executor.start` finished: report `Running` (arming the
+    /// max-runtime watchdog), or journal and report the start failure.
+    ///
+    /// A tombstone written while the start was in flight gets its stop now.
+    /// Under an active plan the attempt is notified only now: a signal before
+    /// the container exists would be lost, and a mark without it would claim
+    /// a notice that was never given.
+    pub async fn finish_start(
+        &mut self,
+        alloc: AllocationId,
+        result: Result<(), crate::executor::StartError>,
+        now: Timestamp,
+    ) -> std::io::Result<Vec<pb::AgentReport>> {
+        if !self.starting.remove(&alloc) {
+            return Ok(Vec::new());
+        }
+        let Some(intent) = self.state.intents.get(&alloc).copied() else {
+            return Ok(Vec::new());
+        };
+        let (attempt, job) = (intent.attempt, intent.job);
+        if self.state.exits.contains_key(&alloc) {
+            return Ok(Vec::new());
+        }
+        match result {
             Ok(()) => {
-                if let Some(max) = max_runtime {
+                if let Some(max) = intent.max_runtime {
                     self.armed_watchdogs.push(ArmedWatchdog {
                         allocation: alloc,
                         fires_after: max,
                         measured_at: tokio::time::Instant::now(),
                     });
                 }
-                Ok(vec![self.running_status(alloc, attempt, job)])
+                let mut reports = vec![self.running_status(alloc, attempt, job)];
+                if self.state.tombstones.contains_key(&alloc) {
+                    self.queue_stop(alloc, intent.abort_grace);
+                } else if self.state.plan.is_some() {
+                    reports.extend(self.notify_under_plan(alloc, now).await?);
+                }
+                Ok(reports)
             }
             Err(e) => {
                 let outcome = e.outcome();
@@ -650,25 +764,24 @@ impl<F: Fs, E: Executor> Session<F, E> {
             )]);
         }
 
-        // We believe it is running (intent, no exit) → stop and classify.
-        if let Some(intent) = self.state.intents.get(&alloc).copied() {
-            return self
-                .stop_and_classify(
-                    alloc,
-                    intent.attempt,
-                    intent.job,
-                    grace,
-                    AttemptOutcome::Aborted,
-                )
-                .await;
+        // We believe it is running (intent, no exit) → stop it on the loop's
+        // own task; `finish_stop` classifies with the tombstone's `Aborted`.
+        // A start still in flight gets its stop when it finishes, and a stop
+        // already in flight (a preemption's) now resolves as the abort.
+        if self.state.intents.contains_key(&alloc) {
+            if !self.starting.contains(&alloc) && !self.stopping.contains(&alloc) {
+                self.queue_stop(alloc, grace);
+            }
+            return Ok(Vec::new());
         }
 
         tracing::info!(node = %self.node, %alloc, "stop for unknown allocation; tombstone journaled, nothing running");
         Ok(Vec::new())
     }
 
-    /// Stop a container and classify per truth-wins-the-race (ADR 0013):
-    /// `kill_outcome` (Aborted or RuntimeLimitExceeded) applies only if *our*
+    /// Stop a container inline and classify per truth-wins-the-race (ADR
+    /// 0013) — the max-runtime watchdog's zero-grace kill, the one stop still
+    /// awaited in place: `kill_outcome` applies only if *our*
     /// stop terminated it; if it had already exited, the natural outcome wins.
     async fn stop_and_classify(
         &mut self,
@@ -679,48 +792,15 @@ impl<F: Fs, E: Executor> Session<F, E> {
         kill_outcome: AttemptOutcome,
     ) -> std::io::Result<Vec<pb::AgentReport>> {
         match self.executor.stop(alloc, grace).await {
-            Ok(StopOutcome::Stopped(exit)) => {
-                // Carve-out on the stopped path (docker-executor.md §4): if the
-                // evidence shows a limit kill (kernel OOM, disk enforcer) landed
-                // as our stop took effect, that kill wins over `kill_outcome` —
-                // the terminal state must never claim our stop terminated a
-                // container that policy had already killed.
-                let outcome = match exit.cause {
-                    // `Killed` cannot reach this arm today — the stop's
-                    // post-inspect is deliberately not settled (§4), and only a
-                    // settle produces it — but if it ever did, our stop is
-                    // still the best attribution we hold: an unattributable
-                    // SIGKILL landing as our own stop takes effect is exactly
-                    // the TERM-grace window ADR 0013 assigns to the stop.
-                    ExitCause::Natural | ExitCause::Killed => kill_outcome,
-                    ExitCause::OomKilled | ExitCause::DiskKilled => classify_exit(&exit, false),
-                };
-                self.record_exit(alloc, attempt, job, outcome.clone(), exit.runtime)?;
+            Ok(stopped @ (StopOutcome::Stopped(_) | StopOutcome::AlreadyExited(_))) => {
+                let attribution = self.state.attribution(&alloc);
+                let (outcome, runtime) = classify_stop(&stopped, kill_outcome, attribution)
+                    .expect("a stopped or already-exited outcome always classifies");
+                self.record_exit(alloc, attempt, job, outcome.clone(), runtime)?;
                 self.pending_reaps.push(alloc);
-                Ok(vec![self.terminal_status(
-                    alloc,
-                    attempt,
-                    job,
-                    outcome,
-                    exit.runtime,
-                )])
-            }
-            Ok(StopOutcome::AlreadyExited(exit)) => {
-                // StopJob's tombstone resolves an unattributable SIGKILL even
-                // when Docker observed the kill just before this command. This
-                // deliberately makes the same attribution trade as a process
-                // exiting during TERM grace. The max-runtime path passes false:
-                // it has no equivalent durable marker.
-                let outcome = classify_exit(&exit, kill_outcome == AttemptOutcome::Aborted);
-                self.record_exit(alloc, attempt, job, outcome.clone(), exit.runtime)?;
-                self.pending_reaps.push(alloc);
-                Ok(vec![self.terminal_status(
-                    alloc,
-                    attempt,
-                    job,
-                    outcome,
-                    exit.runtime,
-                )])
+                Ok(vec![
+                    self.terminal_status(alloc, attempt, job, outcome, runtime)
+                ])
             }
             Ok(StopOutcome::Unknown) => {
                 tracing::warn!(node = %self.node, %alloc, "stop: executor has no record of the container");
@@ -743,6 +823,13 @@ impl<F: Fs, E: Executor> Session<F, E> {
         alloc: AllocationId,
     ) -> std::io::Result<Vec<pb::AgentReport>> {
         if self.state.exits.contains_key(&alloc) {
+            return Ok(Vec::new());
+        }
+        // A stop already in flight (an abort's or a preemption's) got there
+        // first: it will classify the end (ADR 0044 §2, "breaches max_runtime
+        // first"). A start still in flight has no container to kill yet; its
+        // watchdog is armed only once it has one.
+        if self.stopping.contains(&alloc) || self.starting.contains(&alloc) {
             return Ok(Vec::new());
         }
         let Some(intent) = self.state.intents.get(&alloc).copied() else {
@@ -772,7 +859,15 @@ impl<F: Fs, E: Executor> Session<F, E> {
             tracing::warn!(node = %self.node, %alloc, "observed exit for an allocation with no intent; ignoring");
             return Ok(Vec::new());
         };
-        let outcome = classify_exit(&exit, self.state.tombstones.contains_key(&alloc));
+        // Our stop is in flight: an exit now is one our SIGTERM may have
+        // caused, and the stop's own answer decides it (ADR 0013). Held for
+        // `finish_stop`, which falls back to it only if the stop cannot say.
+        if self.stopping.contains(&alloc) {
+            self.deferred_exits.insert(alloc, exit);
+            return Ok(Vec::new());
+        }
+        let outcome = classify_exit(&exit, &self.state.attribution(&alloc));
+        self.stop_retry_at.remove(&alloc);
         self.record_exit(
             alloc,
             intent.attempt,
@@ -841,11 +936,14 @@ impl<F: Fs, E: Executor> Session<F, E> {
                 detected_capacity: self.detected_capacity.as_ref().map(Into::into),
                 // Registration rewrites the replicated flag, so a session that
                 // is not draining clears a stale announcement here (ADR 0041).
-                draining: self.draining,
+                // An active interruption plan is a drain too (ADR 0044 §5).
+                draining: self.announces_draining(),
                 // Spot-only (ADR 0044 §4); registration rewrites the
                 // replicated flag, so a config change takes effect on restart.
                 preemptible_only: self.preemptible_only,
-                interruption_deadline_us: None,
+                // Display-only (the coordinator plans against marks, never
+                // this); rewritten by registration like `draining`.
+                interruption_deadline_us: self.interruption_deadline().map(Timestamp::as_micros),
             })),
         }
     }
@@ -916,8 +1014,8 @@ impl<F: Fs, E: Executor> Session<F, E> {
             running,
             image_cache: Some(self.executor.cache_inventory()),
             used,
-            draining: self.draining,
-            interruption_deadline_us: None,
+            draining: self.announces_draining(),
+            interruption_deadline_us: self.interruption_deadline().map(Timestamp::as_micros),
         }))
     }
 
@@ -937,12 +1035,12 @@ impl<F: Fs, E: Executor> Session<F, E> {
                 exit.runtime,
             )];
         }
-        if self.state.tombstones.contains_key(&alloc) {
+        if let Some(reason) = self.state.tombstones.get(&alloc) {
             return vec![self.terminal_status(
                 alloc,
                 attempt,
                 job,
-                AttemptOutcome::Aborted,
+                reason.outcome(),
                 Duration::ZERO,
             )];
         }
@@ -977,6 +1075,42 @@ impl<F: Fs, E: Executor> Session<F, E> {
         self.journal.journal_exit(&exit)?;
         self.state.exits.insert(alloc, exit);
         Ok(())
+    }
+
+    /// [`Session::handle_command`] with every start and stop it queued run to
+    /// completion in place — the unit suite's stand-in for the live loop,
+    /// which spawns them. Clock read at the edge, as the loop does.
+    #[cfg(test)]
+    pub(crate) async fn handle_command_settled(
+        &mut self,
+        cmd: pb::AgentCommand,
+    ) -> std::io::Result<Vec<pb::AgentReport>> {
+        let mut reports = self.handle_command(cmd).await?;
+        reports.extend(self.settle().await?);
+        Ok(reports)
+    }
+
+    /// Run every queued start and stop in place until none is left (a
+    /// finished start can queue a stop).
+    #[cfg(test)]
+    pub(crate) async fn settle(&mut self) -> std::io::Result<Vec<pb::AgentReport>> {
+        let mut reports = Vec::new();
+        loop {
+            let starts = self.take_pending_starts();
+            let stops = self.take_pending_stops();
+            if starts.is_empty() && stops.is_empty() {
+                return Ok(reports);
+            }
+            for spec in starts {
+                let alloc = spec.allocation;
+                let result = self.executor.start(spec).await;
+                reports.extend(self.finish_start(alloc, result, Timestamp::now()).await?);
+            }
+            for stop in stops {
+                let result = self.executor.stop(stop.allocation, stop.grace).await;
+                reports.extend(self.finish_stop(stop.allocation, result, Timestamp::now())?);
+            }
+        }
     }
 
     fn report(&self, body: pb::agent_report::Body) -> pb::AgentReport {
@@ -1118,8 +1252,10 @@ pub fn resumption_env(sj: &pb::StartJob) -> Option<Vec<(&'static str, String)>> 
 /// follows ([`Session::heartbeat_report`]) rather than a runtime query: a
 /// container the daemon already reports `Exited` is still ours until its exit
 /// is journaled and reported, so the two can never disagree about whether this
-/// agent still owes a terminal report. A tombstoned allocation never has an
-/// intent, so tombstones need no arm here.
+/// agent still owes a terminal report. Tombstones need no arm: a tombstoned
+/// allocation with an intent (a `StopJob` or preemption stop under way) is
+/// still live until its exit is journaled, and one without an intent never
+/// started here.
 ///
 /// A list rather than a count: the drain names the allocations it gave up on.
 pub fn outstanding_live_work(state: &JournalState) -> Vec<AllocationId> {
@@ -1131,17 +1267,73 @@ pub fn outstanding_live_work(state: &JournalState) -> Vec<AllocationId> {
         .collect()
 }
 
-fn observed_to_pb(o: &ObservedAllocation) -> pb::ObservedAllocation {
-    pb::ObservedAllocation {
-        allocation: Some(o.allocation.into()),
-        attempt: Some(o.attempt.into()),
-        job: Some(o.job.into()),
-        running: o.running,
-        outcome: o.outcome.as_ref().map(|oc| oc.into()),
-        runtime_us: o.runtime.as_micros() as u64,
-        notice: None,
+impl<F: Fs, E: Executor> Session<F, E> {
+    /// One ObservedSet entry on the wire. A running allocation with a notice
+    /// mark in force repeats it (ADR 0044 §3), `remaining` recomputed from now.
+    fn observed_to_pb(&self, o: &ObservedAllocation, now: Timestamp) -> pb::ObservedAllocation {
+        let notice = if o.running {
+            self.notice_payload(o.allocation, now)
+                .map(|(reason, remaining, shortfall)| pb::ObservedNotice {
+                    reason: Some(reason.into()),
+                    remaining_us: remaining,
+                    shortfall_us: shortfall,
+                })
+        } else {
+            None
+        };
+        pb::ObservedAllocation {
+            allocation: Some(o.allocation.into()),
+            attempt: Some(o.attempt.into()),
+            job: Some(o.job.into()),
+            running: o.running,
+            outcome: o.outcome.as_ref().map(|oc| oc.into()),
+            runtime_us: o.runtime.as_micros() as u64,
+            notice,
+        }
     }
 }
+
+/// Classify the end of a stop the agent ran (ADR 0013's *truth wins the race*),
+/// with the outcome and runtime to journal; `None` for an
+/// [`StopOutcome::Unknown`], which has nothing to classify.
+///
+/// `kill_outcome` (`Aborted`, `RuntimeLimitExceeded`, or `Preempted`) applies
+/// only if *our* stop terminated the container. On the stopped path a limit
+/// kill in the evidence (kernel OOM, disk enforcer) still wins — the terminal
+/// state must never claim our stop terminated a container policy had already
+/// killed (docker-executor.md §4's carve-out). A container that had already
+/// exited is classified from its evidence and the journal's [`Attribution`]: a
+/// tombstone resolves an unattributable SIGKILL even when Docker observed the
+/// kill just before our stop (the same trade as a process exiting during TERM
+/// grace), and a notice intent makes a non-zero exit `Preempted`.
+pub(crate) fn classify_stop(
+    stopped: &StopOutcome,
+    kill_outcome: AttemptOutcome,
+    attribution: Attribution,
+) -> Option<(AttemptOutcome, Duration)> {
+    match stopped {
+        StopOutcome::Stopped(exit) => {
+            let outcome = match exit.cause {
+                // `Killed` cannot reach this arm today — the stop's
+                // post-inspect is deliberately not settled (§4), and only a
+                // settle produces it — but if it ever did, our stop is still
+                // the best attribution we hold: an unattributable SIGKILL
+                // landing as our own stop takes effect is exactly the
+                // TERM-grace window ADR 0013 assigns to the stop.
+                ExitCause::Natural | ExitCause::Killed => kill_outcome,
+                ExitCause::OomKilled | ExitCause::DiskKilled => {
+                    classify_exit(exit, &Attribution::default())
+                }
+            };
+            Some((outcome, exit.runtime))
+        }
+        StopOutcome::AlreadyExited(exit) => Some((classify_exit(exit, &attribution), exit.runtime)),
+        StopOutcome::Unknown => None,
+    }
+}
+
+mod notice;
+pub use notice::{StopRequest, DRAIN_CLEANUP_MARGIN};
 
 #[cfg(test)]
 mod tests;

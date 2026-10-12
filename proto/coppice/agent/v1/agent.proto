@@ -278,7 +278,10 @@ message ObservedAllocation {
   coppice.core.v1.AttemptId attempt = 2;
   coppice.core.v1.JobId job = 3;
   // True if the container is running; false if it exited and `outcome`
-  // records how.
+  // records how. False with `outcome` absent means *unresolved*: this agent
+  // process is still starting the container, or its own stop of it is still
+  // in flight, and its AttemptStatus will follow. The coordinator neither
+  // adopts nor loses such an allocation.
   bool running = 4;
   coppice.core.v1.AttemptOutcome outcome = 5;
   uint64 runtime_us = 6;

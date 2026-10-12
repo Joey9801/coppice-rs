@@ -20,6 +20,8 @@ use crate::session::ArmedWatchdog;
 
 use super::Session;
 
+mod notice;
+
 /// Whether the fake executor still shows a container for `alloc` (running or
 /// exited) — the witness that a reap did or didn't happen.
 async fn observes(exec: &FakeExecutor, alloc: AllocationId) -> bool {
@@ -141,7 +143,7 @@ fn is_running_report(reports: &[pb::AgentReport]) -> bool {
 
 async fn register(session: &mut TestSession, term: u64, epoch: u64, seq: u64) {
     let reports = session
-        .handle_command(command(
+        .handle_command_settled(command(
             term,
             epoch,
             seq,
@@ -163,7 +165,7 @@ async fn command_before_registration_is_dropped() {
     let alloc = AllocationId::new();
     // No RegisterAccepted yet: a StartJob is dropped (fail closed).
     let reports = session
-        .handle_command(command(
+        .handle_command_settled(command(
             1,
             1,
             1,
@@ -182,7 +184,7 @@ async fn fencing_rejects_lower_term_and_epoch() {
 
     // Lower term → rejected: drain flag stays false.
     session
-        .handle_command(command(
+        .handle_command_settled(command(
             4,
             3,
             2,
@@ -197,7 +199,7 @@ async fn fencing_rejects_lower_term_and_epoch() {
 
     // Lower epoch → rejected.
     session
-        .handle_command(command(
+        .handle_command_settled(command(
             5,
             2,
             2,
@@ -212,7 +214,7 @@ async fn fencing_rejects_lower_term_and_epoch() {
 
     // Equal token, fresh seq → accepted.
     session
-        .handle_command(command(
+        .handle_command_settled(command(
             5,
             3,
             2,
@@ -231,7 +233,7 @@ async fn raising_token_resets_the_sequence_space() {
     let alloc = AllocationId::new();
     // A StopJob at a seq below the watermark is a duplicate (no tombstone).
     session
-        .handle_command(command(1, 1, 3, stop_job(alloc)))
+        .handle_command_settled(command(1, 1, 3, stop_job(alloc)))
         .await
         .unwrap();
     assert!(
@@ -241,7 +243,7 @@ async fn raising_token_resets_the_sequence_space() {
 
     // Raising the epoch resets the seq space, so seq 1 is fresh again.
     session
-        .handle_command(command(1, 2, 1, stop_job(alloc)))
+        .handle_command_settled(command(1, 2, 1, stop_job(alloc)))
         .await
         .unwrap();
     assert_eq!(session.epoch(), 2);
@@ -259,7 +261,7 @@ async fn start_job_is_idempotent_and_dedups() {
 
     // Fresh start.
     let first = session
-        .handle_command(command(1, 1, 2, start_job(alloc, attempt, job, None)))
+        .handle_command_settled(command(1, 1, 2, start_job(alloc, attempt, job, None)))
         .await
         .unwrap();
     assert!(is_running_report(&first));
@@ -267,14 +269,14 @@ async fn start_job_is_idempotent_and_dedups() {
 
     // Same seq → duplicate: re-reports running, does not re-execute.
     let dup = session
-        .handle_command(command(1, 1, 2, start_job(alloc, attempt, job, None)))
+        .handle_command_settled(command(1, 1, 2, start_job(alloc, attempt, job, None)))
         .await
         .unwrap();
     assert!(is_running_report(&dup));
 
     // A fresh seq for the same allocation → idempotent: still no re-execute.
     let again = session
-        .handle_command(command(1, 1, 3, start_job(alloc, attempt, job, None)))
+        .handle_command_settled(command(1, 1, 3, start_job(alloc, attempt, job, None)))
         .await
         .unwrap();
     assert!(is_running_report(&again));
@@ -333,7 +335,7 @@ async fn start_job_with_malformed_env_is_dropped_without_journaling() {
     let (alloc, attempt, job) = (AllocationId::new(), AttemptId::new(), JobId::new());
 
     let reports = session
-        .handle_command(command(
+        .handle_command_settled(command(
             1,
             1,
             2,
@@ -376,7 +378,7 @@ async fn start_job_injects_the_resumption_identity() {
         sj.notice_us = 120_000_000;
     }
     session
-        .handle_command(command(1, 1, 2, body))
+        .handle_command_settled(command(1, 1, 2, body))
         .await
         .unwrap();
     let env = exec.started_env(alloc).expect("started");
@@ -432,11 +434,11 @@ async fn tombstone_refuses_a_later_start() {
     let (alloc, attempt, job) = (AllocationId::new(), AttemptId::new(), JobId::new());
 
     session
-        .handle_command(command(1, 1, 2, stop_job(alloc)))
+        .handle_command_settled(command(1, 1, 2, stop_job(alloc)))
         .await
         .unwrap();
     let reports = session
-        .handle_command(command(1, 1, 3, start_job(alloc, attempt, job, None)))
+        .handle_command_settled(command(1, 1, 3, start_job(alloc, attempt, job, None)))
         .await
         .unwrap();
     assert_eq!(terminal_outcome(&reports), Some(AttemptOutcome::Aborted));
@@ -450,7 +452,7 @@ async fn truth_wins_journaled_exit_beats_tombstone_abort() {
 
     // Start, then a natural exit is observed and journaled.
     session
-        .handle_command(command(1, 1, 2, start_job(alloc, attempt, job, None)))
+        .handle_command_settled(command(1, 1, 2, start_job(alloc, attempt, job, None)))
         .await
         .unwrap();
     let exit = natural_exit(0, Duration::from_micros(9), exec.now());
@@ -464,7 +466,7 @@ async fn truth_wins_journaled_exit_beats_tombstone_abort() {
     // Now a StopJob arrives: the tombstone is journaled, but the honest exit
     // wins over an abort.
     let stop_reports = session
-        .handle_command(command(1, 1, 3, stop_job(alloc)))
+        .handle_command_settled(command(1, 1, 3, stop_job(alloc)))
         .await
         .unwrap();
     assert_eq!(
@@ -474,7 +476,7 @@ async fn truth_wins_journaled_exit_beats_tombstone_abort() {
 
     // And a racing StartJob after the tombstone reports the honest outcome too.
     let start_reports = session
-        .handle_command(command(1, 1, 4, start_job(alloc, attempt, job, None)))
+        .handle_command_settled(command(1, 1, 4, start_job(alloc, attempt, job, None)))
         .await
         .unwrap();
     assert_eq!(
@@ -497,7 +499,7 @@ async fn start_failure_is_classified_and_journaled() {
         },
     );
     let reports = session
-        .handle_command(command(1, 1, 2, start_job(alloc, attempt, job, None)))
+        .handle_command_settled(command(1, 1, 2, start_job(alloc, attempt, job, None)))
         .await
         .unwrap();
     assert_eq!(
@@ -538,7 +540,7 @@ async fn observed_exit_classifies_oom_and_nonzero() {
         let (alloc, attempt, job) = (AllocationId::new(), AttemptId::new(), JobId::new());
         let seq = 100 + expected_seq(&expected);
         session
-            .handle_command(command(1, 1, seq, start_job(alloc, attempt, job, None)))
+            .handle_command_settled(command(1, 1, seq, start_job(alloc, attempt, job, None)))
             .await
             .unwrap();
         let reports = session.handle_observed_exit(alloc, exit).await.unwrap();
@@ -559,12 +561,12 @@ async fn stop_of_running_container_is_aborted() {
     register(&mut session, 1, 1, 1).await;
     let (alloc, attempt, job) = (AllocationId::new(), AttemptId::new(), JobId::new());
     session
-        .handle_command(command(1, 1, 2, start_job(alloc, attempt, job, None)))
+        .handle_command_settled(command(1, 1, 2, start_job(alloc, attempt, job, None)))
         .await
         .unwrap();
 
     let reports = session
-        .handle_command(command(1, 1, 3, stop_job(alloc)))
+        .handle_command_settled(command(1, 1, 3, stop_job(alloc)))
         .await
         .unwrap();
     assert_eq!(terminal_outcome(&reports), Some(AttemptOutcome::Aborted));
@@ -576,7 +578,7 @@ async fn abort_tombstone_attributes_an_unconfirmed_sigkill() {
     register(&mut session, 1, 1, 1).await;
     let (alloc, attempt, job) = (AllocationId::new(), AttemptId::new(), JobId::new());
     session
-        .handle_command(command(1, 1, 2, start_job(alloc, attempt, job, None)))
+        .handle_command_settled(command(1, 1, 2, start_job(alloc, attempt, job, None)))
         .await
         .unwrap();
 
@@ -593,7 +595,7 @@ async fn abort_tombstone_attributes_an_unconfirmed_sigkill() {
         },
     );
     let reports = session
-        .handle_command(command(1, 1, 3, stop_job(alloc)))
+        .handle_command_settled(command(1, 1, 3, stop_job(alloc)))
         .await
         .unwrap();
 
@@ -611,7 +613,7 @@ async fn watcher_uses_tombstone_after_stop_cannot_find_the_container() {
     register(&mut session, 1, 1, 1).await;
     let (alloc, attempt, job) = (AllocationId::new(), AttemptId::new(), JobId::new());
     session
-        .handle_command(command(1, 1, 2, start_job(alloc, attempt, job, None)))
+        .handle_command_settled(command(1, 1, 2, start_job(alloc, attempt, job, None)))
         .await
         .unwrap();
 
@@ -628,7 +630,7 @@ async fn watcher_uses_tombstone_after_stop_cannot_find_the_container() {
     // durably records the tombstone. The already-queued watcher evidence must
     // use that attribution when it arrives afterward.
     let stop_reports = session
-        .handle_command(command(1, 1, 3, stop_job(alloc)))
+        .handle_command_settled(command(1, 1, 3, stop_job(alloc)))
         .await
         .unwrap();
     assert!(stop_reports.is_empty());
@@ -649,13 +651,13 @@ async fn stop_racing_a_limit_kill_records_the_breach() {
     register(&mut session, 1, 1, 1).await;
     let (alloc, attempt, job) = (AllocationId::new(), AttemptId::new(), JobId::new());
     session
-        .handle_command(command(1, 1, 2, start_job(alloc, attempt, job, None)))
+        .handle_command_settled(command(1, 1, 2, start_job(alloc, attempt, job, None)))
         .await
         .unwrap();
     exec.plan_stop_cause(alloc, ExitCause::OomKilled);
 
     let reports = session
-        .handle_command(command(1, 1, 3, stop_job(alloc)))
+        .handle_command_settled(command(1, 1, 3, stop_job(alloc)))
         .await
         .unwrap();
     assert_eq!(
@@ -670,7 +672,7 @@ async fn max_runtime_watchdog_classifies_exceeded() {
     register(&mut session, 1, 1, 1).await;
     let (alloc, attempt, job) = (AllocationId::new(), AttemptId::new(), JobId::new());
     session
-        .handle_command(command(
+        .handle_command_settled(command(
             1,
             1,
             2,
@@ -696,7 +698,7 @@ async fn max_runtime_after_natural_exit_is_a_noop() {
     register(&mut session, 1, 1, 1).await;
     let (alloc, attempt, job) = (AllocationId::new(), AttemptId::new(), JobId::new());
     session
-        .handle_command(command(
+        .handle_command_settled(command(
             1,
             1,
             2,
@@ -736,7 +738,7 @@ async fn start_bounded(
 ) -> AllocationId {
     let (alloc, attempt, job) = (AllocationId::new(), AttemptId::new(), JobId::new());
     session
-        .handle_command(command(
+        .handle_command_settled(command(
             1,
             1,
             seq,
@@ -816,7 +818,7 @@ async fn registration_does_not_rearm_unbounded_exited_or_unjournaled() {
     s1.handle_observed_exit(exited, exit).await.unwrap();
     // A bounded stop: journaled exit, container still visible until reaped.
     let stopped = start_bounded(&mut s1, 4, Some(30_000_000)).await;
-    s1.handle_command(command(1, 1, 5, stop_job(stopped)))
+    s1.handle_command_settled(command(1, 1, 5, stop_job(stopped)))
         .await
         .unwrap();
     s1.take_armed_watchdogs();
@@ -859,7 +861,7 @@ async fn exit_path_journals_then_reaps() {
     // Natural-exit path: start, observe the exit → journaled and reaped.
     let (alloc, attempt, job) = (AllocationId::new(), AttemptId::new(), JobId::new());
     session
-        .handle_command(command(1, 1, 2, start_job(alloc, attempt, job, None)))
+        .handle_command_settled(command(1, 1, 2, start_job(alloc, attempt, job, None)))
         .await
         .unwrap();
     let exit = natural_exit(0, Duration::from_micros(9), exec.now());
@@ -879,7 +881,7 @@ async fn exit_path_journals_then_reaps() {
     // journaled (truth-wins) and likewise reaped.
     let (alloc2, attempt2, job2) = (AllocationId::new(), AttemptId::new(), JobId::new());
     session
-        .handle_command(command(1, 1, 3, start_job(alloc2, attempt2, job2, None)))
+        .handle_command_settled(command(1, 1, 3, start_job(alloc2, attempt2, job2, None)))
         .await
         .unwrap();
     exec.finish(
@@ -887,7 +889,7 @@ async fn exit_path_journals_then_reaps() {
         natural_exit(0, Duration::from_micros(4), exec.now()),
     );
     session
-        .handle_command(command(1, 1, 4, stop_job(alloc2)))
+        .handle_command_settled(command(1, 1, 4, stop_job(alloc2)))
         .await
         .unwrap();
     assert!(
@@ -913,7 +915,7 @@ async fn observed_exit_reports_before_reaping() {
     register(&mut session, 1, 1, 1).await;
     let (alloc, attempt, job) = (AllocationId::new(), AttemptId::new(), JobId::new());
     session
-        .handle_command(command(1, 1, 2, start_job(alloc, attempt, job, None)))
+        .handle_command_settled(command(1, 1, 2, start_job(alloc, attempt, job, None)))
         .await
         .unwrap();
     let exit = natural_exit(0, Duration::from_micros(9), exec.now());
@@ -963,7 +965,7 @@ async fn heartbeat_claims_exited_container_until_exit_is_journaled() {
     register(&mut session, 1, 1, 1).await;
     let (alloc, attempt, job) = (AllocationId::new(), AttemptId::new(), JobId::new());
     session
-        .handle_command(command(1, 1, 2, start_job(alloc, attempt, job, None)))
+        .handle_command_settled(command(1, 1, 2, start_job(alloc, attempt, job, None)))
         .await
         .unwrap();
 
@@ -1011,7 +1013,7 @@ async fn heartbeat_does_not_claim_runtime_only_survivors() {
     );
     register(&mut s1, 1, 1, 1).await;
     let (alloc, attempt, job) = (AllocationId::new(), AttemptId::new(), JobId::new());
-    s1.handle_command(command(1, 1, 2, start_job(alloc, attempt, job, None)))
+    s1.handle_command_settled(command(1, 1, 2, start_job(alloc, attempt, job, None)))
         .await
         .unwrap();
     exec.finish(alloc, natural_exit(0, Duration::from_micros(3), exec.now()));
@@ -1054,7 +1056,7 @@ async fn arrange_exited(
 ) -> AllocationId {
     let (alloc, attempt, job) = (AllocationId::new(), AttemptId::new(), JobId::new());
     session
-        .handle_command(command(1, 1, seq, start_job(alloc, attempt, job, None)))
+        .handle_command_settled(command(1, 1, seq, start_job(alloc, attempt, job, None)))
         .await
         .unwrap();
     exec.finish(
@@ -1135,7 +1137,7 @@ async fn recovery_reaps_journaled_survivors() {
     );
     register(&mut s1, 1, 1, 1).await;
     let (alloc, attempt, job) = (AllocationId::new(), AttemptId::new(), JobId::new());
-    s1.handle_command(command(1, 1, 2, start_job(alloc, attempt, job, None)))
+    s1.handle_command_settled(command(1, 1, 2, start_job(alloc, attempt, job, None)))
         .await
         .unwrap();
     exec.finish(alloc, natural_exit(0, Duration::from_micros(7), exec.now()));
@@ -1197,7 +1199,7 @@ async fn recovery_reports_journaled_stop_outcome_over_runtime_code() {
     );
     register(&mut s1, 1, 1, 1).await;
     let (alloc, attempt, job) = (AllocationId::new(), AttemptId::new(), JobId::new());
-    s1.handle_command(command(1, 1, 2, start_job(alloc, attempt, job, None)))
+    s1.handle_command_settled(command(1, 1, 2, start_job(alloc, attempt, job, None)))
         .await
         .unwrap();
     // The stop's SIGKILL surfaces as a bare 137 in the runtime…
@@ -1221,7 +1223,7 @@ async fn recovery_reports_journaled_stop_outcome_over_runtime_code() {
         forked.clone(),
     );
     let reports = s2
-        .handle_command(command(
+        .handle_command_settled(command(
             1,
             1,
             1,
@@ -1374,7 +1376,7 @@ async fn accountable_live_work_is_intents_without_journaled_exits() {
 
     let (alloc, attempt, job) = (AllocationId::new(), AttemptId::new(), JobId::new());
     session
-        .handle_command(command(1, 1, 2, start_job(alloc, attempt, job, None)))
+        .handle_command_settled(command(1, 1, 2, start_job(alloc, attempt, job, None)))
         .await
         .unwrap();
     assert_eq!(session.outstanding_live_work(), vec![alloc]);

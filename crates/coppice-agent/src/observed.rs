@@ -14,7 +14,9 @@ use crate::executor::{classify_exit, ContainerState, ObservedContainer};
 use crate::journal::JournalState;
 
 /// One entry of the ObservedSet. `outcome` is `None` while `running`; when the
-/// container has ended, `outcome` records how (ADR 0013 taxonomy).
+/// container has ended, `outcome` records how (ADR 0013 taxonomy). The session
+/// clears `outcome` on a not-running entry whose start or stop this process
+/// still has in flight: *unresolved*, which the coordinator leaves alone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObservedAllocation {
     pub allocation: AllocationId,
@@ -32,8 +34,10 @@ pub struct ObservedAllocation {
 /// 1. Every runtime container appears, with its true state — running →
 ///    `running = true`; exited with no journaled exit → `running = false`
 ///    with the *runtime-observed* classification (OOM vs. exit code). A
-///    tombstone supplies abort attribution for an otherwise-unconfirmed
-///    SIGKILL; confirmed limit kills and natural exits remain runtime truth.
+///    tombstone supplies its command's attribution (abort or preemption) for
+///    an otherwise-unconfirmed SIGKILL, and a notice intent makes a non-zero
+///    exit `Preempted` (ADR 0044 §3); confirmed limit kills and exit 0 remain
+///    runtime truth.
 ///    Runtime evidence wins even if the journal intent is missing entirely (a
 ///    survivor is never forgotten). Ids come from the container labels.
 /// 2. A journaled exit → `running = false` with the *journaled* outcome and
@@ -131,7 +135,7 @@ fn from_runtime(container: &ObservedContainer, journal: &JournalState) -> Observ
             running: false,
             outcome: Some(classify_exit(
                 &exit,
-                journal.tombstones.contains_key(&container.allocation),
+                &journal.attribution(&container.allocation),
             )),
             runtime: exit.runtime,
         },

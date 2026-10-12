@@ -1079,6 +1079,14 @@ impl Executor for DockerExecutor {
         lifecycle::stop(&self.inner, allocation, grace).await
     }
 
+    async fn signal(
+        &self,
+        allocation: AllocationId,
+        signal: coppice_core::preemption::NoticeSignal,
+    ) -> Result<crate::executor::SignalOutcome, ExecutorError> {
+        lifecycle::signal(&self.inner, allocation, signal).await
+    }
+
     async fn observe(&self) -> Result<Vec<ObservedContainer>, ExecutorError> {
         lifecycle::observe(&self.inner).await
     }

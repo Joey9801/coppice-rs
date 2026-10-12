@@ -777,8 +777,11 @@ fn observed_set_diff(
         // current state, so it survives a stale epoch. The ObservedSet follows
         // RegisterAccepted on the same ordered report path, so the session is
         // live when this routes. A Dispatching attempt is still adopted below;
-        // the agent then reports Aborted after the stop.
-        if obs.running && abort_pending {
+        // the agent then reports Aborted after the stop. An unresolved
+        // allocation (a start still in flight) gets it too: the agent queues
+        // the stop until the start returns, and no later report re-derives it.
+        let unresolved = !obs.running && obs.outcome.is_none();
+        if (obs.running || unresolved) && abort_pending {
             out.stops.push(alloc_id);
         }
 
@@ -820,6 +823,13 @@ fn observed_set_diff(
                 }
                 _ => {} // Accruing/Ready with a live container: leave it
             }
+        } else if obs.outcome.is_none() {
+            // Unresolved (agent.proto): mentioned, so not lost below; not
+            // running, so not adopted. The agent's AttemptStatus resolves it.
+            tracing::debug!(
+                ?attempt_id,
+                "ingestion: observed allocation unresolved (start or stop in flight)"
+            );
         } else {
             // Observed exit: record the outcome (attempt is non-terminal here).
             let outcome = obs
@@ -1442,6 +1452,46 @@ mod tests {
         assert_eq!(rn.lost[0].attempt, att_disp_lost);
     }
 
+    /// An allocation the agent reports unresolved (not running, no outcome:
+    /// its start or its own stop still in flight) is neither adopted, lost,
+    /// nor given an outcome — whether its attempt is Dispatching or Running.
+    #[test]
+    fn observed_set_leaves_unresolved_allocations_alone() {
+        let node = NodeId::new();
+        let job = JobId::new();
+        let (att_starting, att_stopping) = (AttemptId::new(), AttemptId::new());
+        let (a_starting, a_stopping) = (AllocationId::new(), AllocationId::new());
+        let mut sm = StateMachine::default();
+        sm.nodes.insert(node, node_record(node, 5, true));
+        for (att, alloc, state) in [
+            (att_starting, a_starting, AttemptState::Dispatching),
+            (att_stopping, a_stopping, AttemptState::Running),
+        ] {
+            sm.attempts.insert(
+                att,
+                attempt_record(att, job, alloc, node, state, Some(now())),
+            );
+            sm.allocations.insert(
+                alloc,
+                allocation_record(alloc, job, att, node, requested(), AllocationState::Active),
+            );
+        }
+        let view = view_of(sm);
+        let set = Body::ObservedSet(ObservedSet {
+            allocations: vec![
+                observed(a_starting, att_starting, false, None, 0),
+                observed(a_stopping, att_stopping, false, None, 0),
+            ],
+        });
+        let out = normalize(&view, &report(node, 5, set), now());
+        assert!(out.stops.is_empty());
+        assert!(
+            out.commands.is_empty(),
+            "no outcome, adoption or loss for unresolved work: {:?}",
+            out.commands
+        );
+    }
+
     #[test]
     fn observed_set_stale_epoch_emits_stops_only() {
         let node = NodeId::new();
@@ -1553,6 +1603,24 @@ mod tests {
                 assert_eq!(adopted, None);
             }
         }
+    }
+
+    /// An abort requested while the node was away from a start still in
+    /// flight (an image pull): the reconnect reports the allocation
+    /// unresolved, and its StopJob must still be re-derived.
+    #[test]
+    fn observed_set_resends_pending_abort_stop_for_an_unresolved_start() {
+        let (sm, node, att, alloc) = abort_fixture(AttemptState::Dispatching, true);
+        let set = Body::ObservedSet(ObservedSet {
+            allocations: vec![observed(alloc, att, false, None, 0)],
+        });
+        let out = normalize(&view_of(sm), &report(node, 5, set), now());
+        assert_eq!(out.stops, vec![alloc]);
+        assert!(
+            out.commands.is_empty(),
+            "no adoption or outcome: {:?}",
+            out.commands
+        );
     }
 
     #[test]

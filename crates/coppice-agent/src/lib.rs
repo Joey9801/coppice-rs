@@ -15,6 +15,7 @@ pub mod executor;
 pub mod health;
 pub mod hostinfo;
 pub mod identity;
+pub mod interruption;
 pub mod journal;
 pub mod metrics_server;
 pub mod node_service;

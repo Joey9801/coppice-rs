@@ -12,12 +12,13 @@ use std::collections::{BTreeMap, HashMap};
 
 use bollard::models::{ContainerCreateBody, ContainerStateStatusEnum, ContainerUpdateBody};
 use bollard::query_parameters::{
-    CreateContainerOptionsBuilder, ListContainersOptionsBuilder, RemoveContainerOptions,
-    RemoveContainerOptionsBuilder, StopContainerOptionsBuilder,
+    CreateContainerOptionsBuilder, KillContainerOptionsBuilder, ListContainersOptionsBuilder,
+    RemoveContainerOptions, RemoveContainerOptionsBuilder, StopContainerOptionsBuilder,
 };
 
 use coppice_core::bytes::ByteSize;
 use coppice_core::id::AllocationId;
+use coppice_core::preemption::NoticeSignal;
 use coppice_core::time::{Duration, Timestamp};
 
 use super::state::Mapped;
@@ -28,7 +29,8 @@ use super::{
     LABEL_IMAGE_BYTES, LABEL_IMAGE_DIGEST, LABEL_JOB, LABEL_NODE,
 };
 use crate::executor::{
-    ContainerState, ExecutorError, ObservedContainer, StartError, StartSpec, StopOutcome,
+    ContainerState, ExecutorError, ObservedContainer, SignalOutcome, StartError, StartSpec,
+    StopOutcome,
 };
 use crate::pressure::DiskPressure;
 use crate::telemetry::FilesystemSink;
@@ -581,6 +583,37 @@ pub(crate) async fn stop(
     }
     // Never remove here: an exited container is evidence until the session
     // journals its exit and calls reap (§5).
+}
+
+// ---- signal (ADR 0044 §3: the notice signal) ----------------------------
+
+/// Deliver `signal` to the container's PID 1 (`POST /containers/{id}/kill
+/// ?signal=…`). Docker signals PID 1 only, so the shell-wrapper caveat of
+/// `SIGTERM` applies to every notice signal too.
+///
+/// A container that is gone (404) or not running (409) is
+/// [`SignalOutcome::NotRunning`], not an error. The signal is not a kill, so
+/// no kill-in-flight marker is armed: an exit the workload chooses in response
+/// is its own and keeps the ordinary OOM settle.
+pub(crate) async fn signal(
+    inner: &Inner,
+    allocation: AllocationId,
+    signal: NoticeSignal,
+) -> Result<SignalOutcome, ExecutorError> {
+    let name = container_name(allocation);
+    let options = KillContainerOptionsBuilder::new()
+        .signal(signal.name())
+        .build();
+    match inner.docker.kill_container(&name, Some(options)).await {
+        Ok(()) => Ok(SignalOutcome::Delivered),
+        Err(err) if matches!(api::status_code(&err), Some(404) | Some(409)) => {
+            Ok(SignalOutcome::NotRunning)
+        }
+        Err(err) => Err(ExecutorError::Other(format!(
+            "signalling container {name} with {}: {err}",
+            signal.name()
+        ))),
+    }
 }
 
 /// The kill-in-flight marker (§4), cleared on drop unless [`keep`](Self::keep)
