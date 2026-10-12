@@ -484,6 +484,10 @@ pub async fn run_daemon_with_shutdown(
     .with_service_addr(config.service_addr())
     // Spot-only nodes (ADR 0044 §4) announce it at every registration.
     .with_preemptible_only(config.preemption.preemptible_only)
+    // An interruption source makes StartJob check notice sizing (ADR 0044 §5).
+    .with_interruption_source(
+        config.preemption.interruption_source != config::InterruptionSource::None,
+    )
     // Static host description + what detection read before `[capacity]`
     // overrides, so the node detail view can explain the advertised vector.
     .with_host_facts(hostinfo::collect(&detected), detected.as_resources())

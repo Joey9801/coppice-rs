@@ -154,8 +154,14 @@ where
 
     // The notice machinery, owned here so it spans every phase of the loop.
     // Recovery runs before any coordinator is found; its reports are dropped
-    // (the ObservedSet repeats them).
-    let source: Option<tokio::sync::watch::Receiver<Option<Interruption>>> = None;
+    // (the ObservedSet repeats them). The source task is stopped and joined
+    // under the same bounded deadline as the other tasks here (issue #111).
+    let (source_stop_tx, source_stop_rx) = tokio::sync::watch::channel(false);
+    let (source, source_join) =
+        match crate::interruption::spawn(&config.preemption, source_stop_rx)? {
+            Some((rx, join)) => (Some(rx), Some(join)),
+            None => (None, None),
+        };
     let mut background = Background::new(source, session.executor().clone());
     session.resume_notices(Timestamp::now()).await?;
 
@@ -318,8 +324,12 @@ where
     // tombstone re-runs a stop on the next start; a start cut short is
     // reconciled from the journal and runtime like any crash (ADR 0009).
     drop(background);
+    let _ = source_stop_tx.send(true);
     let deadline = tokio::time::Instant::now() + TASK_DRAIN;
     crate::drain_task("reaper", reaper_join, deadline).await;
+    if let Some(join) = source_join {
+        crate::drain_task("interruption-source", join, deadline).await;
+    }
     watcher_join.abort();
     let _ = watcher_join.await;
     outcome

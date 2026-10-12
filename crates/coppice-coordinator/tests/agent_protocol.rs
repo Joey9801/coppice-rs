@@ -1983,3 +1983,138 @@ async fn max_runtime_watchdog_survives_an_agent_restart() {
     world.coord.shutdown().await;
     drop(world.agent_dir);
 }
+
+// ---- spot interruption (ADR 0044 §5) --------------------------------------
+
+/// A spot reclaim end to end, from instance metadata to the next attempt.
+///
+/// The local IMDSv2 stand-in's deadline leaves no notice window (`T_stop` is
+/// already past), so signal, mark, stop and `Preempted { Interruption }` run
+/// back to back, with the full notice recorded as shortfall. After `D` the
+/// restarted agent retires the dead plan, ignores the stale notice still in
+/// metadata, and takes the next attempt.
+#[tokio::test]
+async fn a_spot_reclaim_preempts_requeues_free_and_tells_the_next_attempt() {
+    use coppice_agent::config::InterruptionSource;
+    use coppice_agent::interruption::FakeImds;
+    use coppice_core::attempt::PreemptReason;
+    use coppice_core::preemption::NoticeSignal;
+
+    init_tracing();
+    let imds = FakeImds::start().await.expect("start the fake IMDS");
+    let endpoint = imds.endpoint();
+    let mut agent_config_used = None;
+    let world = run_to_running_with(|config| {
+        config.preemption.interruption_source = InterruptionSource::AwsImds;
+        config.preemption.imds_endpoint = Some(endpoint.clone());
+        config.preemption.imds_poll_interval = Duration::from_millis(50);
+        agent_config_used = Some(config.clone());
+    })
+    .await;
+    let config = agent_config_used.expect("the tweak ran");
+    let views = world.coord.views();
+
+    let deadline = Timestamp::now() + coppice_core::time::Duration::from_secs(2);
+    imds.set_action("terminate", deadline);
+
+    let preempted = AttemptState::Terminal(AttemptOutcome::Preempted {
+        reason: PreemptReason::Interruption,
+    });
+    poll(DEADLINE, "attempt Preempted { Interruption }", || {
+        let views = views.clone();
+        let attempt = world.attempt;
+        let preempted = preempted.clone();
+        async move { attempt_state(&views, attempt) == Some(preempted) }
+    })
+    .await;
+
+    // The notice protocol ran: one SIGUSR1 (the default notice signal), and
+    // the coordinator acknowledged the mark before the outcome landed.
+    assert_eq!(
+        world.executor.signals_delivered(world.alloc),
+        vec![NoticeSignal::Sigusr1]
+    );
+    let state = views.latest().state().clone();
+    let record = state.attempts.get(&world.attempt).expect("attempt record");
+    let preemption = record.preemption.as_ref().expect("a preemption record");
+    assert_eq!(preemption.reason, PreemptReason::Interruption);
+    let acknowledged = preemption
+        .acknowledged
+        .as_ref()
+        .expect("the reported mark acknowledged it");
+    assert!(
+        acknowledged.notice_shortfall.is_positive(),
+        "no window at all: the whole notice is short"
+    );
+    let node = state.nodes.get(&world.node).expect("node record");
+    assert!(node.draining);
+    assert_eq!(
+        node.interruption_deadline
+            .map(|d| d.as_micros() / 1_000_000),
+        Some(deadline.as_micros() / 1_000_000)
+    );
+
+    // Free requeue: Queued again, no retry consumed, nothing placed on the
+    // interrupted node.
+    poll(DEADLINE, "job requeued", || {
+        let views = views.clone();
+        let job = world.job;
+        async move { job_state(&views, job) == Some(JobState::Queued) }
+    })
+    .await;
+    assert_eq!(
+        views
+            .latest()
+            .state()
+            .jobs
+            .get(&world.job)
+            .unwrap()
+            .retries_used,
+        0
+    );
+
+    // The host comes back after D (an EC2 `stop` reclaim): the restarted
+    // agent finds a plan whose deadline has passed, retires it, and
+    // re-registers undrained, while metadata still shows the old notice.
+    stop_agent(world.agent).await;
+    while Timestamp::now() <= deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let agent = spawn_agent(config, world.executor.fork()).await;
+
+    poll(DEADLINE, "next attempt Running", || {
+        let views = views.clone();
+        let job = world.job;
+        let first = world.attempt;
+        async move {
+            current_attempt_id(&views, job)
+                .filter(|a| *a != first)
+                .and_then(|a| attempt_state(&views, a))
+                == Some(AttemptState::Running)
+        }
+    })
+    .await;
+    let next = current_attempt_id(&views, world.job).expect("next attempt");
+    let next_alloc = attempt_alloc(&views, next).expect("next allocation");
+    let env = world
+        .executor
+        .started_env(next_alloc)
+        .expect("the next attempt started here");
+    assert_eq!(
+        env.get("COPPICE_PREVIOUS_ATTEMPT_OUTCOME")
+            .map(String::as_str),
+        Some("preempted")
+    );
+    assert_eq!(
+        env.get("COPPICE_PREVIOUS_ATTEMPT_ID"),
+        Some(&world.attempt.to_string())
+    );
+    let state = views.latest().state().clone();
+    let node = state.nodes.get(&world.node).expect("node record");
+    assert!(!node.draining, "the retired plan no longer drains the node");
+    assert_eq!(node.interruption_deadline, None);
+
+    stop_agent(agent).await;
+    world.coord.shutdown().await;
+    drop(world.agent_dir);
+}

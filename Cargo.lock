@@ -1139,6 +1139,7 @@ name = "coppice-agent"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "aws-config",
  "axum",
  "bollard",
  "bytes",

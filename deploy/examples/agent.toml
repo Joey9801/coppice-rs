@@ -69,3 +69,10 @@ disk = "8GiB"
 [labels]
 # Advertised at registration and available to job placement constraints.
 role = "demo-worker"
+
+# Spot hosts (ADR 0044 §5): uncomment to have the agent watch EC2 instance
+# metadata for a spot reclaim notice. On one, the node drains, every running
+# attempt gets its notice signal at once and is stopped before the reclaim,
+# and each ends `Preempted` with a free retry rather than `NodeLost`.
+# [preemption]
+# interruption_source = "aws-imds"

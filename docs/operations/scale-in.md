@@ -165,13 +165,22 @@ node id or an API token on the instance: the agent announces its own
 drain. An operator driving the scale-in from outside can equally run
 `coppice node drain <id> --wait` first and terminate afterwards.
 
-**Spot interruption.** The two-minute interruption notice
-(`spot/instance-action` in instance metadata) is the drain window. A
-small watcher unit that stops `coppice-agent` on the notice gives running
-work two minutes to finish and reports exits cleanly; whatever is left
-becomes `NodeLost` when the instance is reclaimed, exactly as with a
-missed deadline above. Set `shutdown_grace` no longer than the notice on
-spot hosts so the agent's own wait does not outlive the instance.
+**Spot interruption.** The agent handles this itself
+([ADR 0044](../decisions/0044-job-preemption-and-spot-capacity.md) §5);
+no watcher unit is needed. With `[preemption] interruption_source =
+"aws-imds"` it polls `spot/instance-action` every five seconds, and a
+notice starts a drain plan with the reclaim time as its deadline: the node
+announces `draining` (and the deadline, shown in the node view), admits
+nothing, and every running attempt gets its job's notice signal at once,
+then the ordinary stop at `deadline − 30 s − abort_grace`. Each attempt
+ends `Preempted { interruption }` and is requeued without consuming retry
+budget; `/readyz` answers `interrupted` meanwhile. None of this waits for a
+coordinator. Only work whose `Preempted` report never arrives (the
+instance vanished first) becomes `NodeLost`. Do not stop `coppice-agent`
+on the notice: the ADR 0041 SIGTERM drain sends no notices and would leave
+the reclaim to the liveness path. Size jobs' declared notice so that
+notice + `abort_grace` + 30 s fits the provider's two minutes; the agent
+warns when one does not.
 
 **Ungraceful termination** — an instance killed without either — still
 takes the 90 s liveness path: every attempt on it ends `NodeLost` and
