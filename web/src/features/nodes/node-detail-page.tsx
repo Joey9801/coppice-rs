@@ -14,6 +14,8 @@ import {
   formatBytes,
   formatCpu,
   formatPercent,
+  formatRelativeTime,
+  formatTimestamp,
   formatTimeUntil,
   formatUcu,
   resourceFractions,
@@ -43,6 +45,7 @@ import {
 } from '@/components/ui/table'
 import { isNotFound, nodeCapacityHistory, sortedLabels } from './lib'
 import { formatHostKernel, formatHostOs } from './host-facts'
+import { InterruptionBadge } from './interruption-badge'
 
 export function NodeDetailPage({ nodeId }: { nodeId: string }) {
   const { data: detail, isPending, isError, error } = useNode(nodeId)
@@ -86,7 +89,7 @@ export function NodeDetailPage({ nodeId }: { nodeId: string }) {
 function NodeDetailBody({ detail, nodeId }: { detail: NodeDetail; nodeId: string }) {
   const { summary } = detail
   const lost = summary.health === 'Lost'
-  const draining = summary.schedulable === false && !lost
+  const draining = (summary.schedulable === false || summary.draining === true) && !lost
   const usedFrac = resourceFractions(summary.used, summary.capacity)
 
   return (
@@ -96,7 +99,9 @@ function NodeDetailBody({ detail, nodeId }: { detail: NodeDetail; nodeId: string
           <span className="flex flex-wrap items-center gap-3">
             <span className="font-mono text-lg break-all">{summary.id}</span>
             <StatePill state={summary.health} />
-            {summary.schedulable === false ? <StatePill state="Draining" /> : null}
+            {summary.schedulable === false || summary.draining ? (
+              <StatePill state="Draining" />
+            ) : null}
             {summary.preemptibleOnly ? (
               <Badge
                 variant="outline"
@@ -104,6 +109,9 @@ function NodeDetailBody({ detail, nodeId }: { detail: NodeDetail; nodeId: string
               >
                 preemptible only
               </Badge>
+            ) : null}
+            {summary.interruptionDeadline != null ? (
+              <InterruptionBadge deadline={summary.interruptionDeadline} />
             ) : null}
           </span>
         }
@@ -129,6 +137,14 @@ function NodeDetailBody({ detail, nodeId }: { detail: NodeDetail; nodeId: string
             <TimeAgo t={summary.lastHeartbeat} className="font-medium" />
           )}
           . Running attempts from registration epoch {summary.epoch} will be marked lost.
+        </Banner>
+      ) : summary.interruptionDeadline != null ? (
+        <Banner tone="amber">
+          Provider interruption — the host is reclaimed{' '}
+          <span className="font-medium" title={formatTimestamp(summary.interruptionDeadline)}>
+            {formatRelativeTime(summary.interruptionDeadline)}
+          </span>{' '}
+          (agent clock). Running attempts are being preempted.
         </Banner>
       ) : draining ? (
         <Banner tone="amber">Draining — no new placements; existing work continues.</Banner>

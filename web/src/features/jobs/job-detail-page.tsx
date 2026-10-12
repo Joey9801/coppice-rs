@@ -197,6 +197,7 @@ function HeroTiles({ job, phase }: { job: JobDetail; phase: JobPhase }) {
   const lastAttempt = currentOrLastAttempt(job)
   const now = new Date()
   const runtimeSeconds = attemptRuntimeSeconds(lastAttempt, now)
+  const preempted = job.attempts.filter((a) => a.outcome?.kind === 'Preempted').length
 
   // Cost lives entirely in the JobCostCard now — the tiles cover the rest of
   // the "how is it doing" story (state, runtime, retries).
@@ -224,12 +225,15 @@ function HeroTiles({ job, phase }: { job: JobDetail; phase: JobPhase }) {
       />
       <StatTile
         label="Attempts"
-        value={`${job.attempts.length} of ${job.spec.retry.maxRetries + 1}`}
-        hint={
+        value={`${job.attempts.length - preempted} of ${job.spec.retry.maxRetries + 1}`}
+        hint={[
           job.retriesUsed > 0
             ? `${job.retriesUsed} ${job.retriesUsed === 1 ? 'retry' : 'retries'} used`
-            : 'no retries used'
-        }
+            : 'no retries used',
+          // A preempted attempt requeues for free (ADR 0044 §2): it is not
+          // a retry and does not count against the budget.
+          ...(preempted > 0 ? [`+${preempted} preempted`] : []),
+        ].join(' · ')}
       />
     </div>
   )
@@ -267,7 +271,9 @@ function stateHint(job: JobDetail, phase: JobPhase, now: Date): ReactNode {
     case 'Preparing':
       return `placing on a node · ${inState}`
     case 'Running':
-      return `for ${inState}`
+      return currentOrLastAttempt(job)?.state === 'Preempting'
+        ? `preempting · running ${inState}`
+        : `for ${inState}`
     case 'Finalizing':
       return `resolving outcome · ${inState}`
     case 'Succeeded':

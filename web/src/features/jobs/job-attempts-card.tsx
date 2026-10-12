@@ -1,9 +1,11 @@
+import { Fragment } from 'react'
 import type { AttemptId, AttemptView } from '@/api/types'
 import { formatUcu, shortId } from '@/lib/format'
 import { IdLink, outcomePill, StatePill, TimeAgo } from '@/components'
 import { cn } from '@/lib/utils'
 import { Badge } from '@/components/ui/badge'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { AttemptPreemptionDetail } from './attempt-preemption'
 import {
   Table,
   TableBody,
@@ -47,48 +49,62 @@ export function JobAttemptsCard({
               <TableBody>
                 {attempts.map((attempt) => {
                   const isCurrent = attempt.id === currentAttempt
+                  const preemption = attempt.preemption
                   return (
-                    <TableRow key={attempt.id} className={cn(isCurrent && 'bg-muted/40')}>
-                      <TableCell className="whitespace-nowrap font-mono text-xs">
-                        {shortId(attempt.id)}
-                        {isCurrent ? (
-                          <span className="ml-2 rounded-full bg-primary/10 px-1.5 py-0.5 text-[10px] font-medium text-primary">
-                            current
-                          </span>
-                        ) : null}
-                        {attempt.preemptible ? (
-                          <Badge
-                            variant="outline"
-                            className="ml-2 text-[10px]"
-                            title="Placed as effectively preemptible: eligible for preemption and charged at the preemptible discount"
-                          >
-                            preemptible
-                          </Badge>
-                        ) : null}
-                      </TableCell>
-                      <TableCell>
-                        <IdLink id={attempt.node} />
-                      </TableCell>
-                      <TableCell>
-                        <StatePill state={attempt.state} />
-                      </TableCell>
-                      <TableCell>
-                        {attempt.outcome ? (
-                          outcomePill(attempt.outcome)
-                        ) : (
-                          <span className="text-muted-foreground">—</span>
-                        )}
-                      </TableCell>
-                      <TableCell className="whitespace-nowrap text-muted-foreground">
-                        {attempt.startedAt != null ? <TimeAgo t={attempt.startedAt} /> : '—'}
-                      </TableCell>
-                      <TableCell className="whitespace-nowrap text-muted-foreground">
-                        {attempt.endedAt != null ? <TimeAgo t={attempt.endedAt} /> : '—'}
-                      </TableCell>
-                      <TableCell className="text-right tabular-nums">
-                        {formatUcu(attempt.chargedUcu)}
-                      </TableCell>
-                    </TableRow>
+                    <Fragment key={attempt.id}>
+                      <TableRow
+                        className={cn(isCurrent && 'bg-muted/40', preemption && 'border-b-0')}
+                      >
+                        <TableCell className="whitespace-nowrap font-mono text-xs">
+                          {shortId(attempt.id)}
+                          {isCurrent ? (
+                            <span className="ml-2 rounded-full bg-primary/10 px-1.5 py-0.5 text-[10px] font-medium text-primary">
+                              current
+                            </span>
+                          ) : null}
+                          {attempt.preemptible ? (
+                            <Badge
+                              variant="outline"
+                              className="ml-2 text-[10px]"
+                              title="Placed as effectively preemptible: eligible for preemption and charged at the preemptible discount"
+                            >
+                              preemptible
+                            </Badge>
+                          ) : null}
+                        </TableCell>
+                        <TableCell>
+                          <IdLink id={attempt.node} />
+                        </TableCell>
+                        <TableCell>
+                          <StatePill state={attempt.state} />
+                        </TableCell>
+                        <TableCell>
+                          {attempt.outcome ? (
+                            outcomePill(attempt.outcome)
+                          ) : (
+                            <span className="text-muted-foreground">—</span>
+                          )}
+                        </TableCell>
+                        <TableCell className="whitespace-nowrap text-muted-foreground">
+                          {attempt.startedAt != null ? <TimeAgo t={attempt.startedAt} /> : '—'}
+                        </TableCell>
+                        <TableCell className="whitespace-nowrap text-muted-foreground">
+                          {attempt.endedAt != null ? <TimeAgo t={attempt.endedAt} /> : '—'}
+                        </TableCell>
+                        <TableCell className="text-right tabular-nums">
+                          {formatUcu(attempt.chargedUcu)}
+                        </TableCell>
+                      </TableRow>
+                      {preemption ? (
+                        <TableRow
+                          className={cn('hover:bg-transparent', isCurrent && 'bg-muted/40')}
+                        >
+                          <TableCell colSpan={7} className="pt-0">
+                            <AttemptPreemptionDetail preemption={preemption} />
+                          </TableCell>
+                        </TableRow>
+                      ) : null}
+                    </Fragment>
                   )
                 })}
               </TableBody>

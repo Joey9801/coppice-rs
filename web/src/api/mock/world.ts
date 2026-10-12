@@ -37,6 +37,7 @@ import type {
   JobMetadata,
   JobPreemption,
   NoticeSignal,
+  PreemptReason,
   JobPhase,
   JobState,
   JobStateKind,
@@ -325,6 +326,10 @@ interface MNode {
   schedulable: boolean
   /** Spot capacity (ADR 0044 §4): hosts only effectively preemptible attempts. */
   preemptibleOnly: boolean
+  /** Provider interruption deadline (ADR 0044 §5); an interrupted node takes no new work. */
+  interruptionDeadlineUs: number | null
+  /** The agent's own drain announcement, distinct from the admin cordon in `schedulable`. */
+  draining: boolean
   health: NodeHealth
   epoch: number
   lastHeartbeatUs: number | null
@@ -388,8 +393,20 @@ interface MAttempt {
   chargedUcu: number
   /** Effective preemptibility recorded at placement (ADR 0044 §1). */
   preemptible: boolean
+  /** Termination record (ADR 0044 §3); a Running attempt with one is shown as Preempting. */
+  preemption: MPreemption | null
   /** Usage samples recorded while this attempt ran (bounded ring). */
   usage: MockUsageSample[]
+}
+
+/** `AttemptPreemption` in simulation µs (acknowledged fields null until notified). */
+interface MPreemption {
+  reason: PreemptReason
+  forJob: string | null
+  requestedAtUs: number
+  notifiedAtUs: number | null
+  deadlineUs: number | null
+  noticeShortfallSeconds: number | null
 }
 
 interface JobSpecInternal {
@@ -574,6 +591,7 @@ export class MockWorld {
     this.buildNodes()
     this.buildCoordinators()
     this.buildJobs()
+    this.seedPreemptions()
     this.seedQueueHistory()
     this.seedCapacityHistory()
     this.seedUtilHistories()
@@ -874,6 +892,8 @@ export class MockWorld {
         labels: { zone: this.rng.pick(zones), pool },
         schedulable: !draining,
         preemptibleOnly: spot,
+        interruptionDeadlineUs: null,
+        draining: false,
         health: lost ? 'Lost' : 'Healthy',
         epoch: lost ? this.rng.int(4, 9) : this.rng.int(1, 3),
         lastHeartbeatUs: lost
@@ -911,9 +931,12 @@ export class MockWorld {
     // enough entries have accrued since the log origin (see tickCoordinators).
   }
 
-  /** Placeable nodes = healthy (draining node still hosts existing work). */
+  /**
+   * Placeable nodes = healthy and not agent-draining (an admin-cordoned node
+   * still hosts existing work; an interrupted agent drains, ADR 0044 §5).
+   */
   private placeableNodes(): MNode[] {
-    return [...this.nodes.values()].filter((n) => n.health === 'Healthy')
+    return [...this.nodes.values()].filter((n) => n.health === 'Healthy' && !n.draining)
   }
 
   private nodeFreeCapacity(): Map<string, Resources> {
@@ -1076,6 +1099,7 @@ export class MockWorld {
       rateUcuPerSecond: rate,
       chargedUcu: 0,
       preemptible: this.effectivelyPreemptible(job),
+      preemption: null,
       usage: [],
     }
     this.attempts.set(attempt.id, attempt)
@@ -1321,6 +1345,161 @@ export class MockWorld {
       }
       this.newAlloc(job, attempt, node.id, { ...job.spec.requests }, 'Released')
       job.retriesUsed += 1
+    }
+  }
+
+  /**
+   * Layers platform terminations (ADR 0044 §2–§3) over the built world. Draws
+   * from its own seed so the rest of the world is unchanged.
+   */
+  private seedPreemptions(): void {
+    const rng = new Rng(hashSeed('preemptions'))
+    const running: Array<{ job: MJob; attempt: MAttempt }> = []
+    for (const job of this.jobs.values()) {
+      const attempt = this.currentAttempt(job)
+      if (attempt?.state === 'Running' && attempt.preemptible) running.push({ job, attempt })
+    }
+    const taken = new Set<string>()
+
+    // A provider interruption on one spot node: the agent noticed it 20 s
+    // ago and every running attempt there is winding down against it.
+    const spot = [...this.nodes.values()].filter((n) => n.preemptibleOnly && n.health === 'Healthy')
+    const interrupted = spot.find((n) => running.some((r) => r.attempt.node === n.id)) ?? spot[0]
+    if (interrupted) {
+      const deadlineUs = this.nowUs + 2 * MINUTE_US
+      interrupted.interruptionDeadlineUs = deadlineUs
+      // The agent drains as it reports the interruption (ADR 0044 §5).
+      interrupted.draining = true
+      const noticedUs = this.nowUs - 20 * SECOND_US
+      for (const { job, attempt } of running) {
+        if (attempt.node !== interrupted.id) continue
+        const noticeUs = job.spec.preemption.noticeSeconds * SECOND_US
+        const attemptDeadlineUs = Math.min(deadlineUs, noticedUs + noticeUs)
+        attempt.preemption = {
+          reason: 'Interruption',
+          forJob: null,
+          // The agent initiated it, so the record arrives acknowledged.
+          requestedAtUs: noticedUs,
+          notifiedAtUs: noticedUs,
+          deadlineUs: attemptDeadlineUs,
+          noticeShortfallSeconds: Math.max(
+            0,
+            Math.ceil((noticeUs - (attemptDeadlineUs - noticedUs)) / SECOND_US),
+          ),
+        }
+        this.pushEvent({
+          atUs: noticedUs,
+          kind: 'AttemptNotified',
+          attempt: attempt.id,
+          job: job.id,
+          node: attempt.node,
+        })
+        taken.add(job.id)
+      }
+    }
+
+    const pool = rng.shuffle(running.filter((r) => !taken.has(r.job.id)))
+    const others = [...this.jobs.values()].filter((j) => this.jobPhase(j) === 'Running')
+    const beneficiary = (self: MJob): string | null => {
+      const candidates = others.filter((j) => j.id !== self.id)
+      return candidates.length > 0 ? rng.pick(candidates).id : null
+    }
+
+    // A priority preemption just committed: the notice is on its way, so
+    // the record carries no deadline yet.
+    const priority = pool.shift()
+    if (priority) {
+      priority.attempt.preemption = {
+        reason: 'Priority',
+        forJob: beneficiary(priority.job),
+        requestedAtUs: this.nowUs - 3 * SECOND_US,
+        notifiedAtUs: null,
+        deadlineUs: null,
+        noticeShortfallSeconds: null,
+      }
+    }
+
+    // An acknowledged relocation, given its full notice.
+    const relocation = pool.shift()
+    if (relocation) {
+      const notifiedUs = this.nowUs - 10 * SECOND_US
+      relocation.attempt.preemption = {
+        reason: 'Relocation',
+        forJob: beneficiary(relocation.job),
+        requestedAtUs: notifiedUs - SECOND_US,
+        notifiedAtUs: notifiedUs,
+        deadlineUs: notifiedUs + relocation.job.spec.preemption.noticeSeconds * SECOND_US,
+        noticeShortfallSeconds: 0,
+      }
+      this.pushEvent({
+        atUs: notifiedUs,
+        kind: 'AttemptNotified',
+        attempt: relocation.attempt.id,
+        job: relocation.job.id,
+        node: relocation.attempt.node,
+      })
+    }
+
+    // Earlier attempts that ended Preempted, then requeued for free.
+    const reasons: PreemptReason[] = ['Priority', 'Drain', 'Interruption']
+    for (const reason of reasons) {
+      const next = pool.shift()
+      if (!next || next.attempt.startedAtUs === null) continue
+      const { job } = next
+      const currentStartUs = next.attempt.startedAtUs
+      const endedAtUs = currentStartUs - rng.range(10 * SECOND_US, 2 * MINUTE_US)
+      const startedAtUs = endedAtUs - rng.range(10 * MINUTE_US, 60 * MINUTE_US)
+      const noticeUs = job.spec.preemption.noticeSeconds * SECOND_US
+      // A provider interruption may give less notice than the job declared.
+      const givenUs = reason === 'Interruption' ? Math.min(noticeUs, 30 * SECOND_US) : noticeUs
+      const notifiedAtUs = endedAtUs - givenUs
+      const node = rng.pick(this.hostableNodes(job, [...this.nodes.values()]))
+      const forJob = reason === 'Priority' ? beneficiary(job) : null
+      const attempt: MAttempt = {
+        id: rng.mintId('attempt'),
+        job: job.id,
+        node: node.id,
+        allocation: '',
+        state: 'Terminal',
+        outcome: {
+          kind: 'Preempted',
+          class: 'Platform',
+          reason,
+          ...(forJob !== null ? { forJob } : {}),
+        },
+        startedAtUs,
+        endedAtUs,
+        rateUcuPerSecond: next.attempt.rateUcuPerSecond,
+        // Platform class: refunded in full.
+        chargedUcu: 0,
+        preemptible: true,
+        preemption: {
+          reason,
+          forJob,
+          requestedAtUs: reason === 'Interruption' ? notifiedAtUs : notifiedAtUs - SECOND_US,
+          notifiedAtUs,
+          deadlineUs: endedAtUs,
+          noticeShortfallSeconds: Math.ceil((noticeUs - givenUs) / SECOND_US),
+        },
+        usage: [],
+      }
+      this.attempts.set(attempt.id, attempt)
+      // Chronological: before the current attempt.
+      job.attempts.splice(job.attempts.length - 1, 0, attempt.id)
+      this.seqCounter += 1
+      const alloc: MAlloc = {
+        id: rng.mintId('alloc'),
+        job: job.id,
+        attempt: attempt.id,
+        node: node.id,
+        requested: { ...job.spec.requests },
+        funded: { ...job.spec.requests },
+        state: 'Released',
+        seq: this.seqCounter,
+      }
+      this.allocs.set(alloc.id, alloc)
+      attempt.allocation = alloc.id
+      this.seedUsage(attempt, job.spec.requests, startedAtUs, endedAtUs)
     }
   }
 
@@ -1599,7 +1778,9 @@ export class MockWorld {
       const delta = Math.round(attempt.rateUcuPerSecond * (TICK_US / SECOND_US))
       this.chargeAncestors(job.spec.quotaEntity, delta)
 
-      if (attempt.state === 'Running') {
+      if (attempt.state === 'Running' && attempt.preemption) {
+        this.tickPreempting(job, attempt, attempt.preemption)
+      } else if (attempt.state === 'Running') {
         const overRuntime =
           job.spec.maxRuntimeUs !== null &&
           attempt.startedAtUs !== null &&
@@ -1625,6 +1806,46 @@ export class MockWorld {
         this.finishJob(job, attempt)
       }
     }
+  }
+
+  /** Advances a preempting attempt: acknowledge the notice, then end `Preempted` at the deadline. */
+  private tickPreempting(job: MJob, attempt: MAttempt, p: MPreemption): void {
+    if (p.deadlineUs === null) {
+      if (!this.rng.bool(0.3)) return
+      p.notifiedAtUs = this.nowUs
+      p.deadlineUs = this.nowUs + job.spec.preemption.noticeSeconds * SECOND_US
+      p.noticeShortfallSeconds = 0
+      this.pushEvent({
+        atUs: this.nowUs,
+        kind: 'AttemptNotified',
+        attempt: attempt.id,
+        job: job.id,
+        node: attempt.node,
+      })
+      return
+    }
+    if (this.nowUs < p.deadlineUs) return
+    attempt.state = 'Terminal'
+    attempt.endedAtUs = this.nowUs
+    attempt.outcome = {
+      kind: 'Preempted',
+      class: 'Platform',
+      reason: p.reason,
+      ...(p.forJob !== null ? { forJob: p.forJob } : {}),
+    }
+    // Platform class: the upfront charge is refunded in full.
+    attempt.chargedUcu = 0
+    const alloc = this.allocs.get(attempt.allocation)
+    if (alloc) alloc.state = 'Released'
+    this.pushEvent({
+      atUs: this.nowUs,
+      kind: 'AttemptStateChanged',
+      attempt: attempt.id,
+      job: job.id,
+      node: attempt.node,
+      state: 'Terminal',
+    })
+    this.transition(job, { kind: 'Queued' })
   }
 
   private finishJob(job: MJob, attempt: MAttempt): void {
@@ -2650,13 +2871,24 @@ export class MockWorld {
       job: a.job,
       node: a.node,
       allocation: a.allocation,
-      state: a.state,
+      // Derived at read time, like the real projection (ADR 0044 §3).
+      state: a.state === 'Running' && a.preemption ? 'Preempting' : a.state,
       outcome: a.outcome ? { ...a.outcome } : null,
       startedAt: a.startedAtUs === null ? null : at(a.startedAtUs),
       endedAt: a.endedAtUs === null ? null : at(a.endedAtUs),
       rateUcuPerSecond: a.rateUcuPerSecond,
       chargedUcu: a.chargedUcu,
       preemptible: a.preemptible,
+      preemption: a.preemption
+        ? {
+            reason: a.preemption.reason,
+            forJob: a.preemption.forJob,
+            requestedAt: at(a.preemption.requestedAtUs),
+            notifiedAt: a.preemption.notifiedAtUs === null ? null : at(a.preemption.notifiedAtUs),
+            deadline: a.preemption.deadlineUs === null ? null : at(a.preemption.deadlineUs),
+            noticeShortfallSeconds: a.preemption.noticeShortfallSeconds,
+          }
+        : null,
     }
   }
 
@@ -3037,7 +3269,10 @@ export class MockWorld {
       used: this.nodeUsedOrNull(node.id),
       labels: { ...node.labels },
       schedulable: node.schedulable,
+      draining: node.draining,
       preemptibleOnly: node.preemptibleOnly,
+      interruptionDeadline:
+        node.interruptionDeadlineUs === null ? null : at(node.interruptionDeadlineUs),
       health: node.health,
       epoch: node.epoch,
       lastHeartbeat: node.lastHeartbeatUs === null ? null : at(node.lastHeartbeatUs),

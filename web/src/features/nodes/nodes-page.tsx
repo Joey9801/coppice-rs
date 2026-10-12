@@ -17,6 +17,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
+import { InterruptionBadge } from './interruption-badge'
 import { sortedLabels } from './lib'
 
 export function NodesPage() {
@@ -87,7 +88,9 @@ function NodesSummaryLine({ nodes }: { nodes: NodeSummary[] | undefined }) {
 
 function statusPill(node: NodeSummary) {
   if (node.health === 'Lost') return <StatePill state="Lost" />
-  if (!node.schedulable) return <StatePill state="Draining" />
+  // Either the admin cordon or the agent's own drain (e.g. on a provider
+  // interruption, ADR 0044 §5) stops new placements.
+  if (!node.schedulable || node.draining) return <StatePill state="Draining" />
   // `Unknown` renders as itself: with no heartbeat marks to judge by (a
   // follower serving the read), "Healthy" would be a fabrication.
   return <StatePill state={node.health} />
@@ -112,6 +115,9 @@ function NodeRow({ node }: { node: NodeSummary }) {
         <div className="flex flex-wrap items-center gap-1.5">
           {statusPill(node)}
           {node.preemptibleOnly ? <SpotBadge /> : null}
+          {node.interruptionDeadline != null ? (
+            <InterruptionBadge deadline={node.interruptionDeadline} className="text-[10px]" />
+          ) : null}
         </div>
       </TableCell>
       <TableCell>

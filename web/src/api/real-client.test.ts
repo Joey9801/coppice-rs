@@ -464,6 +464,7 @@ describe('getJob attempts', () => {
       rate_ucu_per_second: 1,
       charged_ucu: 240,
       preemptible: false,
+      preemption: null,
       ...overrides,
     })
     fetchMock.mockResolvedValueOnce(
@@ -530,6 +531,218 @@ describe('getJob attempts', () => {
   })
 })
 
+describe('platform terminations (ADR 0044 §2–§5)', () => {
+  const jobId = 'job-00000000-0000-0000-0000-000000000001'
+  const otherJob = 'job-00000000-0000-0000-0000-000000000002'
+  const wireAttempt = (n: number, overrides: Record<string, unknown>) => ({
+    id: `attempt-00000000-0000-0000-0000-00000000000${n}`,
+    job: jobId,
+    node: 'node-00000000-0000-0000-0000-000000000001',
+    allocation: `alloc-00000000-0000-0000-0000-00000000000${n}`,
+    state: 'terminal',
+    outcome: null,
+    started_at: '2026-01-01T00:01:00.000000Z',
+    ended_at: null,
+    rate_ucu_per_second: 1,
+    charged_ucu: 0,
+    preemptible: true,
+    preemption: null,
+    ...overrides,
+  })
+  const jobWith = (attempts: unknown[]) => ({
+    id: jobId,
+    state: 'attempting',
+    attempt: 'attempt-00000000-0000-0000-0000-000000000003',
+    spec: {
+      image: 'busybox',
+      command: [],
+      entrypoint: null,
+      env: {},
+      requests: { cpu_millis: 100, memory_bytes: 1, disk_bytes: 1 },
+      priority: 0,
+      max_runtime_seconds: null,
+      quota_entity: 'quota-00000000-0000-0000-0000-000000000001',
+      quota_entity_path: 'acme/root',
+      retry: { max_retries: 0, retry_user_errors: false },
+      preemption: { preemptible: true, notice_seconds: 120, notice_signal: 'SIGUSR1' },
+    },
+    submitted_at: '2026-01-01T00:00:00.000000Z',
+    state_since: '2026-01-01T00:05:00.000000Z',
+    terminal_at: null,
+    retries_used: 0,
+    abort_requested: null,
+    entity_chain: [],
+    attempts,
+    queue: null,
+    accrual: null,
+    cost: {
+      rate_ucu_per_second: 1,
+      rate_breakdown: { cpu: 1, memory: 0, disk: 0 },
+      priority_multiplier: 1,
+      unbounded_multiplier: 1,
+      preemptible_multiplier: 0.75,
+      effective_rate_ucu_per_second: 0.75,
+      charge_window_seconds: 0,
+      charge_window_is_default: true,
+      estimated_ucu: 0,
+      charged_ucu: 0,
+      refund_fraction: 0,
+      actual_ucu: null,
+      true_up: null,
+    },
+  })
+
+  it('maps the preempted outcome, the termination record and the preempting state', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse(
+        jobWith([
+          wireAttempt(1, {
+            outcome: {
+              kind: 'preempted',
+              class: 'platform',
+              reason: 'priority',
+              for_job: otherJob,
+            },
+            ended_at: '2026-01-01T00:03:00.000000Z',
+            preemption: {
+              reason: 'priority',
+              for_job: otherJob,
+              requested_at: '2026-01-01T00:00:58.000000Z',
+              notified_at: '2026-01-01T00:01:00.000000Z',
+              deadline: '2026-01-01T00:03:00.000000Z',
+              notice_shortfall_seconds: 0,
+            },
+          }),
+          wireAttempt(2, {
+            // `reason` present, `for_job` omitted: a node-driven termination.
+            outcome: { kind: 'preempted', class: 'platform', reason: 'interruption' },
+            ended_at: '2026-01-01T00:04:00.000000Z',
+            preemption: {
+              reason: 'interruption',
+              for_job: null,
+              requested_at: '2026-01-01T00:03:30.000000Z',
+              notified_at: '2026-01-01T00:03:30.000000Z',
+              deadline: '2026-01-01T00:04:00.000000Z',
+              notice_shortfall_seconds: 90,
+            },
+          }),
+          wireAttempt(3, {
+            state: 'preempting',
+            preemption: {
+              reason: 'drain',
+              for_job: null,
+              requested_at: '2026-01-01T00:05:00.000000Z',
+              notified_at: null,
+              deadline: null,
+              notice_shortfall_seconds: null,
+            },
+          }),
+        ]),
+      ),
+    )
+    const job = await createRealClient().getJob(jobId)
+    const [byPriority, byInterruption, preempting] = job.attempts
+
+    expect(byPriority!.outcome).toEqual({
+      kind: 'Preempted',
+      class: 'Platform',
+      reason: 'Priority',
+      forJob: otherJob,
+    })
+    expect(byPriority!.preemption).toEqual({
+      reason: 'Priority',
+      forJob: otherJob,
+      requestedAt: new Date('2026-01-01T00:00:58Z'),
+      notifiedAt: new Date('2026-01-01T00:01:00Z'),
+      deadline: new Date('2026-01-01T00:03:00Z'),
+      noticeShortfallSeconds: 0,
+    })
+    expect(byInterruption!.outcome).toEqual({
+      kind: 'Preempted',
+      class: 'Platform',
+      reason: 'Interruption',
+    })
+    expect(byInterruption!.preemption?.noticeShortfallSeconds).toBe(90)
+
+    expect(preempting!.state).toBe('Preempting')
+    expect(preempting!.outcome).toBeNull()
+    expect(preempting!.preemption).toEqual({
+      reason: 'Drain',
+      forJob: null,
+      requestedAt: new Date('2026-01-01T00:05:00Z'),
+      notifiedAt: null,
+      deadline: null,
+      noticeShortfallSeconds: null,
+    })
+  })
+
+  it('maps an outcome without preemption fields to one without them', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse(
+        jobWith([wireAttempt(1, { outcome: { kind: 'node_lost', class: 'platform' } })]),
+      ),
+    )
+    const job = await createRealClient().getJob(jobId)
+    expect(job.attempts[0]!.outcome).toEqual({ kind: 'NodeLost', class: 'Platform' })
+    expect(job.attempts[0]!.preemption).toBeNull()
+  })
+
+  it("maps a node's interruption deadline", async () => {
+    const node = (deadline: string | null) => ({
+      id: 'node-00000000-0000-0000-0000-000000000001',
+      capacity: { cpu_millis: 1, memory_bytes: 1, disk_bytes: 1 },
+      allocated: { cpu_millis: 0, memory_bytes: 0, disk_bytes: 0 },
+      used: null,
+      labels: {},
+      schedulable: true,
+      draining: true,
+      preemptible_only: true,
+      interruption_deadline: deadline,
+      health: 'healthy',
+      epoch: 1,
+      last_heartbeat: null,
+      running_count: 0,
+      accruing_count: 0,
+    })
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({ nodes: [node('2026-01-01T00:02:00.000000Z'), node(null)] }),
+    )
+    const [interrupted, plain] = await createRealClient().listNodes()
+    expect(interrupted!.interruptionDeadline).toEqual(new Date('2026-01-01T00:02:00Z'))
+    expect(plain!.interruptionDeadline).toBeNull()
+  })
+
+  it('maps the attempt_notified timeline event', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        events: [
+          {
+            index: 7,
+            ordinal: 1,
+            at: '2026-01-01T00:05:00.000000Z',
+            kind: 'attempt_notified',
+            attempt: 'attempt-00000000-0000-0000-0000-000000000003',
+            job: jobId,
+            node: 'node-00000000-0000-0000-0000-000000000001',
+          },
+        ],
+        floor_index: 0,
+        next_cursor: null,
+      }),
+    )
+    const [event] = await createRealClient().getJobTimeline(jobId)
+    expect(event).toEqual({
+      index: 7,
+      ordinal: 1,
+      at: new Date('2026-01-01T00:05:00Z'),
+      kind: 'AttemptNotified',
+      attempt: 'attempt-00000000-0000-0000-0000-000000000003',
+      job: jobId,
+      node: 'node-00000000-0000-0000-0000-000000000001',
+    })
+  })
+})
+
 describe('preemption fields (ADR 0044)', () => {
   it('maps job spec, attempt, cost, entity and node preemption fields from the wire', async () => {
     const jobId = 'job-00000000-0000-0000-0000-000000000001'
@@ -569,6 +782,7 @@ describe('preemption fields (ADR 0044)', () => {
             rate_ucu_per_second: 1,
             charged_ucu: 240,
             preemptible: true,
+            preemption: null,
           },
         ],
         queue: null,
@@ -635,6 +849,7 @@ describe('preemption fields (ADR 0044)', () => {
             schedulable: true,
             draining: false,
             preemptible_only: true,
+            interruption_deadline: null,
             health: 'healthy',
             epoch: 1,
             last_heartbeat: null,

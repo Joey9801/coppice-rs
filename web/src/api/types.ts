@@ -129,9 +129,14 @@ export function jobStateLabel(state: JobState): string {
   return state.kind === 'Attempting' ? `Attempting(${state.attempt})` : state.kind
 }
 
-/** `AttemptState`: one execution of a job (retries mint a new attempt). */
+/**
+ * `AttemptState`: one execution of a job (retries mint a new attempt).
+ *
+ * `Preempting` is derived (ADR 0044 §3): a `Running` attempt with a
+ * termination record. Display-only, so never on a timeline event.
+ */
 export type AttemptState =
-  'Accruing' | 'Ready' | 'Dispatching' | 'Running' | 'Finalizing' | 'Terminal'
+  'Accruing' | 'Ready' | 'Dispatching' | 'Running' | 'Preempting' | 'Finalizing' | 'Terminal'
 
 /**
  * Flat display "phase" for a job (ADR 0030 observability note): a read-time
@@ -199,6 +204,7 @@ export function derivePhase(state: JobState, attemptState: AttemptState | null):
     case 'Dispatching':
       return 'Preparing'
     case 'Running':
+    case 'Preempting':
       return 'Running'
     case 'Finalizing':
     case 'Terminal':
@@ -219,6 +225,10 @@ export type AttemptOutcomeKind =
   | 'StartFailed'
   | 'NodeLost'
   | 'AgentError'
+  | 'Preempted'
+
+/** `PreemptReason` — why the platform terminated a running attempt (ADR 0044 §2). */
+export type PreemptReason = 'Priority' | 'Relocation' | 'Drain' | 'Interruption'
 
 /** `OutcomeClass` — who "owns" the outcome (drives retry policy). */
 export type OutcomeClass = 'Success' | 'UserError' | 'UserRequest' | 'Platform'
@@ -228,6 +238,25 @@ export interface AttemptOutcome {
   /** Present when kind is `Exited`. */
   exitCode?: number
   class: OutcomeClass
+  /** Present when kind is `Preempted`. */
+  reason?: PreemptReason
+  /** The job a `Priority` or `Relocation` preemption made room for. */
+  forJob?: JobId
+}
+
+/** An attempt's termination record (ADR 0044 §3); it stays on the attempt after it ends. */
+export interface AttemptPreemption {
+  reason: PreemptReason
+  /** The job a `Priority` or `Relocation` preemption made room for. */
+  forJob: JobId | null
+  /** When the coordinator committed to, or learned of, the termination. */
+  requestedAt: Date
+  /** When the agent's notice mark was recorded; null until the notice was delivered. */
+  notifiedAt: Date | null
+  /** The stop time the coordinator plans against; only ever moves earlier. Null until acknowledged. */
+  deadline: Date | null
+  /** Declared notice minus notice given, rounded up; null until acknowledged. */
+  noticeShortfallSeconds: number | null
 }
 
 /**
@@ -269,6 +298,8 @@ export interface AttemptView {
    * true the charge carries the preemptible discount.
    */
   preemptible: boolean
+  /** Termination record (ADR 0044 §3); a running attempt with one shows `state: 'Preempting'`. */
+  preemption: AttemptPreemption | null
 }
 
 // ---------------------------------------------------------------------------
@@ -602,6 +633,8 @@ export type TimelineEventBody =
     }
   | { kind: 'AllocationFunded'; allocation: AllocationId; job: JobId; node: NodeId }
   | { kind: 'StopRequested'; node: NodeId; allocation: AllocationId; job: JobId }
+  /** A termination record was created or its deadline moved earlier (ADR 0044 §3); re-read the attempt. */
+  | { kind: 'AttemptNotified'; attempt: AttemptId; job: JobId; node: NodeId }
   | { kind: 'NodeEpochBumped'; node: NodeId; epoch: number }
   | { kind: 'JobEvicted'; job: JobId }
   | { kind: 'JobMetadataUpdated'; job: JobId }
@@ -748,6 +781,8 @@ export interface NodeSummary {
    * preemptible work.
    */
   preemptibleOnly: boolean
+  /** Provider interruption deadline (ADR 0044 §5), from the agent's wall clock: display only. */
+  interruptionDeadline: Date | null
   health: NodeHealth
   /** Bumps on (re)registration or loss; fences stale agent commands. */
   epoch: number
