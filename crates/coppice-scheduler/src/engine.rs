@@ -1297,6 +1297,7 @@ mod tests {
                 },
                 epoch: 1,
                 draining: false,
+                interruption_deadline: None,
             },
         );
         sm

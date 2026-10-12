@@ -126,6 +126,7 @@ fn node_summary(
         schedulable: record.node.schedulable,
         draining: record.draining,
         preemptible_only: record.node.preemptible_only,
+        interruption_deadline: record.interruption_deadline,
         health: node_health(mark),
         epoch: record.epoch,
         // The wall stamp is display-only: health above never reads it.
@@ -537,7 +538,12 @@ fn attempt_view(ar: &AttemptRecord) -> dto::AttemptView {
         job: ar.attempt.job,
         node: ar.attempt.node,
         allocation: ar.attempt.allocation,
-        state: (&ar.attempt.state).into(),
+        // "Preempting" is derived here and nowhere else (ADR 0044 §3): a
+        // running attempt the platform has asked to stop.
+        state: match (&ar.attempt.state, &ar.preemption) {
+            (AttemptState::Running, Some(_)) => dto::AttemptState::Preempting,
+            (state, _) => state.into(),
+        },
         outcome: match &ar.attempt.state {
             AttemptState::Terminal(outcome) => Some(outcome.into()),
             _ => None,
@@ -547,6 +553,7 @@ fn attempt_view(ar: &AttemptRecord) -> dto::AttemptView {
         rate_ucu_per_second: ar.rate_ucu_per_second,
         charged_ucu: ar.charge.amount.0,
         preemptible: ar.effective_preemptible,
+        preemption: ar.preemption.as_ref().map(Into::into),
     }
 }
 
@@ -1643,6 +1650,7 @@ mod tests {
             },
             epoch: 1,
             draining: false,
+            interruption_deadline: None,
         }
     }
 
@@ -1668,6 +1676,7 @@ mod tests {
             ended_at: None,
             settlement: None,
             effective_preemptible: false,
+            preemption: None,
         }
     }
 

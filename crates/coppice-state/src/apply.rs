@@ -10,7 +10,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use coppice_core::allocation::{Allocation, AllocationState};
-use coppice_core::attempt::{Attempt, AttemptOutcome, AttemptState, OutcomeClass};
+use coppice_core::attempt::{
+    Acknowledged, Attempt, AttemptOutcome, AttemptState, OutcomeClass, Preemption,
+};
 use coppice_core::entity_ref;
 use coppice_core::env;
 use coppice_core::id::{AllocationId, AttemptId, JobId, NodeId, QuotaEntityId};
@@ -30,10 +32,11 @@ use crate::command::{
     AbortJob, BindMachineIdentity, BumpClusterVersion, CommitPlacements, ConfigureQuotaEntity,
     ConfirmKeyPossession, ConfirmStagedKeyPossession, DeclareNodeLost, DispatchAttempt, EvictNodes,
     EvictTerminalJobs, MintEnrollToken, Placement, RebindMachineAddress, ReconcileNode,
-    RecordAttemptExited, RecordAttemptOutcome, RecordAttemptStarted, RecordCaCertificate,
-    RecordEnrolledIdentity, RecordKeyTransferIntent, RecordStagedKeyTransferIntent, RegisterNode,
-    RenewIntervalCharges, RetireMachineBinding, RevokeEnrollToken, RevokeIdentity, SetNodeDraining,
-    SetNodeSchedulable, SubmitJob, UpdateAuthorization, UpdateJobMetadata, UpdatePolicy,
+    RecordAttemptExited, RecordAttemptNotified, RecordAttemptOutcome, RecordAttemptStarted,
+    RecordCaCertificate, RecordEnrolledIdentity, RecordKeyTransferIntent,
+    RecordStagedKeyTransferIntent, RegisterNode, RenewIntervalCharges, RetireMachineBinding,
+    RevokeEnrollToken, RevokeIdentity, SetNodeDraining, SetNodeSchedulable, SubmitJob,
+    UpdateAuthorization, UpdateJobMetadata, UpdatePolicy,
 };
 use crate::{
     AllocationRecord, Applied, AttemptRecord, CaCertificate, Command, EnrollToken, Event,
@@ -61,6 +64,7 @@ impl StateMachine {
             Command::RecordAttemptExited(c) => self.record_attempt_exited(c),
             Command::RecordAttemptOutcome(c) => self.record_attempt_outcome(c),
             Command::ReconcileNode(c) => self.reconcile_node(c),
+            Command::RecordAttemptNotified(c) => self.record_attempt_notified(c),
             Command::RegisterNode(c) => self.register_node(c),
             Command::DeclareNodeLost(c) => self.declare_node_lost(c),
             Command::SetNodeSchedulable(c) => self.set_node_schedulable(c),
@@ -568,6 +572,7 @@ impl StateMachine {
                     started_at: None,
                     ended_at: None,
                     settlement: None,
+                    preemption: None,
                     effective_preemptible: preemptible,
                 },
             );
@@ -838,6 +843,80 @@ impl StateMachine {
         Ok(Applied { events })
     }
 
+    fn record_attempt_notified(&mut self, c: &RecordAttemptNotified) -> ApplyResult {
+        // The record exists only for a Running attempt (ADR 0044 §3): a mark
+        // for an attempt that has already exited, or one that has not been
+        // observed running, is a stale report like any other.
+        let rec = match self.attempts.get(&c.attempt) {
+            None => return Err(RejectionReason::UnknownAttempt(c.attempt)),
+            Some(a) if a.attempt.state != AttemptState::Running => {
+                return Err(RejectionReason::StaleAttemptState(c.attempt));
+            }
+            Some(a) => a,
+        };
+        let deadline = c
+            .observed_at
+            .saturating_add(c.remaining.max(Duration::ZERO));
+        let shortfall = c.shortfall.max(Duration::ZERO);
+        let acknowledged = Acknowledged {
+            notified_at: c.observed_at,
+            deadline,
+            notice_shortfall: shortfall,
+        };
+        let next = match rec.preemption {
+            // The first the coordinator hears of it (a drain or an
+            // interruption): create the record and acknowledge it together.
+            None => Preemption {
+                reason: c.reason,
+                requested_at: c.observed_at,
+                acknowledged: Some(acknowledged),
+            },
+            // A scheduler preemption the agent has now delivered: the
+            // request's own reason stands.
+            Some(Preemption {
+                reason,
+                requested_at,
+                acknowledged: None,
+            }) => Preemption {
+                reason,
+                requested_at,
+                acknowledged: Some(acknowledged),
+            },
+            // Already acknowledged: the deadline only ever moves earlier, so
+            // a published release bound stays valid; `notified_at` and the
+            // reason never move.
+            Some(
+                p @ Preemption {
+                    acknowledged: Some(prior),
+                    ..
+                },
+            ) => {
+                if deadline >= prior.deadline {
+                    return Ok(Applied::default());
+                }
+                Preemption {
+                    acknowledged: Some(Acknowledged {
+                        notified_at: prior.notified_at,
+                        deadline,
+                        notice_shortfall: shortfall,
+                    }),
+                    ..p
+                }
+            }
+        };
+        let (job, node) = (rec.attempt.job, rec.attempt.node);
+        if let Some(a) = self.attempts.get_mut(&c.attempt) {
+            a.preemption = Some(next);
+        }
+        Ok(Applied {
+            events: vec![Event::AttemptNotified {
+                attempt: c.attempt,
+                job,
+                node,
+            }],
+        })
+    }
+
     fn reconcile_node(&mut self, c: &ReconcileNode) -> ApplyResult {
         let epoch = match self.nodes.get(&c.node) {
             None => return Err(RejectionReason::UnknownNode(c.node)),
@@ -947,6 +1026,7 @@ impl StateMachine {
                 // definition, not gone away, so a report without the flag
                 // voids the earlier "I am leaving".
                 rec.draining = c.draining;
+                rec.interruption_deadline = c.interruption_deadline;
                 rec.node.capacity = c.capacity;
                 rec.node.labels = c.labels.clone();
                 // Overwrite the advertised address like capacity/labels: an
@@ -981,6 +1061,7 @@ impl StateMachine {
                         },
                         epoch: 1,
                         draining: c.draining,
+                        interruption_deadline: c.interruption_deadline,
                     },
                 );
                 events.push(Event::NodeEpochBumped {
@@ -1066,6 +1147,9 @@ impl StateMachine {
         // admin cordon. The cordon itself is untouched — the two flags have
         // different owners.
         rec.draining = c.draining;
+        // Display-only (ADR 0044 §5): the agent's reading of the provider's
+        // deadline, carried by the same announcement.
+        rec.interruption_deadline = c.interruption_deadline;
         Ok(Applied::default())
     }
 
@@ -2017,10 +2101,13 @@ impl StateMachine {
             // actually terminated the attempt.
             AttemptOutcome::Aborted => Resolution::Terminal(JobState::Aborted),
             o if o.class() == OutcomeClass::Success => Resolution::Terminal(JobState::Succeeded),
-            // Revoked requeues free of retry budget — unless an abort is
-            // pending, which always wins over any requeue (unreachable via
-            // the ordered log; specified for completeness).
-            AttemptOutcome::Revoked => {
+            // Revoked and Preempted requeue free of retry budget — unless an
+            // abort is pending, which always wins over any requeue. For
+            // Revoked that is unreachable via the ordered log (specified for
+            // completeness); a preempted attempt can race an abort, and then
+            // the job ends Aborted while the attempt keeps its own outcome
+            // (ADR 0044 §2). There is no cap on how often a job is preempted.
+            AttemptOutcome::Revoked | AttemptOutcome::Preempted { .. } => {
                 if abort_pending {
                     Resolution::Terminal(JobState::Aborted)
                 } else {

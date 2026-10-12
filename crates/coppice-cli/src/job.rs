@@ -84,9 +84,10 @@ use coppice_client::{
     paths, AbortJobRequest, AttemptId, Client, FollowOptions, JobCursor, JobDetail, JobEnv,
     JobFilter, JobId, JobMetadata, JobPhase, ListJobsParams, ListJobsResponse, LogAvailability,
     LogEntry, LogOrder, LogSourceRecord, LogStreamName, LogsParams, NodeId, NoticeSignal,
-    PreemptionRequest, QuotaEntityRef, ReplaceJobMetadataRequest, RequestsResource, Resources,
-    RetryPolicy, SubmitJobRequest, TimelineEvent, TimelineEventBody, TimelineParams, Timestamp,
-    UpdateJobMetadataRequest, UsageAvailability, UsageParams, UsagePoint, UsageSourceRecord,
+    PreemptReason, PreemptionRequest, QuotaEntityRef, ReplaceJobMetadataRequest, RequestsResource,
+    Resources, RetryPolicy, SubmitJobRequest, TimelineEvent, TimelineEventBody, TimelineParams,
+    Timestamp, UpdateJobMetadataRequest, UsageAvailability, UsageParams, UsagePoint,
+    UsageSourceRecord,
 };
 use coppice_core::bytes::ByteSize;
 
@@ -1559,11 +1560,40 @@ fn render_status(detail: &JobDetail) -> String {
                 if let Some(code) = outcome.exit_code {
                     let _ = write!(line, " (exit {code})");
                 }
+                if let Some(reason) = &outcome.reason {
+                    let _ = write!(line, " ({})", reason_label(reason, outcome.for_job));
+                }
             }
             let _ = writeln!(out, "{line}");
+            if let Some(p) = &attempt.preemption {
+                let mut detail = format!(
+                    "    termination: {} requested {}",
+                    reason_label(&p.reason, p.for_job),
+                    p.requested_at
+                );
+                if let Some(deadline) = p.deadline {
+                    let _ = write!(detail, ", deadline {deadline}");
+                }
+                if let Some(shortfall) = p.notice_shortfall_seconds {
+                    let _ = write!(detail, ", notice shortfall {shortfall}s");
+                }
+                if p.notified_at.is_none() {
+                    detail.push_str(", not yet notified");
+                }
+                let _ = writeln!(out, "{detail}");
+            }
         }
     }
     out
+}
+
+/// A preemption reason, with the job it made room for when there is one:
+/// `interruption`, `priority for job-…`.
+fn reason_label(reason: &PreemptReason, for_job: Option<JobId>) -> String {
+    match for_job {
+        Some(job) => format!("{reason} for {job}"),
+        None => reason.to_string(),
+    }
 }
 
 /// Render a job's event timeline (ADR 0032) as the block appended after the
@@ -1623,6 +1653,9 @@ fn timeline_description(body: &TimelineEventBody) -> String {
         B::StopRequested {
             allocation, node, ..
         } => format!("stop requested for allocation {allocation} on node {node}"),
+        B::AttemptNotified { attempt, node, .. } => {
+            format!("attempt {attempt} notified on node {node}")
+        }
         B::JobEvicted { .. } => "evicted".to_string(),
         B::JobMetadataUpdated { .. } => "metadata updated".to_string(),
         // The five cluster-scoped events never fall inside a job-filtered
@@ -2050,6 +2083,60 @@ EMPTY = ""
         );
         assert!(
             rendered.contains("multipliers     unbounded x1, preemptible x0.5"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn status_renders_preempted_outcomes_and_termination_records() {
+        let job = CoreJobId::new();
+        let other = CoreJobId::new();
+        let mut detail = sample_job_detail(job, dto::JobStateKind::Attempting);
+        let ts = |us| CoreTimestamp::from_micros(us).unwrap();
+        let base = |n: u128, state| dto::AttemptView {
+            id: CoreAttemptId::new(),
+            job,
+            node: "node-00000000-0000-0000-0000-000000000001".parse().unwrap(),
+            allocation: "alloc-00000000-0000-0000-0000-000000000001"
+                .parse()
+                .unwrap(),
+            state,
+            outcome: None,
+            started_at: Some(ts(1_000_000 + n as i64)),
+            ended_at: None,
+            rate_ucu_per_second: 1,
+            charged_ucu: 1,
+            preemptible: true,
+            preemption: None,
+        };
+        let mut running = base(1, dto::AttemptState::Preempting);
+        running.preemption = Some(dto::AttemptPreemption {
+            reason: dto::PreemptReason::Priority,
+            for_job: Some(other),
+            requested_at: ts(2_000_000),
+            notified_at: Some(ts(2_100_000)),
+            deadline: Some(ts(62_000_000)),
+            notice_shortfall_seconds: Some(5),
+        });
+        let mut ended = base(2, dto::AttemptState::Terminal);
+        ended.outcome = Some(dto::AttemptOutcome {
+            kind: dto::AttemptOutcomeKind::Preempted,
+            exit_code: None,
+            class: dto::OutcomeClass::Platform,
+            reason: Some(dto::PreemptReason::Interruption),
+            for_job: None,
+        });
+        detail.attempts = vec![running, ended];
+        let rendered = render_status(&as_client(detail));
+        assert!(rendered.contains(" preempting node "), "{rendered}");
+        assert!(
+            rendered.contains(&format!("termination: priority for {other} requested")),
+            "{rendered}"
+        );
+        assert!(rendered.contains("notice shortfall 5s"), "{rendered}");
+        assert!(rendered.contains(", deadline "), "{rendered}");
+        assert!(
+            rendered.contains("outcome preempted (interruption)"),
             "{rendered}"
         );
     }

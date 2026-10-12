@@ -15,6 +15,7 @@ package coppice.agent.v1;
 
 import "coppice/core/v1/attempt.proto";
 import "coppice/core/v1/ids.proto";
+import "coppice/core/v1/job.proto";
 
 // One journal entry. Append-only; compaction rewrites the live set.
 message JournalRecord {
@@ -23,6 +24,9 @@ message JournalRecord {
     StartIntent start_intent = 2;
     AllocationTombstone tombstone = 3;
     ObservedExit observed_exit = 4;
+    NoticeIntent notice_intent = 5;
+    NoticeMark notice_mark = 6;
+    DrainPlan drain_plan = 7;
   }
 }
 
@@ -49,6 +53,12 @@ message StartIntent {
   // journaled so recovery can rebuild the max-runtime watchdog: the remaining
   // budget is this minus the runtime the container reports. Absent = unbounded.
   optional uint64 max_runtime_us = 5;
+  // The notice contract and stop-path grace copied from StartJob (ADR 0044
+  // §3), so recovery re-signals with the declared signal and runs the stop
+  // path with the dispatched grace.
+  coppice.core.v1.NoticeSignal notice_signal = 6;
+  uint64 notice_us = 7;
+  uint64 abort_grace_us = 8;
 }
 
 // A StopJob was accepted for this allocation (ADR 0013): journaled before
@@ -56,6 +66,53 @@ message StartIntent {
 // agent restart. Valid for allocations the agent has never seen.
 message AllocationTombstone {
   coppice.core.v1.AllocationId allocation = 1;
+  // Which command wrote it, so a tombstone found on recovery resolves as
+  // that command would have (ADR 0044 §3). Always written.
+  TombstoneReason reason = 2;
+}
+
+message TombstoneReason {
+  // A StopJob from the coordinator.
+  message Abort {}
+  // The agent's own stop path for a preemption, drain or interruption.
+  message Preempt {
+    coppice.core.v1.PreemptReason reason = 1;
+  }
+
+  oneof reason {
+    Abort abort = 1;
+    Preempt preempt = 2;
+  }
+}
+
+// The platform asked this attempt to stop (ADR 0044 §3): journaled, fsynced,
+// *before* the notice signal is delivered. The intent, not the mark, is the
+// classifier: a non-zero exit of an allocation with an intent is Preempted.
+message NoticeIntent {
+  coppice.core.v1.AllocationId allocation = 1;
+  coppice.core.v1.PreemptReason reason = 2;
+}
+
+// The notice signal was delivered (ADR 0044 §3): journaled after the signal,
+// before it is reported. The latest mark per allocation is in force, and a
+// replacement mark may only be earlier.
+message NoticeMark {
+  coppice.core.v1.AllocationId allocation = 1;
+  // The attempt's stop time, agent wall-clock µs.
+  int64 stop_at_us = 2;
+  // Declared notice minus notice actually given; zero when none was lost.
+  uint64 shortfall_us = 3;
+}
+
+// The node's active drain plan (ADR 0044 §5), so a restarted agent still
+// runs it. The latest record is in force.
+message DrainPlan {
+  // The plan's deadline D, agent wall-clock µs.
+  int64 deadline_us = 1;
+  coppice.core.v1.PreemptReason reason = 2;
+  // The accepted-work target of a deadline drain; unused until operator
+  // deadline drains exist.
+  optional int64 accepted_target_us = 3;
 }
 
 // The container's exit was observed and classified (ADR 0013 taxonomy).

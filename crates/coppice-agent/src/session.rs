@@ -29,7 +29,7 @@ use coppice_proto::pb::agent::v1 as pb;
 use coppice_proto::pb::core::v1 as pbcore;
 
 use crate::executor::{classify_exit, Executor, ExitCause, ExitInfo, StartSpec, StopOutcome};
-use crate::journal::{ExitRec, IntentRec, Journal, JournalState, Watermark};
+use crate::journal::{ExitRec, IntentRec, Journal, JournalState, TombstoneReason, Watermark};
 use crate::observed::{build_observed_set, ObservedAllocation};
 
 /// The outcome of the fencing check for one inbound command (ADR 0009).
@@ -510,7 +510,7 @@ impl<F: Fs, E: Executor> Session<F, E> {
 
         // Tombstone → refuse and report, unless a journaled exit records the
         // honest outcome (truth wins over the tombstone-abort, ADR 0013).
-        if self.state.tombstones.contains(&alloc) {
+        if self.state.tombstones.contains_key(&alloc) {
             if let Some(exit) = self.state.exits.get(&alloc) {
                 return Ok(vec![self.terminal_status(
                     alloc,
@@ -559,6 +559,14 @@ impl<F: Fs, E: Executor> Session<F, E> {
             tracing::info!(node = %self.node, %alloc, "starting committed StartJob while drained (intent predates the drain)");
         }
 
+        // Already validated by `resumption_env` above, which drops a StartJob
+        // whose signal is outside the allowlist.
+        let notice_signal = coppice_proto::convert::notice_signal_from_pb(
+            sj.notice_signal,
+            "StartJob.notice_signal",
+        )
+        .unwrap_or_default();
+
         // Journal the intent and fsync BEFORE starting the container: a
         // running container always has durable intent behind it (ADR 0009).
         let intent = IntentRec {
@@ -567,6 +575,9 @@ impl<F: Fs, E: Executor> Session<F, E> {
             job,
             node_epoch: self.epoch,
             max_runtime: sj.max_runtime_us.map(runtime_bound),
+            notice_signal,
+            notice: runtime_bound(sj.notice_us),
+            abort_grace: runtime_bound(sj.abort_grace_us),
         };
         self.journal.journal_intent(&intent)?;
         self.state.intents.insert(alloc, intent);
@@ -624,8 +635,9 @@ impl<F: Fs, E: Executor> Session<F, E> {
         // Tombstone first, fsynced, valid even for an unknown allocation: a
         // racing or re-delivered StartJob is refused even across a restart
         // (ADR 0013).
-        self.journal.journal_tombstone(alloc)?;
-        self.state.tombstones.insert(alloc);
+        self.journal
+            .journal_tombstone(alloc, TombstoneReason::Abort)?;
+        self.state.tombstones.insert(alloc, TombstoneReason::Abort);
 
         // Already ended → report the honest outcome (truth wins).
         if let Some(exit) = self.state.exits.get(&alloc) {
@@ -760,7 +772,7 @@ impl<F: Fs, E: Executor> Session<F, E> {
             tracing::warn!(node = %self.node, %alloc, "observed exit for an allocation with no intent; ignoring");
             return Ok(Vec::new());
         };
-        let outcome = classify_exit(&exit, self.state.tombstones.contains(&alloc));
+        let outcome = classify_exit(&exit, self.state.tombstones.contains_key(&alloc));
         self.record_exit(
             alloc,
             intent.attempt,
@@ -833,6 +845,7 @@ impl<F: Fs, E: Executor> Session<F, E> {
                 // Spot-only (ADR 0044 §4); registration rewrites the
                 // replicated flag, so a config change takes effect on restart.
                 preemptible_only: self.preemptible_only,
+                interruption_deadline_us: None,
             })),
         }
     }
@@ -904,6 +917,7 @@ impl<F: Fs, E: Executor> Session<F, E> {
             image_cache: Some(self.executor.cache_inventory()),
             used,
             draining: self.draining,
+            interruption_deadline_us: None,
         }))
     }
 
@@ -923,7 +937,7 @@ impl<F: Fs, E: Executor> Session<F, E> {
                 exit.runtime,
             )];
         }
-        if self.state.tombstones.contains(&alloc) {
+        if self.state.tombstones.contains_key(&alloc) {
             return vec![self.terminal_status(
                 alloc,
                 attempt,
@@ -1069,7 +1083,7 @@ pub fn resumption_env(sj: &pb::StartJob) -> Option<Vec<(&'static str, String)>> 
         (None, None) => None,
         (Some(id), Some(outcome)) => {
             let id: AttemptId = id.clone().try_into().ok()?;
-            let outcome: AttemptOutcome = (*outcome).try_into().ok()?;
+            let outcome: AttemptOutcome = outcome.clone().try_into().ok()?;
             Some((id, outcome))
         }
         _ => return None,
@@ -1125,6 +1139,7 @@ fn observed_to_pb(o: &ObservedAllocation) -> pb::ObservedAllocation {
         running: o.running,
         outcome: o.outcome.as_ref().map(|oc| oc.into()),
         runtime_us: o.runtime.as_micros() as u64,
+        notice: None,
     }
 }
 

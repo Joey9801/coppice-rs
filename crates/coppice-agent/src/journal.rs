@@ -31,13 +31,14 @@
 //! fsync-before-container-start barrier of ADR 0009: `StartIntent` is durable
 //! before [`crate::executor::Executor::start`] is ever called.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::io;
 use std::path::Path;
 
 use coppice_consensus::fs::{write_atomic, Fs, FsFile};
-use coppice_core::attempt::AttemptOutcome;
+use coppice_core::attempt::{AttemptOutcome, PreemptReason};
 use coppice_core::id::{AllocationId, AttemptId, JobId};
+use coppice_core::preemption::NoticeSignal;
 use coppice_core::time::Duration;
 use coppice_proto::pb::agent::v1 as pb;
 use prost::Message;
@@ -67,6 +68,23 @@ pub struct IntentRec {
     /// The enforced runtime bound from `StartJob`, so recovery can re-arm the
     /// watchdog. `None` = unbounded.
     pub max_runtime: Option<Duration>,
+    /// The job's declared notice contract from `StartJob` (ADR 0044 §3), so
+    /// recovery re-signals with the declared signal.
+    pub notice_signal: NoticeSignal,
+    pub notice: Duration,
+    /// The stop-path grace dispatched with `StartJob` (the policy's
+    /// `abort_grace`), for a stop the agent runs on its own.
+    pub abort_grace: Duration,
+}
+
+/// Which command wrote a tombstone (ADR 0044 §3), so a tombstone found on
+/// recovery resolves as that command would have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TombstoneReason {
+    /// A `StopJob` from the coordinator: the abort mechanism.
+    Abort,
+    /// The agent's own stop path for a platform termination.
+    Preempt { reason: PreemptReason },
 }
 
 /// A journaled, classified exit (ADR 0013).
@@ -86,7 +104,7 @@ pub struct ExitRec {
 pub struct JournalState {
     pub watermark: Watermark,
     pub intents: BTreeMap<AllocationId, IntentRec>,
-    pub tombstones: BTreeSet<AllocationId>,
+    pub tombstones: BTreeMap<AllocationId, TombstoneReason>,
     pub exits: BTreeMap<AllocationId, ExitRec>,
 }
 
@@ -111,6 +129,11 @@ impl JournalState {
                 let allocation = try_id(si.allocation.clone(), "StartIntent.allocation")?;
                 let attempt = try_id(si.attempt.clone(), "StartIntent.attempt")?;
                 let job = try_id(si.job.clone(), "StartIntent.job")?;
+                let notice_signal = coppice_proto::convert::notice_signal_from_pb(
+                    si.notice_signal,
+                    "StartIntent.notice_signal",
+                )
+                .map_err(|_| corrupt("StartIntent.notice_signal"))?;
                 self.intents.insert(
                     allocation,
                     IntentRec {
@@ -121,12 +144,16 @@ impl JournalState {
                         max_runtime: si
                             .max_runtime_us
                             .map(|us| Duration::from_micros(i64::try_from(us).unwrap_or(i64::MAX))),
+                        notice_signal,
+                        notice: try_duration(si.notice_us, "StartIntent.notice_us")?,
+                        abort_grace: try_duration(si.abort_grace_us, "StartIntent.abort_grace_us")?,
                     },
                 );
             }
             Body::Tombstone(t) => {
                 let allocation = try_id(t.allocation.clone(), "AllocationTombstone.allocation")?;
-                self.tombstones.insert(allocation);
+                let reason = tombstone_reason_from_pb(t.reason.clone())?;
+                self.tombstones.insert(allocation, reason);
             }
             Body::ObservedExit(e) => {
                 let allocation = try_id(e.allocation.clone(), "ObservedExit.allocation")?;
@@ -134,6 +161,7 @@ impl JournalState {
                 let job = try_id(e.job.clone(), "ObservedExit.job")?;
                 let outcome = e
                     .outcome
+                    .clone()
                     .ok_or_else(|| corrupt("ObservedExit.outcome missing"))?
                     .try_into()
                     .map_err(|_| corrupt("ObservedExit.outcome invalid"))?;
@@ -148,6 +176,9 @@ impl JournalState {
                     },
                 );
             }
+            // The notice records (ADR 0044 §3) are defined but not yet written
+            // by this agent; there is nothing to fold until they are.
+            Body::NoticeIntent(_) | Body::NoticeMark(_) | Body::DrainPlan(_) => {}
         }
         Ok(())
     }
@@ -167,8 +198,8 @@ impl JournalState {
         for intent in self.intents.values() {
             records.push(record_intent(intent));
         }
-        for allocation in &self.tombstones {
-            records.push(record_tombstone(*allocation));
+        for (allocation, reason) in &self.tombstones {
+            records.push(record_tombstone(*allocation, *reason));
         }
         for exit in self.exits.values() {
             records.push(record_exit(exit));
@@ -266,8 +297,12 @@ impl<F: Fs> Journal<F> {
     }
 
     /// Journal a stop tombstone (fsynced) *before* acting on the stop.
-    pub fn journal_tombstone(&mut self, allocation: AllocationId) -> io::Result<()> {
-        self.append(&record_tombstone(allocation))
+    pub fn journal_tombstone(
+        &mut self,
+        allocation: AllocationId,
+        reason: TombstoneReason,
+    ) -> io::Result<()> {
+        self.append(&record_tombstone(allocation, reason))
     }
 
     /// Journal a classified exit (fsynced) *before* reporting it.
@@ -293,17 +328,47 @@ fn record_intent(intent: &IntentRec) -> pb::JournalRecord {
             max_runtime_us: intent
                 .max_runtime
                 .map(|d| u64::try_from(d.as_micros()).unwrap_or(0)),
+            notice_signal: coppice_proto::convert::notice_signal_to_pb(intent.notice_signal) as i32,
+            notice_us: u64::try_from(intent.notice.as_micros()).unwrap_or(0),
+            abort_grace_us: u64::try_from(intent.abort_grace.as_micros()).unwrap_or(0),
         })),
     }
 }
 
-fn record_tombstone(allocation: AllocationId) -> pb::JournalRecord {
+fn record_tombstone(allocation: AllocationId, reason: TombstoneReason) -> pb::JournalRecord {
+    use pb::tombstone_reason as r;
+    let reason = match reason {
+        TombstoneReason::Abort => r::Reason::Abort(r::Abort {}),
+        TombstoneReason::Preempt { reason } => r::Reason::Preempt(r::Preempt {
+            reason: Some(reason.into()),
+        }),
+    };
     pb::JournalRecord {
         body: Some(pb::journal_record::Body::Tombstone(
             pb::AllocationTombstone {
                 allocation: Some(allocation.into()),
+                reason: Some(pb::TombstoneReason {
+                    reason: Some(reason),
+                }),
             },
         )),
+    }
+}
+
+/// A tombstone's reason. Every tombstone is written with one, so a missing
+/// reason is corruption like any other missing field.
+fn tombstone_reason_from_pb(reason: Option<pb::TombstoneReason>) -> io::Result<TombstoneReason> {
+    use pb::tombstone_reason as r;
+    match reason.and_then(|r| r.reason) {
+        None => Err(corrupt("AllocationTombstone.reason missing")),
+        Some(r::Reason::Abort(_)) => Ok(TombstoneReason::Abort),
+        Some(r::Reason::Preempt(p)) => Ok(TombstoneReason::Preempt {
+            reason: p
+                .reason
+                .ok_or_else(|| corrupt("TombstoneReason.preempt.reason missing"))?
+                .try_into()
+                .map_err(|_| corrupt("TombstoneReason.preempt.reason invalid"))?,
+        }),
     }
 }
 
@@ -425,6 +490,9 @@ mod tests {
                 job,
                 node_epoch: 7,
                 max_runtime: Some(Duration::from_secs(30)),
+                notice_signal: Default::default(),
+                notice: Default::default(),
+                abort_grace: Default::default(),
             };
             journal.journal_intent(&intent).unwrap();
             state.intents.insert(alloc, intent);
@@ -462,7 +530,9 @@ mod tests {
         {
             let fs = RealFs::new(dir.path());
             let (mut journal, _) = Journal::open(fs).unwrap();
-            journal.journal_tombstone(alloc).unwrap();
+            journal
+                .journal_tombstone(alloc, TombstoneReason::Abort)
+                .unwrap();
             journal
                 .journal_intent(&IntentRec {
                     allocation: alloc,
@@ -470,13 +540,16 @@ mod tests {
                     job,
                     node_epoch: 1,
                     max_runtime: None,
+                    notice_signal: Default::default(),
+                    notice: Default::default(),
+                    abort_grace: Default::default(),
                 })
                 .unwrap();
         }
         let first = { Journal::open(RealFs::new(dir.path())).unwrap().1 };
         let second = { Journal::open(RealFs::new(dir.path())).unwrap().1 };
         assert_eq!(first, second);
-        assert!(first.tombstones.contains(&alloc));
+        assert!(first.tombstones.contains_key(&alloc));
         assert!(first.intents.contains_key(&alloc));
     }
 
@@ -494,6 +567,9 @@ mod tests {
                     job,
                     node_epoch: 1,
                     max_runtime: None,
+                    notice_signal: Default::default(),
+                    notice: Default::default(),
+                    abort_grace: Default::default(),
                 })
                 .unwrap();
         }

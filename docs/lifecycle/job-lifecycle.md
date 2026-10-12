@@ -30,7 +30,7 @@ reports safe to ignore.
 | Accepted | Queued | Coordinator apply | Enqueued under its quota entity |
 | Queued | Attempting(id) | Coordinator apply of `CommitPlacements` | Attempt + allocation(s) committed, possibly accruing |
 | Attempting(id) | Succeeded / Failed / Aborted | Coordinator apply (resolution) | The attempt reached `Terminal`; outcome, retry policy, and abort resolved in the same apply |
-| Attempting(id) | Queued | Coordinator apply (resolution) | Retry: the next attempt gets a fresh id via a later `CommitPlacements`; `Revoked` requeues without consuming retry budget |
+| Attempting(id) | Queued | Coordinator apply (resolution) | Retry: the next attempt gets a fresh id via a later `CommitPlacements`; `Revoked` and `Preempted` requeue without consuming retry budget |
 | Submitted / Accepted / Queued | Aborted | Coordinator apply of `AbortJob` | No live attempt — abort is immediate |
 
 `Attempting` structurally carries the id of the one in-flight attempt: there
@@ -71,6 +71,16 @@ endings (abort before start, revocation, pull/start failure, node lost).
   barrier across several jobs' attempts — no new states.
 - **Dispatching / Running / Finalizing** — as observed via the agent.
 
+A `Running` attempt the platform has asked to stop carries a **termination
+record** (`AttemptRecord.preemption`, [ADR 0044](../decisions/0044-job-preemption-and-spot-capacity.md)
+§3): the reason, when it was requested, and — once the agent reports that
+the notice signal was delivered — when it was notified, the coordinator's
+stop deadline, and any notice shortfall. There is no extra state: the
+attempt stays `Running` and its allocation `Active` until it ends, and the
+API derives the display status **preempting** from the record. The deadline
+only ever moves earlier, and `deadline + abort_grace` becomes the
+allocation's guaranteed release for backfill.
+
 Each terminal attempt records an **outcome** with a classification:
 
 | Outcome | Classification | Retried by default? |
@@ -85,6 +95,14 @@ Each terminal attempt records an **outcome** with a classification:
 | `PullFailed` / `StartFailed` | User or platform per error detail | Platform yes; user no |
 | `NodeLost` | Platform | Yes |
 | `AgentError` | Platform | Yes |
+| `Preempted { reason }` | Platform (notice given; reason `priority`, `relocation`, `drain`, or `interruption`) | Always requeued, free, uncapped |
+
+`Preempted` is the agent's classification (ADR 0044 §3): a kill by its own
+stop path for a platform termination, or a non-zero exit after a notice
+intent was journaled. An exit 0 after a notice is still `Exited { code: 0 }`
+— the job finished. A pending abort wins over the free requeue: the job ends
+`Aborted` and the attempt keeps `Preempted`. The next attempt sees
+`COPPICE_PREVIOUS_ATTEMPT_OUTCOME=preempted`.
 
 ## Allocation machine (per node)
 

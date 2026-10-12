@@ -154,6 +154,7 @@ pub fn register_node_cmd_with(
         detected_capacity: None,
         draining: false,
         preemptible_only,
+        interruption_deadline: None,
     })
 }
 

@@ -530,3 +530,83 @@ fn sweep_cost_at_one_million_allocations() {
         "the memo hit must be far cheaper than the sweep"
     );
 }
+
+// ---- termination records (ADR 0044 §3) ----
+
+/// Record a delivered notice for `aid(n)` observed at `at` with `remaining`
+/// left, as ingestion would.
+fn notify(sm: &mut StateMachine, n: u128, at: coppice_core::time::Timestamp, remaining: Duration) {
+    apply_ok(
+        sm,
+        Command::RecordAttemptNotified(coppice_state::command::RecordAttemptNotified {
+            attempt: aid(n),
+            reason: coppice_core::attempt::PreemptReason::Interruption,
+            remaining,
+            shortfall: Duration::ZERO,
+            observed_at: at,
+        }),
+    );
+}
+
+/// An unbounded runner has no guaranteed release until it is notified; then
+/// it releases at `deadline + abort_grace`, and the accrual behind it
+/// projects that instant.
+#[test]
+fn an_acknowledged_preemption_gives_an_unbounded_runner_a_release() {
+    let mut sm = setup(cpu(32_000), 4);
+    seed_running(&mut sm, 1, 1, cpu(32_000), None);
+    seed_accrual(&mut sm, alid(50), jid(3), nid(1), cpu(16_000), cpu(0), 1);
+    assert_eq!(projected_starts(&sm).get(&alid(50)), Some(&None));
+
+    let notified_at = base_ts() + Duration::from_secs(10);
+    notify(&mut sm, 1, notified_at, Duration::from_secs(120));
+    let grace = sm.policy.abort_grace;
+    assert_eq!(
+        projected_starts(&sm).get(&alid(50)),
+        Some(&Some(notified_at + Duration::from_secs(120) + grace)),
+    );
+}
+
+/// A bounded runner takes the earlier of its `max_runtime` release and its
+/// preemption release, in both directions.
+#[test]
+fn a_preemption_release_and_max_runtime_take_the_earlier() {
+    // Preemption earlier than max_runtime: the preemption bound wins.
+    let mut sm = setup(cpu(32_000), 4);
+    seed_running(&mut sm, 1, 1, cpu(32_000), Some(3600));
+    seed_accrual(&mut sm, alid(50), jid(3), nid(1), cpu(16_000), cpu(0), 1);
+    notify(&mut sm, 1, base_ts(), Duration::from_secs(60));
+    let grace = sm.policy.abort_grace;
+    assert_eq!(
+        projected_starts(&sm).get(&alid(50)),
+        Some(&Some(base_ts() + Duration::from_secs(60) + grace)),
+    );
+
+    // Preemption later than max_runtime: max_runtime still bounds it.
+    let mut sm = setup(cpu(32_000), 4);
+    seed_running(&mut sm, 1, 1, cpu(32_000), Some(3600));
+    seed_accrual(&mut sm, alid(50), jid(3), nid(1), cpu(16_000), cpu(0), 1);
+    notify(&mut sm, 1, base_ts(), Duration::from_secs(7200));
+    assert_eq!(
+        projected_starts(&sm).get(&alid(50)),
+        Some(&Some(base_ts() + Duration::from_secs(3600))),
+    );
+}
+
+/// A termination request the agent has not acknowledged bounds nothing: the
+/// workload has not been warned, so no release may be published for it.
+#[test]
+fn an_unacknowledged_preemption_contributes_no_release() {
+    let mut sm = setup(cpu(32_000), 4);
+    seed_running(&mut sm, 1, 1, cpu(32_000), None);
+    seed_accrual(&mut sm, alid(50), jid(3), nid(1), cpu(16_000), cpu(0), 1);
+    sm.attempts
+        .get_mut(&aid(1))
+        .expect("running attempt")
+        .preemption = Some(coppice_core::attempt::Preemption {
+        reason: coppice_core::attempt::PreemptReason::Priority { for_job: jid(3) },
+        requested_at: base_ts(),
+        acknowledged: None,
+    });
+    assert_eq!(projected_starts(&sm).get(&alid(50)), Some(&None));
+}

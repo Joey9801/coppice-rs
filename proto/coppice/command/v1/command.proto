@@ -57,6 +57,7 @@ message Command {
     RecordAttemptExited record_attempt_exited = 31;
     RecordAttemptOutcome record_attempt_outcome = 32;
     ReconcileNode reconcile_node = 33;
+    RecordAttemptNotified record_attempt_notified = 34;
 
     RegisterNode register_node = 50;
     DeclareNodeLost declare_node_lost = 51;
@@ -216,6 +217,20 @@ message RecordAttemptOutcome {
   int64 observed_at_us = 4;
 }
 
+// A notice was delivered to a Running attempt (ADR 0044 §3), normalized from
+// the agent's AttemptNotice or an ObservedSet's repeated mark. Creates or
+// acknowledges the termination record; a no-op unless the attempt is Running.
+message RecordAttemptNotified {
+  coppice.core.v1.AttemptId attempt = 1;
+  coppice.core.v1.PreemptReason reason = 2;
+  // Time from the agent's report to its stop time.
+  uint64 remaining_us = 3;
+  // Declared notice minus notice actually given.
+  uint64 shortfall_us = 4;
+  // The leader's receive time, never an agent wall-clock time.
+  int64 observed_at_us = 5;
+}
+
 // Verdicts from the leader's ObservedSet diff (ADR 0009). "Stop" verdicts
 // never appear: an unknown running container has nothing in state to
 // mutate; the leader sends StopJob directly.
@@ -269,6 +284,9 @@ message RegisterNode {
   // Whether the node accepts only effectively preemptible work (ADR 0044
   // §4), from the agent's `Register.preemptible_only`.
   bool preemptible_only = 9;
+  // The provider's interruption deadline the agent reported (ADR 0044 §5),
+  // agent wall-clock µs, display-only. Rewritten with `draining`.
+  optional int64 interruption_deadline_us = 10;
 }
 
 // Node missed the replicated heartbeat deadline: epoch bump, unschedulable,
@@ -297,6 +315,9 @@ message SetNodeDraining {
   coppice.core.v1.NodeId node = 1;
   bool draining = 2;
   int64 at_us = 3;
+  // The provider's interruption deadline the agent reported (ADR 0044 §5),
+  // agent wall-clock µs, display-only. Absent clears it.
+  optional int64 interruption_deadline_us = 4;
 }
 
 // Remove terminal jobs from replicated state (ADR 0012). Proposed only

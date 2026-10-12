@@ -446,6 +446,16 @@ pub enum TimelineEventBody {
         /// The job.
         job: JobId,
     },
+    /// A running attempt's termination record was created or its deadline
+    /// moved earlier (ADR 0044 §3); re-read the attempt for the record.
+    AttemptNotified {
+        /// The attempt.
+        attempt: AttemptId,
+        /// Its job.
+        job: JobId,
+        /// Its node.
+        node: NodeId,
+    },
     /// A node's epoch bumped (re-registration or loss).
     NodeEpochBumped {
         /// The node.
@@ -500,6 +510,7 @@ impl TimelineEventBody {
             | TimelineEventBody::AttemptStateChanged { job, .. }
             | TimelineEventBody::AllocationFunded { job, .. }
             | TimelineEventBody::StopRequested { job, .. }
+            | TimelineEventBody::AttemptNotified { job, .. }
             | TimelineEventBody::JobEvicted { job }
             | TimelineEventBody::JobMetadataUpdated { job } => Some(*job),
             TimelineEventBody::NodeEpochBumped { .. }

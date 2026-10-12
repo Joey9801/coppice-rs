@@ -4,7 +4,9 @@
 use std::collections::BTreeMap;
 
 use coppice_core::allocation::{Allocation, AllocationState};
-use coppice_core::attempt::{Attempt, AttemptOutcome, AttemptState};
+use coppice_core::attempt::{
+    Acknowledged, Attempt, AttemptOutcome, AttemptState, PreemptReason, Preemption,
+};
 use coppice_core::bytes::ByteSize;
 use coppice_core::env::JobEnv;
 use coppice_core::job::{AbortRequest, Job, JobState, RetryPolicy};
@@ -449,6 +451,9 @@ impl From<&AttemptOutcome> for pb::AttemptOutcome {
             }),
             AttemptOutcome::NodeLost => o::Outcome::NodeLost(o::NodeLost {}),
             AttemptOutcome::AgentError => o::Outcome::AgentError(o::AgentError {}),
+            AttemptOutcome::Preempted { reason } => o::Outcome::Preempted(o::Preempted {
+                reason: Some(reason.into()),
+            }),
         };
         pb::AttemptOutcome {
             outcome: Some(outcome),
@@ -476,6 +481,90 @@ impl TryFrom<pb::AttemptOutcome> for AttemptOutcome {
             },
             o::Outcome::NodeLost(_) => AttemptOutcome::NodeLost,
             o::Outcome::AgentError(_) => AttemptOutcome::AgentError,
+            o::Outcome::Preempted(p) => AttemptOutcome::Preempted {
+                reason: req(p.reason, "AttemptOutcome.preempted.reason")?.try_into()?,
+            },
+        })
+    }
+}
+
+impl From<&PreemptReason> for pb::PreemptReason {
+    fn from(reason: &PreemptReason) -> Self {
+        use pb::preempt_reason as r;
+        let reason = match reason {
+            PreemptReason::Priority { for_job } => r::Reason::Priority(r::Priority {
+                for_job: Some((*for_job).into()),
+            }),
+            PreemptReason::Relocation { for_job } => r::Reason::Relocation(r::Relocation {
+                for_job: Some((*for_job).into()),
+            }),
+            PreemptReason::Drain => r::Reason::Drain(r::Drain {}),
+            PreemptReason::Interruption => r::Reason::Interruption(r::Interruption {}),
+        };
+        pb::PreemptReason {
+            reason: Some(reason),
+        }
+    }
+}
+
+impl From<PreemptReason> for pb::PreemptReason {
+    fn from(reason: PreemptReason) -> Self {
+        (&reason).into()
+    }
+}
+
+impl TryFrom<pb::PreemptReason> for PreemptReason {
+    type Error = ConvertError;
+
+    fn try_from(reason: pb::PreemptReason) -> Result<Self, ConvertError> {
+        use pb::preempt_reason as r;
+        Ok(match req(reason.reason, "PreemptReason.reason")? {
+            r::Reason::Priority(p) => PreemptReason::Priority {
+                for_job: req(p.for_job, "PreemptReason.priority.for_job")?.try_into()?,
+            },
+            r::Reason::Relocation(p) => PreemptReason::Relocation {
+                for_job: req(p.for_job, "PreemptReason.relocation.for_job")?.try_into()?,
+            },
+            r::Reason::Drain(_) => PreemptReason::Drain,
+            r::Reason::Interruption(_) => PreemptReason::Interruption,
+        })
+    }
+}
+
+impl From<&Preemption> for pb::Preemption {
+    fn from(p: &Preemption) -> Self {
+        pb::Preemption {
+            reason: Some(p.reason.into()),
+            requested_at_us: p.requested_at.as_micros(),
+            acknowledged: p.acknowledged.map(|a| pb::Acknowledged {
+                notified_at_us: a.notified_at.as_micros(),
+                deadline_us: a.deadline.as_micros(),
+                notice_shortfall_us: a.notice_shortfall.as_micros().max(0) as u64,
+            }),
+        }
+    }
+}
+
+impl TryFrom<pb::Preemption> for Preemption {
+    type Error = ConvertError;
+
+    fn try_from(p: pb::Preemption) -> Result<Self, ConvertError> {
+        Ok(Preemption {
+            reason: req(p.reason, "Preemption.reason")?.try_into()?,
+            requested_at: timestamp(p.requested_at_us, "Preemption.requested_at_us")?,
+            acknowledged: p
+                .acknowledged
+                .map(|a| -> Result<Acknowledged, ConvertError> {
+                    Ok(Acknowledged {
+                        notified_at: timestamp(a.notified_at_us, "Acknowledged.notified_at_us")?,
+                        deadline: timestamp(a.deadline_us, "Acknowledged.deadline_us")?,
+                        notice_shortfall: nonnegative_duration(
+                            a.notice_shortfall_us,
+                            "Acknowledged.notice_shortfall_us",
+                        )?,
+                    })
+                })
+                .transpose()?,
         })
     }
 }

@@ -20,7 +20,7 @@ mod common;
 use std::collections::BTreeMap;
 
 use common::*;
-use coppice_core::attempt::AttemptOutcome;
+use coppice_core::attempt::{AttemptOutcome, PreemptReason};
 use coppice_core::bytes::ByteSize;
 use coppice_core::env::JobEnv;
 use coppice_core::job::RetryPolicy;
@@ -33,8 +33,8 @@ use coppice_proto::convert::{state_from_records, state_to_records, StateRecords}
 use coppice_state::authz::{Binding, Role, Subject};
 use coppice_state::command::{
     BumpClusterVersion, ConfigureQuotaEntity, DeclareNodeLost, EvictNodes, EvictTerminalJobs,
-    IntervalRenewal, JobMetadataUpdate, LostAttempt, ReconcileNode, RegisterNode,
-    RenewIntervalCharges, SetNodeDraining, SetNodeSchedulable, UpdateAuthorization,
+    IntervalRenewal, JobMetadataUpdate, LostAttempt, ReconcileNode, RecordAttemptNotified,
+    RegisterNode, RenewIntervalCharges, SetNodeDraining, SetNodeSchedulable, UpdateAuthorization,
     UpdateJobMetadata,
 };
 use coppice_state::{Command, StateMachine};
@@ -65,7 +65,32 @@ fn arb_outcome() -> impl Strategy<Value = AttemptOutcome> {
         Just(AttemptOutcome::StartFailed { user_error: false }),
         Just(AttemptOutcome::NodeLost),
         Just(AttemptOutcome::AgentError),
+        arb_reason().prop_map(|reason| AttemptOutcome::Preempted { reason }),
     ]
+}
+
+fn arb_reason() -> impl Strategy<Value = PreemptReason> {
+    prop_oneof![
+        Just(PreemptReason::Interruption),
+        Just(PreemptReason::Drain),
+        (0u128..MAX_JOBS as u128).prop_map(|j| PreemptReason::Priority {
+            for_job: jid(1_000 + j)
+        }),
+        (0u128..MAX_JOBS as u128).prop_map(|j| PreemptReason::Relocation {
+            for_job: jid(1_000 + j)
+        }),
+    ]
+}
+
+/// Up to three delivered notices (ADR 0044 §3) for one attempt, each with
+/// its splice position in the chain: more than one exercises the
+/// earlier-only deadline rule, and a position outside `Running` the stale
+/// rejection.
+fn arb_notices() -> impl Strategy<Value = Vec<(usize, PreemptReason, i64, i64, Timestamp)>> {
+    proptest::collection::vec(
+        (0usize..=6, arb_reason(), 0i64..900, 0i64..120, arb_ts()),
+        0..3,
+    )
 }
 
 /// An arbitrary metadata map: a few short string keys and values, all
@@ -141,6 +166,7 @@ fn arb_job_chain(i: u64) -> impl Strategy<Value = Vec<Command>> {
         proptest::option::of((0usize..=6, arb_metadata_update(jid(1_000 + i as u128)))),
         arb_env(),
         arb_preemption(),
+        arb_notices(),
     )
         .prop_map(
             move |(
@@ -154,6 +180,7 @@ fn arb_job_chain(i: u64) -> impl Strategy<Value = Vec<Command>> {
                 metadata_at,
                 env,
                 preemption,
+                notices,
             )| {
                 let job = jid(1_000 + i as u128);
                 let attempt = aid(2_000 + i as u128);
@@ -189,6 +216,19 @@ fn arb_job_chain(i: u64) -> impl Strategy<Value = Vec<Command>> {
                     let at = at.min(chain.len());
                     chain.insert(at, update);
                 }
+                for (at, reason, remaining_s, shortfall_s, observed_at) in notices {
+                    let at = at.min(chain.len());
+                    chain.insert(
+                        at,
+                        Command::RecordAttemptNotified(RecordAttemptNotified {
+                            attempt,
+                            reason,
+                            remaining: Duration::from_secs(remaining_s),
+                            shortfall: Duration::from_secs(shortfall_s),
+                            observed_at,
+                        }),
+                    );
+                }
                 chain
             },
         )
@@ -203,23 +243,27 @@ fn arb_global() -> impl Strategy<Value = Command> {
             4_000u64..32_000,
             any::<bool>(),
             any::<bool>(),
-            arb_ts()
+            arb_ts(),
+            proptest::option::of(arb_ts()),
         )
-            .prop_map(|(n, cpu_millis, draining, preemptible_only, ts)| {
-                Command::RegisterNode(RegisterNode {
-                    node: node_of(n),
-                    capacity: cpu(cpu_millis),
-                    labels: BTreeMap::new(),
-                    registered_at: ts,
-                    service_addr: None,
-                    host_facts: None,
-                    detected_capacity: None,
-                    draining,
-                    // ADR 0044 §4: a spot node refuses placements for jobs
-                    // that are not effectively preemptible, deterministically.
-                    preemptible_only,
-                })
-            }),
+            .prop_map(
+                |(n, cpu_millis, draining, preemptible_only, ts, deadline)| {
+                    Command::RegisterNode(RegisterNode {
+                        node: node_of(n),
+                        capacity: cpu(cpu_millis),
+                        labels: BTreeMap::new(),
+                        registered_at: ts,
+                        service_addr: None,
+                        host_facts: None,
+                        detected_capacity: None,
+                        draining,
+                        // ADR 0044 §4: a spot node refuses placements for jobs
+                        // that are not effectively preemptible, deterministically.
+                        preemptible_only,
+                        interruption_deadline: deadline,
+                    })
+                }
+            ),
         (0usize..NODES as usize, arb_ts()).prop_map(|(n, ts)| {
             Command::DeclareNodeLost(DeclareNodeLost {
                 node: node_of(n),
@@ -242,13 +286,20 @@ fn arb_global() -> impl Strategy<Value = Command> {
                     actor: with_who.then(|| actor("root")),
                 })
             }),
-        (0usize..NODES as usize, any::<bool>(), arb_ts()).prop_map(|(n, draining, ts)| {
-            Command::SetNodeDraining(SetNodeDraining {
-                node: node_of(n),
-                draining,
-                at: ts,
-            })
-        }),
+        (
+            0usize..NODES as usize,
+            any::<bool>(),
+            arb_ts(),
+            proptest::option::of(arb_ts())
+        )
+            .prop_map(|(n, draining, ts, deadline)| {
+                Command::SetNodeDraining(SetNodeDraining {
+                    node: node_of(n),
+                    draining,
+                    at: ts,
+                    interruption_deadline: deadline,
+                })
+            }),
         (any::<u8>(), any::<bool>(), arb_ts()).prop_map(|(mask, with_who, ts)| {
             Command::EvictNodes(EvictNodes {
                 nodes: (0..NODES as usize)

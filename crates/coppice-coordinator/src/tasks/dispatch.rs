@@ -349,6 +349,9 @@ pub(crate) fn start_job_command(
                 .unwrap_or(state.policy.preemption_notice_floor)
                 .as_micros()
                 .max(0) as u64,
+            // The policy's grace as of this dispatch (ADR 0044 §3): the agent
+            // runs a platform termination's stop path without asking us.
+            abort_grace_us: state.policy.abort_grace.as_micros().max(0) as u64,
         })),
     }
 }
@@ -627,6 +630,10 @@ mod tests {
         assert!(sj.previous_attempt_outcome.is_some());
         assert!(sj.preemptible);
         assert_eq!(sj.notice_us, 90_000_000);
+        assert_eq!(
+            sj.abort_grace_us,
+            state.policy.abort_grace.as_micros() as u64
+        );
         assert_eq!(
             sj.notice_signal,
             coppice_proto::pb::core::v1::NoticeSignal::Sigusr1 as i32

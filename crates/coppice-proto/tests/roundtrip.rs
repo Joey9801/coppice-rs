@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 
-use coppice_core::attempt::AttemptOutcome;
+use coppice_core::attempt::{AttemptOutcome, PreemptReason};
 use coppice_core::bytes::ByteSize;
 use coppice_core::env::JobEnv;
 use coppice_core::id::{
@@ -188,6 +188,37 @@ fn every_command() -> Vec<Command> {
             actual_runtime: Duration::from_secs(30),
             observed_at: ts(),
         }),
+        // Every PreemptReason arm, in the outcome and in the notice command.
+        Command::RecordAttemptOutcome(RecordAttemptOutcome {
+            attempt,
+            outcome: AttemptOutcome::Preempted {
+                reason: PreemptReason::Priority { for_job: jid(3) },
+            },
+            actual_runtime: Duration::from_secs(30),
+            observed_at: ts(),
+        }),
+        Command::RecordAttemptOutcome(RecordAttemptOutcome {
+            attempt,
+            outcome: AttemptOutcome::Preempted {
+                reason: PreemptReason::Drain,
+            },
+            actual_runtime: Duration::from_secs(30),
+            observed_at: ts(),
+        }),
+        Command::RecordAttemptNotified(RecordAttemptNotified {
+            attempt,
+            reason: PreemptReason::Relocation { for_job: jid(4) },
+            remaining: Duration::from_secs(90),
+            shortfall: Duration::from_millis(1_500),
+            observed_at: ts(),
+        }),
+        Command::RecordAttemptNotified(RecordAttemptNotified {
+            attempt,
+            reason: PreemptReason::Interruption,
+            remaining: Duration::ZERO,
+            shortfall: Duration::ZERO,
+            observed_at: ts(),
+        }),
         Command::ReconcileNode(ReconcileNode {
             node,
             node_epoch: 2,
@@ -228,6 +259,7 @@ fn every_command() -> Vec<Command> {
             }),
             draining: true,
             preemptible_only: false,
+            interruption_deadline: Some(ts() + Duration::from_secs(120)),
         }),
         Command::DeclareNodeLost(DeclareNodeLost {
             node,
@@ -243,6 +275,13 @@ fn every_command() -> Vec<Command> {
             node,
             draining: true,
             at: ts(),
+            interruption_deadline: Some(ts() + Duration::from_secs(120)),
+        }),
+        Command::SetNodeDraining(SetNodeDraining {
+            node,
+            draining: false,
+            at: ts(),
+            interruption_deadline: None,
         }),
         Command::EvictTerminalJobs(EvictTerminalJobs {
             jobs: vec![jid(1), jid(2)],

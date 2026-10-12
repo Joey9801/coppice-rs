@@ -90,6 +90,10 @@ pub enum NodeHealth {
 
 /// `coppice_core::attempt::AttemptState`, flattened for display (the
 /// `Terminal` outcome payload travels separately as [`AttemptView::outcome`]).
+///
+/// `Preempting` is derived for display (ADR 0044 §3): a `Running` attempt with
+/// a termination record. Replicated state has no such phase, so it never
+/// appears on a timeline event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AttemptState {
@@ -97,6 +101,7 @@ pub enum AttemptState {
     Ready,
     Dispatching,
     Running,
+    Preempting,
     Finalizing,
     Terminal,
 }
@@ -129,6 +134,29 @@ pub enum AttemptOutcomeKind {
     StartFailed,
     NodeLost,
     AgentError,
+    Preempted,
+}
+
+/// Mirrors `coppice_core::attempt::PreemptReason`; the job it made room for
+/// travels beside it as `for_job`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreemptReason {
+    Priority,
+    Relocation,
+    Drain,
+    Interruption,
+}
+
+impl From<&attempt::PreemptReason> for PreemptReason {
+    fn from(r: &attempt::PreemptReason) -> Self {
+        match r {
+            attempt::PreemptReason::Priority { .. } => PreemptReason::Priority,
+            attempt::PreemptReason::Relocation { .. } => PreemptReason::Relocation,
+            attempt::PreemptReason::Drain => PreemptReason::Drain,
+            attempt::PreemptReason::Interruption => PreemptReason::Interruption,
+        }
+    }
 }
 
 /// Who "owns" an outcome (drives retry policy).
@@ -148,11 +176,21 @@ pub struct AttemptOutcome {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub exit_code: Option<i32>,
     pub class: OutcomeClass,
+    /// Present when `kind` is `Preempted`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub reason: Option<PreemptReason>,
+    /// The job a `priority` or `relocation` preemption made room for.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub for_job: Option<JobId>,
 }
 
 impl From<&attempt::AttemptOutcome> for AttemptOutcome {
     fn from(o: &attempt::AttemptOutcome) -> Self {
         use attempt::AttemptOutcome as O;
+        let (reason, for_job) = match o {
+            O::Preempted { reason } => (Some(reason.into()), reason.for_job()),
+            _ => (None, None),
+        };
         let (kind, exit_code) = match o {
             O::Exited { code } => (AttemptOutcomeKind::Exited, Some(*code)),
             O::MemoryLimitExceeded => (AttemptOutcomeKind::MemoryLimitExceeded, None),
@@ -164,6 +202,7 @@ impl From<&attempt::AttemptOutcome> for AttemptOutcome {
             O::StartFailed { .. } => (AttemptOutcomeKind::StartFailed, None),
             O::NodeLost => (AttemptOutcomeKind::NodeLost, None),
             O::AgentError => (AttemptOutcomeKind::AgentError, None),
+            O::Preempted { .. } => (AttemptOutcomeKind::Preempted, None),
         };
         let class = match o.class() {
             attempt::OutcomeClass::Success => OutcomeClass::Success,
@@ -175,6 +214,8 @@ impl From<&attempt::AttemptOutcome> for AttemptOutcome {
             kind,
             exit_code,
             class,
+            reason,
+            for_job,
         }
     }
 }
@@ -222,6 +263,47 @@ pub struct AttemptView {
     /// switch, as they stood then. When `true` the charge carries the
     /// preemptibility discount.
     pub preemptible: bool,
+    /// The termination record (ADR 0044 §3): `null` unless the platform has
+    /// asked this attempt to stop; kept after the attempt ends.
+    pub preemption: Option<AttemptPreemption>,
+}
+
+/// An attempt's termination record (mirrors
+/// `coppice_core::attempt::Preemption`, with `Acknowledged` flattened in).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttemptPreemption {
+    pub reason: PreemptReason,
+    /// The job a `priority` or `relocation` preemption made room for.
+    pub for_job: Option<JobId>,
+    /// When the coordinator committed to, or first learned of, the
+    /// termination.
+    pub requested_at: Timestamp,
+    /// When the notice was delivered; `null` until then, as are `deadline` and
+    /// `notice_shortfall_seconds`.
+    pub notified_at: Option<Timestamp>,
+    /// The attempt's stop time as the coordinator plans against it. Only ever
+    /// moves earlier.
+    pub deadline: Option<Timestamp>,
+    /// Declared notice minus notice actually given, in whole seconds
+    /// (rounded up, so any lost notice shows); zero when none was lost.
+    pub notice_shortfall_seconds: Option<i64>,
+}
+
+impl From<&attempt::Preemption> for AttemptPreemption {
+    fn from(p: &attempt::Preemption) -> Self {
+        let ack = p.acknowledged.as_ref();
+        AttemptPreemption {
+            reason: (&p.reason).into(),
+            for_job: p.reason.for_job(),
+            requested_at: p.requested_at,
+            notified_at: ack.map(|a| a.notified_at),
+            deadline: ack.map(|a| a.deadline),
+            notice_shortfall_seconds: ack.map(|a| {
+                let us = a.notice_shortfall.as_micros().max(0);
+                (us + 999_999) / 1_000_000
+            }),
+        }
+    }
 }
 
 /// Read-model projection of an allocation.
@@ -281,6 +363,9 @@ pub struct NodeSummary {
     /// The node takes only effectively preemptible work (ADR 0044 §4) —
     /// spot capacity, from the agent's `[preemption] preemptible_only`.
     pub preemptible_only: bool,
+    /// The provider's interruption deadline (ADR 0044 §5), by the agent's wall
+    /// clock: display only, never a scheduling input.
+    pub interruption_deadline: Option<Timestamp>,
     pub health: NodeHealth,
     /// Bumps on (re)registration or loss; fences stale agent commands.
     pub epoch: u64,
@@ -656,6 +741,13 @@ pub enum TimelineEventBody {
         allocation: AllocationId,
         job: JobId,
     },
+    /// A running attempt's termination record was created or its deadline
+    /// moved earlier (ADR 0044 §3); re-read the attempt for the record.
+    AttemptNotified {
+        attempt: AttemptId,
+        job: JobId,
+        node: NodeId,
+    },
     NodeEpochBumped {
         node: NodeId,
         epoch: u64,
@@ -714,6 +806,11 @@ impl From<&coppice_state::Event> for TimelineEventBody {
                 node: *node,
                 allocation: *allocation,
                 job: *job,
+            },
+            E::AttemptNotified { attempt, job, node } => TimelineEventBody::AttemptNotified {
+                attempt: *attempt,
+                job: *job,
+                node: *node,
             },
             E::NodeEpochBumped { node, epoch } => TimelineEventBody::NodeEpochBumped {
                 node: *node,
@@ -2825,6 +2922,7 @@ mod tests {
             running_count: 2,
             accruing_count: 1,
             preemptible_only: false,
+            interruption_deadline: None,
         };
 
         let json = serde_json::to_value(&summary).unwrap();
@@ -2839,6 +2937,7 @@ mod tests {
                 "schedulable": true,
                 "draining": false,
                 "preemptible_only": false,
+                "interruption_deadline": null,
                 "health": "unknown",
                 "epoch": 3,
                 "last_heartbeat": null,

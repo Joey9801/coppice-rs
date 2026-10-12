@@ -1107,6 +1107,7 @@ fn register_report(node: NodeId) -> pbagent::AgentReport {
             detected_capacity: None,
             draining: false,
             preemptible_only: false,
+            interruption_deadline_us: None,
         })),
     }
 }

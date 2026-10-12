@@ -37,10 +37,28 @@ minority coordinators must reject them using epoch checks.
 Job execution failure is classified through the attempt outcome taxonomy
 (`Exited`, `MemoryLimitExceeded`, `RuntimeLimitExceeded`, `DiskLimitExceeded`,
 `Aborted`, `Revoked`,
-`PullFailed`, `StartFailed`, `NodeLost`, `AgentError` — see
+`PullFailed`, `StartFailed`, `NodeLost`, `AgentError`, `Preempted` — see
 [ADR 0013](../decisions/0013-job-attempt-allocation-state-machines.md)), each
 classified as success, user error, user request, or platform failure. Retry
 policy keys off that classification and should avoid retry storms.
+
+## Platform termination (preemption and spot interruption)
+
+When the platform ends a running attempt on purpose — a spot reclaim today,
+a scheduler preemption or deadline drain later
+([ADR 0044](../decisions/0044-job-preemption-and-spot-capacity.md)) — the
+workload is sent its declared notice signal first, and the agent reports the
+notice so the coordinator records the attempt's stop deadline (the attempt
+shows as *preempting*). The attempt then ends `Preempted { reason }`, which
+is free: the job requeues without consuming retry budget, however often it
+happens, and the unused charge is refunded in full. A pending abort still
+wins, ending the job `Aborted`.
+
+Only a *reported* preemption is free. A host that disappears before the
+agent's `Preempted` report reaches the coordinator is resolved `NodeLost`
+by the liveness monitor, with ordinary retry accounting. The next attempt
+learns how its predecessor ended from `COPPICE_PREVIOUS_ATTEMPT_OUTCOME`
+(`preempted` or `node_lost`) and resumes from its own checkpoint.
 
 ## Node restart
 

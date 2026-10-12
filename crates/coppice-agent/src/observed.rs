@@ -131,7 +131,7 @@ fn from_runtime(container: &ObservedContainer, journal: &JournalState) -> Observ
             running: false,
             outcome: Some(classify_exit(
                 &exit,
-                journal.tombstones.contains(&container.allocation),
+                journal.tombstones.contains_key(&container.allocation),
             )),
             runtime: exit.runtime,
         },
@@ -142,7 +142,7 @@ fn from_runtime(container: &ObservedContainer, journal: &JournalState) -> Observ
 mod tests {
     use super::*;
     use crate::executor::{ExitCause, ExitInfo};
-    use crate::journal::{ExitRec, IntentRec, JournalState};
+    use crate::journal::{ExitRec, IntentRec, JournalState, TombstoneReason};
     use coppice_core::time::Timestamp;
 
     fn ids() -> (AllocationId, AttemptId, JobId) {
@@ -228,7 +228,7 @@ mod tests {
         // journaled: the tombstone is the durable attribution Docker lacks.
         let (a, at, j) = ids();
         let mut state = JournalState::default();
-        state.tombstones.insert(a);
+        state.tombstones.insert(a, TombstoneReason::Abort);
         state.intents.insert(
             a,
             IntentRec {
@@ -237,6 +237,9 @@ mod tests {
                 job: j,
                 node_epoch: 1,
                 max_runtime: None,
+                notice_signal: Default::default(),
+                notice: Default::default(),
+                abort_grace: Default::default(),
             },
         );
         let runtime = vec![ObservedContainer {
@@ -261,7 +264,7 @@ mod tests {
     fn tombstone_does_not_override_confirmed_oom_after_restart() {
         let (a, at, j) = ids();
         let mut state = JournalState::default();
-        state.tombstones.insert(a);
+        state.tombstones.insert(a, TombstoneReason::Abort);
         let runtime = vec![ObservedContainer {
             allocation: a,
             attempt: at,
@@ -309,6 +312,9 @@ mod tests {
                 job: j,
                 node_epoch: 1,
                 max_runtime: None,
+                notice_signal: Default::default(),
+                notice: Default::default(),
+                abort_grace: Default::default(),
             },
         );
         let set = build_observed_set(&state, &[]);
@@ -320,7 +326,7 @@ mod tests {
     fn tombstone_alone_reports_nothing() {
         let (a, _, _) = ids();
         let mut state = JournalState::default();
-        state.tombstones.insert(a);
+        state.tombstones.insert(a, TombstoneReason::Abort);
         assert!(build_observed_set(&state, &[]).is_empty());
     }
 
