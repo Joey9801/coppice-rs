@@ -381,11 +381,22 @@ pub struct NodeSummary {
     pub accruing_count: u32,
 }
 
-/// An operator's drain of one node (ADR 0044 §5), as the node views show it.
+/// An operator's drain of one node (ADR 0044 §5), as the node views show it,
+/// with its derived status computed from the snapshot at read time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeDrain {
     /// When the drain was first requested; a repeated drain keeps it.
     pub requested_at: Timestamp,
+    /// The node's horizon: the latest enforced completion bound among its
+    /// live commitments, by which it will be empty and up to which it still
+    /// admits bounded backfill. `null` either when the drain is `complete`
+    /// or when some commitment (running work with no `max_runtime`, work not
+    /// yet started, an accrual) is unbounded — then nothing bounds when the
+    /// node empties, and no backfill is admitted.
+    pub horizon: Option<Timestamp>,
+    /// The node holds no live allocation: the drain is done. Admission stays
+    /// closed until the operator undrains.
+    pub complete: bool,
 }
 
 /// `GET /api/v1/nodes` — an envelope, never a bare array, so fields can

@@ -24,7 +24,8 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Result};
 
 use coppice_client::{
-    paths, Client, GetNodeResponse, ListNodesResponse, NodeHealth, NodeId, NodeSummary, Resources,
+    paths, Client, GetNodeResponse, ListNodesResponse, NodeDrain, NodeHealth, NodeId, NodeSummary,
+    Resources, Timestamp,
 };
 use coppice_core::bytes::ByteSize;
 
@@ -87,8 +88,10 @@ pub enum NodeVerb {
     Drain {
         /// Node id (`node-<uuid>`).
         node: NodeId,
-        /// Poll the node until nothing is running or accruing on it, or the
-        /// duration elapses. Bare `--wait` means 10 minutes; `--wait 30s`
+        /// Poll the node until the drain is complete (no live work left on
+        /// it), printing its horizon — the time by which it will be empty, or
+        /// "unbounded" — as it changes, or until the duration elapses. Bare
+        /// `--wait` means 10 minutes; `--wait 30s`
         /// names a duration explicitly; omitting the flag entirely means
         /// return as soon as the drain is requested, without waiting.
         #[arg(
@@ -265,8 +268,8 @@ async fn show(client: &Client, node: NodeId, json: bool) -> Result<()> {
 
 /// `coppice node drain`: drain a node (ADR 0044 §5).
 ///
-/// With `--wait`, polls `GET /nodes/{node}` once a second until nothing is
-/// running or accruing on it, or the wait duration elapses.
+/// With `--wait`, polls `GET /nodes/{node}` once a second until the drain's
+/// derived status reads complete, or the wait duration elapses.
 async fn drain(client: &Client, node: NodeId, wait: Option<Duration>, json: bool) -> Result<()> {
     let path = paths::node_drain(node);
     post_node_action(
@@ -347,9 +350,10 @@ where
     Ok(())
 }
 
-/// Poll a node's summary once every `interval` until it is [`drained`] or
-/// `deadline` elapses, printing a stderr progress line whenever the
-/// `(running, accruing)` pair changes, and a final line when it is empty.
+/// Poll a node's summary once every `interval` until its drain is complete
+/// or `deadline` elapses, printing a stderr progress line whenever the
+/// [`DrainProgress`] changes — the horizon (or "unbounded") and the running
+/// and accruing counts — and a final line when it is complete.
 ///
 /// Progress goes to stderr, not stdout: `--json` writes the server's own
 /// response body to stdout, and a script that pipes that into `jq` must not
@@ -361,52 +365,87 @@ async fn wait_for_drain(
     interval: Duration,
 ) -> Result<()> {
     let start = std::time::Instant::now();
-    let mut last: Option<(u32, u32)> = None;
+    let mut last: Option<DrainProgress> = None;
     loop {
         let response = client
             .node(node)
             .await
             .api_ctx(ctx("checking drain progress", "reading node detail"))?;
-        let current = counts(&response.summary);
+        let current = drain_progress(&response.summary);
         // The verdict before the progress line, so a node that is already
-        // empty is answered rather than narrated: "waiting for node X to
-        // drain: running 0, accruing 0" is a sentence that contradicts
-        // itself, and a scale-in script's log is where it would show up.
-        if drained(&response.summary) {
-            eprintln!("node {node} drained");
+        // empty is answered rather than narrated.
+        if current.complete {
+            eprintln!("node {node} drained: drain complete");
             return Ok(());
         }
-        if last != Some(current) {
-            eprintln!(
-                "waiting for node {node} to drain: running {}, accruing {}",
-                current.0, current.1
-            );
-            last = Some(current);
+        if last.as_ref() != Some(&current) {
+            eprintln!("waiting for node {node} to drain: {}", current.describe());
+            last = Some(current.clone());
         }
         if start.elapsed() >= deadline {
             return Err(anyhow!(
-                "node {node} did not drain within {deadline:?}: running {}, accruing {} \
-                 outstanding",
-                current.0,
-                current.1
+                "node {node} did not drain within {deadline:?}: {} outstanding",
+                current.describe()
             ));
         }
         tokio::time::sleep(interval).await;
     }
 }
 
-/// Both counts at zero: nothing is running and nothing is still funded, so a
-/// drain wait is satisfied.
-fn drained(summary: &NodeSummary) -> bool {
-    let (running, accruing) = counts(summary);
-    running == 0 && accruing == 0
+/// What a drain wait watches, pulled out so the "did the progress line need
+/// reprinting" decision in [`wait_for_drain`] is testable without a live
+/// poll loop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DrainProgress {
+    /// The drain record is visible on the read. `false` right after the
+    /// request on a replica that has not applied it yet, or after an
+    /// undrain.
+    recorded: bool,
+    /// The node's horizon; `None` while unbounded (or not recorded).
+    horizon: Option<Timestamp>,
+    complete: bool,
+    running: u32,
+    accruing: u32,
 }
 
-/// The `(running, accruing)` pair a drain wait watches, pulled out so the
-/// "did the progress line need reprinting" decision in [`wait_for_drain`] is
-/// testable without a live poll loop.
-fn counts(summary: &NodeSummary) -> (u32, u32) {
-    (summary.running_count, summary.accruing_count)
+impl DrainProgress {
+    fn describe(&self) -> String {
+        let horizon = match (self.recorded, self.horizon) {
+            (false, _) => "drain not recorded".to_string(),
+            (true, Some(at)) => format!("empty by {at}"),
+            (true, None) => "horizon unbounded".to_string(),
+        };
+        format!(
+            "{horizon}, running {}, accruing {}",
+            self.running, self.accruing
+        )
+    }
+}
+
+/// The drain's derived status off a node summary (ADR 0044 §5).
+fn drain_progress(summary: &NodeSummary) -> DrainProgress {
+    let drain = summary.drain.as_ref();
+    DrainProgress {
+        recorded: drain.is_some(),
+        horizon: drain.and_then(|d| d.horizon),
+        complete: drain.is_some_and(|d| d.complete),
+        running: summary.running_count,
+        accruing: summary.accruing_count,
+    }
+}
+
+/// The drain cell of the detail view: when it was requested and its derived
+/// status — the horizon, "unbounded", or "complete".
+fn drain_detail(drain: &NodeDrain) -> String {
+    let status = if drain.complete {
+        "complete".to_string()
+    } else {
+        match drain.horizon {
+            Some(at) => format!("empty by {at}"),
+            None => "unbounded (live work with no runtime bound)".to_string(),
+        }
+    };
+    format!("requested {}, {status}", drain.requested_at)
 }
 
 // ---------------------------------------------------------------------------
@@ -543,6 +582,18 @@ fn render_detail(response: &GetNodeResponse) -> String {
         &mut out,
         "scheduling",
         drain_label(summary.drain.is_some(), summary.agent_draining),
+    );
+    if let Some(drain) = summary.drain.as_ref() {
+        kv(&mut out, "drain", &drain_detail(drain));
+    }
+    kv(
+        &mut out,
+        "agent",
+        if summary.agent_draining {
+            "draining (shutting down)"
+        } else {
+            "not draining"
+        },
     );
     kv(
         &mut out,
@@ -956,10 +1007,25 @@ mod tests {
     /// A `GetNodeResponse` with the given running/accruing counts, otherwise
     /// identical to [`sample_summary`] — what the `--wait` poll decodes.
     fn get_node_response(running: u32, accruing: u32) -> dto::GetNodeResponse {
+        drained_node_response(running, accruing, None, running == 0 && accruing == 0)
+    }
+
+    /// A drained node's detail, with the drain's derived status.
+    fn drained_node_response(
+        running: u32,
+        accruing: u32,
+        horizon: Option<coppice_core::time::Timestamp>,
+        complete: bool,
+    ) -> dto::GetNodeResponse {
         dto::GetNodeResponse {
             summary: dto::NodeSummary {
                 running_count: running,
                 accruing_count: accruing,
+                drain: Some(dto::NodeDrain {
+                    requested_at: coppice_core::time::Timestamp::UNIX_EPOCH,
+                    horizon,
+                    complete,
+                }),
                 ..sample_summary()
             },
             host: None,
@@ -1071,7 +1137,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wait_for_drain_returns_once_both_counts_reach_zero() {
+    async fn wait_for_drain_returns_once_the_drain_is_complete() {
         let calls: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
         let router = Router::new()
             .route(
@@ -1099,12 +1165,12 @@ mod tests {
             Duration::from_millis(1),
         )
         .await
-        .expect("wait succeeds once counts reach zero");
+        .expect("wait succeeds once the drain is complete");
         assert_eq!(*calls.lock().unwrap(), 2);
     }
 
     #[tokio::test]
-    async fn wait_for_drain_errors_naming_outstanding_counts_when_the_deadline_elapses() {
+    async fn wait_for_drain_errors_naming_what_is_outstanding_when_the_deadline_elapses() {
         let router = Router::new().route(
             "/api/v1/nodes/:node",
             get(|| async { Json(serde_json::to_value(get_node_response(1, 2)).unwrap()) }),
@@ -1125,23 +1191,43 @@ mod tests {
         assert!(message.contains("accruing 2"), "{message}");
     }
 
-    /// The `--wait` poll's `GetNodeResponse`, client-typed — what `drained`
-    /// and `counts` actually take.
-    fn client_get_node_response(running: u32, accruing: u32) -> GetNodeResponse {
-        to_client(get_node_response(running, accruing))
+    /// The `--wait` poll's `GetNodeResponse`, client-typed — what
+    /// `drain_progress` actually takes.
+    fn client(response: dto::GetNodeResponse) -> GetNodeResponse {
+        to_client(response)
     }
 
     #[test]
-    fn drained_is_true_only_when_both_counts_are_zero() {
-        assert!(drained(&client_get_node_response(0, 0).summary));
-        assert!(!drained(&client_get_node_response(1, 0).summary));
-        assert!(!drained(&client_get_node_response(0, 1).summary));
-        assert!(!drained(&client_get_node_response(3, 4).summary));
+    fn drain_progress_reads_the_derived_status() {
+        let horizon = coppice_core::time::Timestamp::UNIX_EPOCH
+            + coppice_core::time::Duration::from_secs(3_600);
+        let bounded =
+            drain_progress(&client(drained_node_response(1, 0, Some(horizon), false)).summary);
+        assert!(!bounded.complete);
+        assert!(
+            bounded.describe().starts_with("empty by "),
+            "{}",
+            bounded.describe()
+        );
+        let unbounded = drain_progress(&client(drained_node_response(1, 2, None, false)).summary);
+        assert_eq!(
+            unbounded.describe(),
+            "horizon unbounded, running 1, accruing 2"
+        );
+        assert!(drain_progress(&client(drained_node_response(0, 0, None, true)).summary).complete);
+        // Not yet visible on this replica: pending, never complete.
+        let unseen = drain_progress(&to_client::<_, NodeSummary>(sample_summary()));
+        assert!(!unseen.complete);
+        assert!(unseen.describe().starts_with("drain not recorded"));
     }
 
     #[test]
-    fn counts_reads_the_running_and_accruing_pair() {
-        assert_eq!(counts(&client_get_node_response(1, 2).summary), (1, 2));
-        assert_eq!(counts(&client_get_node_response(0, 0).summary), (0, 0));
+    fn detail_shows_the_drain_and_the_agent_separately() {
+        let mut response = drained_node_response(1, 0, None, false);
+        response.summary.agent_draining = true;
+        let rendered = render_detail(&client(response));
+        assert!(rendered.contains("drained, agent draining"), "{rendered}");
+        assert!(rendered.contains("unbounded"), "{rendered}");
+        assert!(rendered.contains("draining (shutting down)"), "{rendered}");
     }
 }

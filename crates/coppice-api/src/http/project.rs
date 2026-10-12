@@ -13,13 +13,14 @@ use coppice_core::attempt::AttemptState;
 use coppice_core::bytes::ByteSize;
 use coppice_core::id::{AllocationId, ClusterId, JobId, NodeId, QuotaEntityId};
 use coppice_core::job::JobState;
+use coppice_core::node::Drain;
 use coppice_core::quota::{self, CostUnits, PriorityMultiplier, TrueUp};
 use coppice_core::resource::Resources;
 use coppice_core::time::{Duration, Timestamp};
 use coppice_scheduler::{projected_starts_cached, ProjectedStarts};
 use coppice_state::{
-    AllocationRecord, AttemptRecord, JobRecord, PolicyConfig, QuotaEntity, StateMachine, ViewMemos,
-    QUOTA_TREE_DEPTH_CAP,
+    AllocationRecord, AttemptRecord, JobRecord, NodeHorizon, PolicyConfig, QuotaEntity,
+    StateMachine, ViewMemos, QUOTA_TREE_DEPTH_CAP,
 };
 
 use crate::{
@@ -104,10 +105,37 @@ fn node_health(mark: Option<&LivenessMark>) -> dto::NodeHealth {
     }
 }
 
+/// The horizon of every drained node, in one allocation scan (ADR 0044 §5)
+/// — derived at read time, never stored.
+fn drain_horizons(state: &StateMachine) -> BTreeMap<NodeId, NodeHorizon> {
+    let drained = state
+        .nodes
+        .iter()
+        .filter(|(_, record)| record.node.drain.is_some())
+        .map(|(id, _)| *id)
+        .collect();
+    state.node_horizons(&drained)
+}
+
+/// A drain record and its derived status, as the node views show it.
+fn drain_view(drain: &Drain, horizon: Option<&NodeHorizon>) -> dto::NodeDrain {
+    let (horizon, complete) = match horizon.copied().unwrap_or(NodeHorizon::Empty) {
+        NodeHorizon::Empty => (None, true),
+        NodeHorizon::Unbounded => (None, false),
+        NodeHorizon::Bounded(at) => (Some(at), false),
+    };
+    dto::NodeDrain {
+        requested_at: drain.requested_at,
+        horizon,
+        complete,
+    }
+}
+
 fn node_summary(
     node_id: &NodeId,
     record: &coppice_state::NodeRecord,
     memo: &NodeMemo,
+    horizons: &BTreeMap<NodeId, NodeHorizon>,
     usage: &UsageSnapshot,
     liveness: &LivenessMarks,
 ) -> dto::NodeSummary {
@@ -123,9 +151,11 @@ fn node_summary(
             .get(node_id)
             .map(|sample| (&sample.used).into()),
         labels: record.node.labels.clone(),
-        drain: record.node.drain.map(|drain| dto::NodeDrain {
-            requested_at: drain.requested_at,
-        }),
+        drain: record
+            .node
+            .drain
+            .as_ref()
+            .map(|drain| drain_view(drain, horizons.get(node_id))),
         agent_draining: record.draining,
         preemptible_only: record.node.preemptible_only,
         interruption_deadline: record.interruption_deadline,
@@ -147,6 +177,7 @@ pub fn list_nodes(
     liveness: &LivenessMarks,
 ) -> dto::ListNodesResponse {
     let memos = build_node_memos(state);
+    let horizons = drain_horizons(state);
     let empty = NodeMemo::default();
 
     let nodes = state
@@ -154,7 +185,7 @@ pub fn list_nodes(
         .iter()
         .map(|(id, record)| {
             let memo = memos.get(id).unwrap_or(&empty);
-            node_summary(id, record, memo, usage, liveness)
+            node_summary(id, record, memo, &horizons, usage, liveness)
         })
         .collect();
 
@@ -176,8 +207,12 @@ pub fn get_node(
     let memos = build_node_memos(state);
     let empty = NodeMemo::default();
     let memo = memos.get(id).unwrap_or(&empty);
+    let horizons = match record.node.drain {
+        Some(_) => BTreeMap::from([(*id, state.node_horizon(*id))]),
+        None => BTreeMap::new(),
+    };
 
-    let summary = node_summary(id, record, memo, usage, liveness);
+    let summary = node_summary(id, record, memo, &horizons, usage, liveness);
 
     let active_attempts = state
         .attempts
@@ -1717,6 +1752,55 @@ mod tests {
         let state = StateMachine::default();
         let response = list_nodes(&state, &no_usage(), &no_liveness());
         assert!(response.nodes.is_empty());
+    }
+
+    /// ADR 0044 §5: the drain record carries its derived status, computed
+    /// at read time — complete when the node is empty, unbounded while live
+    /// work has no enforced bound — and the agent flag is reported apart.
+    #[test]
+    fn list_nodes_derives_the_drain_status() {
+        let empty = NodeId::new();
+        let busy = NodeId::new();
+        let open = NodeId::new();
+        let drain = Some(coppice_core::node::Drain {
+            requested_at: ts(5),
+        });
+        let mut state = StateMachine::default();
+        let mut record = test_node(empty);
+        record.node.drain = drain;
+        state.nodes.insert(empty, record);
+        let mut record = test_node(busy);
+        record.node.drain = drain;
+        record.draining = true;
+        state.nodes.insert(busy, record);
+        state.nodes.insert(open, test_node(open));
+        // A live allocation whose attempt is not on record: nothing bounds it.
+        let alloc = AllocationId::new();
+        state.allocations.insert(
+            alloc,
+            test_allocation(
+                alloc,
+                JobId::new(),
+                AttemptId::new(),
+                busy,
+                AllocationState::Funded,
+            ),
+        );
+
+        let by_id: BTreeMap<_, _> = list_nodes(&state, &no_usage(), &no_liveness())
+            .nodes
+            .into_iter()
+            .map(|n| (n.id, n))
+            .collect();
+        let complete = by_id[&empty].drain.clone().expect("drained");
+        assert!(complete.complete);
+        assert_eq!(complete.horizon, None);
+        assert!(!by_id[&empty].agent_draining);
+        let unbounded = by_id[&busy].drain.clone().expect("drained");
+        assert!(!unbounded.complete);
+        assert_eq!(unbounded.horizon, None);
+        assert!(by_id[&busy].agent_draining);
+        assert_eq!(by_id[&open].drain, None);
     }
 
     #[test]

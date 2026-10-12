@@ -74,12 +74,27 @@ impl NodeHealth {
     }
 }
 
-/// An operator's drain of one node.
+/// An operator's drain of one node, with its derived status.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct NodeDrain {
     /// When the drain was first requested; a repeated drain keeps it.
     pub requested_at: Timestamp,
+    /// The node's horizon: the latest enforced completion bound among its
+    /// live work, by which it will be empty and up to which it still admits
+    /// bounded backfill. `None` either when the drain is `complete` or when
+    /// some live work is unbounded, so nothing bounds when the node empties.
+    pub horizon: Option<Timestamp>,
+    /// The node holds no live allocation: the drain is done.
+    pub complete: bool,
+}
+
+impl NodeDrain {
+    /// Live work with no enforced bound remains: the node cannot say when it
+    /// will be empty.
+    pub fn is_unbounded(&self) -> bool {
+        !self.complete && self.horizon.is_none()
+    }
 }
 
 /// Summary of a compute node's current state, for the list view.

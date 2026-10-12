@@ -596,6 +596,8 @@ fn node_read_models_round_trip_through_the_client() {
         labels: BTreeMap::from([("zone".to_string(), "a".to_string())]),
         drain: Some(dto::NodeDrain {
             requested_at: ts(3_000_000),
+            horizon: Some(ts(5_000_000)),
+            complete: false,
         }),
         agent_draining: true,
         health: dto::NodeHealth::Healthy,
