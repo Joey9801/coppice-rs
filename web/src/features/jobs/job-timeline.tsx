@@ -1,6 +1,7 @@
 import type { ReactNode } from 'react'
 import {
   Activity,
+  AlarmClock,
   Ban,
   CircleCheck,
   CircleDot,
@@ -78,6 +79,8 @@ function eventIcon(event: TimelineEvent): LucideIcon {
       return CircleCheck
     case 'StopRequested':
       return Ban
+    case 'AttemptNotified':
+      return AlarmClock
     case 'NodeEpochBumped':
       return RefreshCw
     case 'JobEvicted':
@@ -117,6 +120,13 @@ function eventSentence(event: TimelineEvent): ReactNode {
       return (
         <>
           Stop requested on <IdLink id={event.node} />
+        </>
+      )
+    case 'AttemptNotified':
+      return (
+        <>
+          Attempt <IdLink id={event.attempt} /> given preemption notice on{' '}
+          <IdLink id={event.node} />
         </>
       )
     case 'NodeEpochBumped':

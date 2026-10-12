@@ -10,6 +10,7 @@ import {
   type AttemptId,
   type AttemptOutcome,
   type AttemptOutcomeKind,
+  type AttemptPreemption,
   type AttemptState,
   type AttemptView,
   type ClusterOverview,
@@ -28,6 +29,7 @@ import {
   type JobPhase,
   type JobSpec,
   type NoticeSignal,
+  type PreemptReason,
   type JobState,
   type JobStateKind,
   type JobSummary,
@@ -337,7 +339,8 @@ function mapJobState(state: WireJobStateKind, attempt: AttemptId | null): JobSta
   return { kind } as JobState
 }
 
-type WireAttemptState = 'accruing' | 'ready' | 'dispatching' | 'running' | 'finalizing' | 'terminal'
+type WireAttemptState =
+  'accruing' | 'ready' | 'dispatching' | 'running' | 'preempting' | 'finalizing' | 'terminal'
 
 function mapAttemptState(s: WireAttemptState): AttemptState {
   return snakeToPascal(s) as AttemptState
@@ -354,6 +357,13 @@ type WireAttemptOutcomeKind =
   | 'start_failed'
   | 'node_lost'
   | 'agent_error'
+  | 'preempted'
+
+type WirePreemptReason = 'priority' | 'relocation' | 'drain' | 'interruption'
+
+function mapPreemptReason(r: WirePreemptReason): PreemptReason {
+  return snakeToPascal(r) as PreemptReason
+}
 
 type WireOutcomeClass = 'success' | 'user_error' | 'user_request' | 'platform'
 
@@ -361,6 +371,10 @@ interface WireAttemptOutcome {
   kind: WireAttemptOutcomeKind
   exit_code?: number | null
   class: WireOutcomeClass
+  /** Present when `kind` is `preempted`. */
+  reason?: WirePreemptReason | null
+  /** The job a `priority` or `relocation` preemption made room for. */
+  for_job?: JobId | null
 }
 
 function mapAttemptOutcome(o: WireAttemptOutcome): AttemptOutcome {
@@ -368,6 +382,28 @@ function mapAttemptOutcome(o: WireAttemptOutcome): AttemptOutcome {
     kind: snakeToPascal(o.kind) as AttemptOutcomeKind,
     ...(o.exit_code != null ? { exitCode: o.exit_code } : {}),
     class: snakeToPascal(o.class) as OutcomeClass,
+    ...(o.reason != null ? { reason: mapPreemptReason(o.reason) } : {}),
+    ...(o.for_job != null ? { forJob: o.for_job } : {}),
+  }
+}
+
+interface WireAttemptPreemption {
+  reason: WirePreemptReason
+  for_job: JobId | null
+  requested_at: string
+  notified_at: string | null
+  deadline: string | null
+  notice_shortfall_seconds: number | null
+}
+
+function mapAttemptPreemption(p: WireAttemptPreemption): AttemptPreemption {
+  return {
+    reason: mapPreemptReason(p.reason),
+    forJob: p.for_job ?? null,
+    requestedAt: toDate(p.requested_at),
+    notifiedAt: toDateOrNull(p.notified_at),
+    deadline: toDateOrNull(p.deadline),
+    noticeShortfallSeconds: p.notice_shortfall_seconds ?? null,
   }
 }
 
@@ -383,6 +419,7 @@ interface WireAttemptView {
   rate_ucu_per_second: number
   charged_ucu: number
   preemptible: boolean
+  preemption: WireAttemptPreemption | null
 }
 
 function mapAttemptView(a: WireAttemptView): AttemptView {
@@ -398,6 +435,7 @@ function mapAttemptView(a: WireAttemptView): AttemptView {
     rateUcuPerSecond: a.rate_ucu_per_second,
     chargedUcu: a.charged_ucu,
     preemptible: a.preemptible,
+    preemption: a.preemption ? mapAttemptPreemption(a.preemption) : null,
   }
 }
 
@@ -512,6 +550,7 @@ type WireTimelineEventBody =
     }
   | { kind: 'allocation_funded'; allocation: string; job: JobId; node: NodeId }
   | { kind: 'stop_requested'; node: NodeId; allocation: string; job: JobId }
+  | { kind: 'attempt_notified'; attempt: AttemptId; job: JobId; node: NodeId }
   | { kind: 'node_epoch_bumped'; node: NodeId; epoch: number }
   | { kind: 'job_evicted'; job: JobId }
   | { kind: 'job_metadata_updated'; job: JobId }
@@ -560,6 +599,13 @@ function mapTimelineEventBody(e: WireTimelineEvent): TimelineEventBody {
         node: e.node as NodeId,
         allocation: e.allocation as string,
         job: e.job as JobId,
+      }
+    case 'attempt_notified':
+      return {
+        kind: 'AttemptNotified',
+        attempt: e.attempt as AttemptId,
+        job: e.job as JobId,
+        node: e.node as NodeId,
       }
     case 'node_epoch_bumped':
       return { kind: 'NodeEpochBumped', node: e.node as NodeId, epoch: e.epoch as number }
@@ -1156,6 +1202,7 @@ interface WireNodeSummary {
   schedulable: boolean
   draining?: boolean
   preemptible_only: boolean
+  interruption_deadline: string | null
   health: WireNodeHealth
   epoch: number
   last_heartbeat: string | null
@@ -1173,6 +1220,7 @@ function mapNodeSummary(n: WireNodeSummary): NodeSummary {
     schedulable: n.schedulable,
     draining: n.draining ?? false,
     preemptibleOnly: n.preemptible_only,
+    interruptionDeadline: toDateOrNull(n.interruption_deadline),
     health: snakeToPascal(n.health) as NodeHealth,
     epoch: n.epoch,
     lastHeartbeat: toDateOrNull(n.last_heartbeat),

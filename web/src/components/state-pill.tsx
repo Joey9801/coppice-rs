@@ -5,6 +5,7 @@ import type {
   AttemptState,
   JobPhase,
   NodeHealth,
+  PreemptReason,
 } from '@/api/types'
 import { cn } from '@/lib/utils'
 
@@ -41,7 +42,8 @@ const STATE_TONE: Record<PillState, Tone> = {
   Accruing: 'amber',
   Ready: 'amber',
   Dispatching: 'amber',
-  // teal — winding down
+  // teal — winding down (a preempting attempt is running out its notice)
+  Preempting: 'teal',
   Finalizing: 'teal',
   // red — failure / loss
   Failed: 'red',
@@ -111,6 +113,19 @@ const OUTCOME_LABEL: Record<AttemptOutcome['kind'], string> = {
   StartFailed: 'Start failed',
   NodeLost: 'Node lost',
   AgentError: 'Agent error',
+  Preempted: 'Preempted',
+}
+
+const PREEMPT_REASON_LABEL: Record<PreemptReason, string> = {
+  Priority: 'priority',
+  Relocation: 'relocation',
+  Drain: 'drain',
+  Interruption: 'interruption',
+}
+
+/** Lower-case label for a preemption reason, e.g. "interruption". */
+export function preemptReasonLabel(reason: PreemptReason): string {
+  return PREEMPT_REASON_LABEL[reason]
 }
 
 // Color follows who owns the outcome (its class), so the same kind can read
@@ -126,7 +141,11 @@ const CLASS_TONE: Record<AttemptOutcome['class'], Tone> = {
 export function outcomePill(outcome: AttemptOutcome): ReactNode {
   const base = OUTCOME_LABEL[outcome.kind]
   const label =
-    outcome.kind === 'Exited' && outcome.exitCode != null ? `${base} ${outcome.exitCode}` : base
+    outcome.kind === 'Exited' && outcome.exitCode != null
+      ? `${base} ${outcome.exitCode}`
+      : outcome.kind === 'Preempted' && outcome.reason != null
+        ? `${base} (${PREEMPT_REASON_LABEL[outcome.reason]})`
+        : base
   const tone =
     outcome.kind === 'Exited' && outcome.class === 'Success' ? 'emerald' : CLASS_TONE[outcome.class]
   return <Pill tone={tone}>{label}</Pill>

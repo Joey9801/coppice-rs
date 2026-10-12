@@ -19,6 +19,7 @@ function attempt(n: number, overrides: Partial<AttemptView> = {}): AttemptView {
     rateUcuPerSecond: 1_000_000 / 3600,
     chargedUcu: 1_000_000,
     preemptible: false,
+    preemption: null,
     ...overrides,
   }
 }

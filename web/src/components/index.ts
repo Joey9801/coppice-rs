@@ -4,7 +4,13 @@
 
 export { PageHeader, type PageHeaderProps } from './page-header'
 export { StatTile, type StatTileProps } from './stat-tile'
-export { StatePill, outcomePill, type StatePillProps, type PillState } from './state-pill'
+export {
+  StatePill,
+  outcomePill,
+  preemptReasonLabel,
+  type StatePillProps,
+  type PillState,
+} from './state-pill'
 export { IdLink, type IdLinkProps } from './id-link'
 export {
   EntityBreadcrumb,

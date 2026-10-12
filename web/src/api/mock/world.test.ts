@@ -98,12 +98,42 @@ function assertInvariants(world: MockWorld, nowUs: number): void {
     }
 
     // The retry budget bounds total attempts (maxRetries + the first one).
-    expect(detail.attempts.length).toBeLessThanOrEqual(detail.spec.retry.maxRetries + 1)
+    // A preempted attempt is a free requeue (ADR 0044 §2), outside the budget.
+    const budgeted = detail.attempts.filter((a) => a.outcome?.kind !== 'Preempted')
+    expect(budgeted.length).toBeLessThanOrEqual(detail.spec.retry.maxRetries + 1)
+
+    // ADR 0044 §3: `Preempting` is exactly a running attempt with a record.
+    for (const attempt of detail.attempts) {
+      if (attempt.state === 'Preempting') expect(attempt.preemption).not.toBeNull()
+      if (attempt.state === 'Running') expect(attempt.preemption).toBeNull()
+      const p = attempt.preemption
+      if (p) {
+        expect(attempt.preemptible).toBe(true)
+        if (p.forJob != null) expect(['Priority', 'Relocation']).toContain(p.reason)
+        // Acknowledgement fills notifiedAt, deadline and shortfall together.
+        const acked = [p.notifiedAt, p.deadline, p.noticeShortfallSeconds].map((v) => v != null)
+        expect(new Set(acked).size).toBe(1)
+        if (p.noticeShortfallSeconds != null) {
+          expect(p.noticeShortfallSeconds).toBeGreaterThanOrEqual(0)
+        }
+        if (p.notifiedAt)
+          expect(p.notifiedAt.getTime()).toBeGreaterThanOrEqual(p.requestedAt.getTime())
+      }
+      const o = attempt.outcome
+      if (o?.kind === 'Preempted') {
+        expect(o.class).toBe('Platform')
+        expect(o.reason).toBeDefined()
+        expect(p?.reason).toBe(o.reason)
+        if (o.forJob !== undefined) expect(['Priority', 'Relocation']).toContain(o.reason)
+      } else {
+        expect(o?.reason).toBeUndefined()
+      }
+    }
 
     // Attempting + attempt Running: exactly one current attempt Running with
     // an Active, fully funded allocation.
     const cur = jobCurrentAttempt(detail)
-    if (cur?.state === 'Running') {
+    if (cur?.state === 'Running' || cur?.state === 'Preempting') {
       expect(jobAttemptId(detail.state)).not.toBeNull()
       const nodeDetail = world.buildNodeDetail(cur.node)
       const active = nodeDetail.activeAttempts.find((a) => a.id === cur.id)
@@ -257,6 +287,64 @@ describe('MockWorld construction', () => {
     }
     const spot = world.buildNodeSummaries().filter((n) => n.preemptibleOnly)
     expect(spot.length).toBeGreaterThanOrEqual(1)
+  })
+
+  it('seeds preempted and preempting attempts and an interrupted node (ADR 0044 §2–§5)', () => {
+    const world = new MockWorld(NOW_US)
+    const attempts = world
+      .listJobs({ limit: 1000 })
+      .jobs.flatMap((j) => world.buildJobDetail(j.id).attempts)
+
+    const preempting = attempts.filter((a) => a.state === 'Preempting')
+    expect(preempting.length).toBeGreaterThanOrEqual(1)
+    // One notice still in flight, at least one acknowledged against a deadline.
+    expect(preempting.some((a) => a.preemption?.notifiedAt == null)).toBe(true)
+    expect(preempting.some((a) => a.preemption?.deadline != null)).toBe(true)
+    expect(preempting.some((a) => a.preemption?.forJob != null)).toBe(true)
+
+    const preempted = attempts.filter((a) => a.outcome?.kind === 'Preempted')
+    expect(preempted.length).toBeGreaterThanOrEqual(1)
+    for (const a of preempted) {
+      expect(a.state).toBe('Terminal')
+      expect(a.chargedUcu).toBe(0)
+    }
+    expect(preempted.some((a) => (a.preemption?.noticeShortfallSeconds ?? 0) > 0)).toBe(true)
+
+    const interrupted = world.buildNodeSummaries().filter((n) => n.interruptionDeadline != null)
+    expect(interrupted).toHaveLength(1)
+    const node = interrupted[0]!
+    expect(node.preemptibleOnly).toBe(true)
+    // ADR 0044 §5: an interrupted agent announces its drain with the deadline.
+    expect(node.draining).toBe(true)
+    expect(node.interruptionDeadline!.getTime()).toBeGreaterThan(NOW_US / 1000)
+    // Every attempt still running there is preempting for the interruption.
+    for (const a of world.buildNodeDetail(node.id).activeAttempts) {
+      if (a.state === 'Preempting') expect(a.preemption?.reason).toBe('Interruption')
+      expect(a.state).not.toBe('Running')
+    }
+  })
+
+  it('ends a preempting attempt Preempted at its deadline and requeues the job', () => {
+    const world = new MockWorld(NOW_US)
+    const ids = world.listJobs({ limit: 1000 }).jobs.map((j) => j.id)
+    const target = ids
+      .map((id) => world.buildJobDetail(id))
+      .find((d) => {
+        const cur = jobCurrentAttempt(d)
+        return cur?.state === 'Preempting' && cur.preemption?.deadline != null
+      })
+    expect(target).toBeDefined()
+    const attemptId = jobCurrentAttempt(target!)!.id
+    const deadlineUs = jobCurrentAttempt(target!)!.preemption!.deadline!.getTime() * 1000
+    world.advanceTo(deadlineUs + 2_000_000)
+
+    const after = world.buildJobDetail(target!.id)
+    const ended = after.attempts.find((a) => a.id === attemptId)!
+    expect(ended.state).toBe('Terminal')
+    expect(ended.outcome?.kind).toBe('Preempted')
+    expect(ended.preemption).not.toBeNull()
+    expect(jobAttemptId(after.state)).not.toBe(attemptId)
+    expect(world.buildJobTimeline(target!.id).some((e) => e.kind === 'AttemptNotified')).toBe(true)
   })
 
   it('reconciles the accruing breakdown with the phase counts', () => {

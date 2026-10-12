@@ -208,6 +208,11 @@ export function formatTimeUntil(t: Date, now: Date = new Date()): string {
   return `in ${formatDuration(inSeconds)}`
 }
 
+/** "in 12m" for a future instant, "3m ago" for a past one. */
+export function formatRelativeTime(t: Date, now: Date = new Date()): string {
+  return t.getTime() > now.getTime() ? formatTimeUntil(t, now) : formatTimeAgo(t, now)
+}
+
 /** Absolute local timestamp for detail views / tooltips. */
 export function formatTimestamp(t: Date): string {
   return t.toLocaleString(undefined, {
