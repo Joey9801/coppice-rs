@@ -120,14 +120,16 @@ const PRIORITY_MULTIPLIER: Record<number, number> = { 0: 1, 1: 2, 2: 4 }
 const W_AGE = 0.5
 const AGE_HORIZON_US = 24 * HOUR_US
 /**
- * Charge policy (ADR 0029), mirroring `coppice_state::Policy` defaults:
- * - the upfront charge covers `max_runtime`, or this default window when the
- *   job declared no bound (`default_charge_runtime_s: 86_400` = 24h);
+ * Charge policy (ADR 0029/0046), mirroring `coppice_state::PolicyConfig` defaults:
+ * - a bounded job's upfront charge covers its `max_runtime`; a job with no
+ *   bound is charged in intervals (`unbounded_charge_interval_s: 1800` = 30
+ *   min), one up front at placement and one more each time its runtime reaches
+ *   the end of what it has paid for;
  * - unbounded jobs price at an elevated multiplier to encourage real bounds;
  * - a true-up refunds this fraction of the unused charge for bounded jobs
  *   (unbounded / platform outcomes refund in full).
  */
-const DEFAULT_CHARGE_RUNTIME_US = 24 * HOUR_US
+const UNBOUNDED_CHARGE_INTERVAL_US = 30 * MINUTE_US
 const UNBOUNDED_RUNTIME_MULTIPLIER = 2
 const REFUND_FRACTION = 0.75
 
@@ -1277,8 +1279,7 @@ export class MockWorld {
   }
 
   private applyTrueUp(job: MJob, attempt: MAttempt, state: JobState): void {
-    const charged = job.attempts.reduce((s, id) => s + (this.attempts.get(id)?.chargedUcu ?? 0), 0)
-    // The upfront charge covered the whole window at the effective rate; the
+    // The charges covered the whole paid window at the effective rate; the
     // tail the job never used is refunded (partly for a declared bound, fully
     // for an unbounded job or a platform-attributable outcome).
     const model = this.jobChargeModel(job)
@@ -1286,10 +1287,20 @@ export class MockWorld {
       0,
       (attempt.endedAtUs ?? this.nowUs) - (attempt.startedAtUs ?? this.nowUs),
     )
-    const unusedUs = Math.max(0, model.chargeWindowUs - ranUs)
+    // An unbounded job paid for every interval it began (ADR 0046): the
+    // renewals the leader charged while it ran are folded in here, so the
+    // attempt's charge is the cumulative amount the real record carries.
+    let paidUs = model.chargeWindowUs
+    if (!model.bounded && attempt.startedAtUs !== null) {
+      const intervals = Math.floor(ranUs / model.chargeWindowUs) + 1
+      paidUs = intervals * model.chargeWindowUs
+      attempt.chargedUcu = Math.round(model.upfrontUcu * intervals)
+    }
+    const unusedUs = Math.max(0, paidUs - ranUs)
     // An attempt that never started refunds in full — the real apply's
     // actual-cost-zero path — regardless of the job's declared refund
     // fraction (which only retains cost the job actually incurred).
+    const charged = job.attempts.reduce((s, id) => s + (this.attempts.get(id)?.chargedUcu ?? 0), 0)
     const fraction =
       attempt.startedAtUs === null || attempt.outcome?.class === 'Platform'
         ? 1
@@ -2637,10 +2648,11 @@ export class MockWorld {
   }
 
   /**
-   * The upfront-charge model for a job (ADR 0005/0029) — the single source of
-   * every cost number shown. The `max_runtime` window (or the policy default
-   * when the job declared no bound) is priced in full at the effective rate at
-   * placement; the unused tail is (partly) refunded at true-up.
+   * The upfront-charge model for a job (ADR 0005/0029/0046) — the single
+   * source of every cost number shown. The `max_runtime` window (or, when the
+   * job declared no bound, one renewal interval) is priced in full at the
+   * effective rate at placement; the unused tail is (partly) refunded at
+   * true-up.
    */
   private jobChargeModel(job: MJob) {
     const terms = rateTerms(job.spec.requests)
@@ -2649,7 +2661,7 @@ export class MockWorld {
     const priorityMultiplier = this.multiplier(job.spec.priority)
     const unboundedMultiplier = bounded ? 1 : UNBOUNDED_RUNTIME_MULTIPLIER
     const effectiveRate = base * priorityMultiplier * unboundedMultiplier
-    const chargeWindowUs = job.spec.maxRuntimeUs ?? DEFAULT_CHARGE_RUNTIME_US
+    const chargeWindowUs = job.spec.maxRuntimeUs ?? UNBOUNDED_CHARGE_INTERVAL_US
     const upfrontUcu = Math.round(effectiveRate * (chargeWindowUs / SECOND_US))
     const refundFraction = bounded ? REFUND_FRACTION : 1
     return {
