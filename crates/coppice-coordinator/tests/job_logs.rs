@@ -117,6 +117,7 @@ fn agent_config(node_id: NodeId, data_dir: std::path::PathBuf, endpoint: &str, c
         telemetry: Default::default(),
         listen: None,
         metrics_addr: None,
+        preemption: Default::default(),
     }
 }
 

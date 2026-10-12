@@ -100,6 +100,9 @@ pub struct NodeSummary {
     /// necessarily ask for this. A node takes new placements only when
     /// `schedulable && !draining`.
     pub draining: bool,
+    /// The node takes only effectively preemptible work (ADR 0044 §4) —
+    /// spot capacity, from the agent's `[preemption] preemptible_only`.
+    pub preemptible_only: bool,
     /// Liveness verdict.
     pub health: NodeHealth,
     /// Bumps on (re)registration or loss; fences stale agent commands.
@@ -256,6 +259,7 @@ mod tests {
             labels: BTreeMap::from([("zone".to_string(), "a".to_string())]),
             schedulable: true,
             draining: false,
+            preemptible_only: true,
             health: NodeHealth::Unreported,
             epoch: 3,
             last_heartbeat: None,
@@ -274,6 +278,7 @@ mod tests {
                 "labels": { "zone": "a" },
                 "schedulable": true,
                 "draining": false,
+                "preemptible_only": true,
                 "health": "unknown",
                 "epoch": 3,
                 "last_heartbeat": null,

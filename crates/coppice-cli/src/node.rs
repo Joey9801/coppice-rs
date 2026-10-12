@@ -425,6 +425,17 @@ fn health_label(health: &NodeHealth) -> String {
     health.to_string()
 }
 
+/// The list table's scheduling cell: [`schedulable_label`], marked when the
+/// node takes only effectively preemptible work (ADR 0044 §4).
+fn scheduling_cell(schedulable: bool, draining: bool, preemptible_only: bool) -> String {
+    let label = schedulable_label(schedulable, draining);
+    if preemptible_only {
+        format!("{label}, preemptible only")
+    } else {
+        label.to_string()
+    }
+}
+
 /// The scheduling posture, derived from the two independent flags on
 /// [`NodeSummary`]: the admin cordon (`schedulable`) and the agent's
 /// own shutdown announcement (`draining`).
@@ -478,7 +489,7 @@ fn render_list(response: &ListNodesResponse) -> String {
             vec![
                 node.id.to_string(),
                 health_label(&node.health),
-                schedulable_label(node.schedulable, node.draining).to_string(),
+                scheduling_cell(node.schedulable, node.draining, node.preemptible_only),
                 resources_cell(&node.capacity),
                 resources_cell(&node.allocated),
                 node.running_count.to_string(),
@@ -522,6 +533,17 @@ fn render_detail(response: &GetNodeResponse) -> String {
         &mut out,
         "scheduling",
         schedulable_label(summary.schedulable, summary.draining),
+    );
+    kv(
+        &mut out,
+        "accepts",
+        // ADR 0044 §4: a spot-only node takes effectively preemptible work
+        // only.
+        if summary.preemptible_only {
+            "preemptible work only"
+        } else {
+            "any work"
+        },
     );
     kv(&mut out, "epoch", &summary.epoch.to_string());
     kv(&mut out, "capacity", &resources(&summary.capacity));
@@ -665,6 +687,7 @@ mod tests {
             last_heartbeat: None,
             running_count: 1,
             accruing_count: 2,
+            preemptible_only: false,
         }
     }
 
@@ -704,6 +727,16 @@ mod tests {
         assert!(rendered.contains("unknown"), "{rendered}");
         assert!(rendered.contains("schedulable"), "{rendered}");
         assert!(rendered.contains("4000m"), "{rendered}");
+        assert!(!rendered.contains("preemptible only"), "{rendered}");
+
+        // A spot-only node says so in its scheduling cell (ADR 0044 §4).
+        let mut spot = sample_summary();
+        spot.preemptible_only = true;
+        let rendered = render_list(&to_client(dto::ListNodesResponse { nodes: vec![spot] }));
+        assert!(
+            rendered.contains("schedulable, preemptible only"),
+            "{rendered}"
+        );
     }
 
     #[test]

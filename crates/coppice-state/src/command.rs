@@ -344,6 +344,10 @@ pub struct RegisterNode {
     /// registration, so an agent that comes back clears the announcement at
     /// the same log position that bumps the epoch.
     pub draining: bool,
+    /// The agent's `[preemption] preemptible_only` (ADR 0044 §4), written to
+    /// [`Node::preemptible_only`](coppice_core::node::Node::preemptible_only)
+    /// on every registration.
+    pub preemptible_only: bool,
 }
 
 /// Node missed the replicated heartbeat deadline: epoch bump, unschedulable,

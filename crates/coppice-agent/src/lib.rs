@@ -481,6 +481,8 @@ pub async fn run_daemon_with_shutdown(
         docker_executor,
     )
     .with_service_addr(config.service_addr())
+    // Spot-only nodes (ADR 0044 §4) announce it at every registration.
+    .with_preemptible_only(config.preemption.preemptible_only)
     // Static host description + what detection read before `[capacity]`
     // overrides, so the node detail view can explain the advertised vector.
     .with_host_facts(hostinfo::collect(&detected), detected.as_resources())

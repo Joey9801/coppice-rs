@@ -627,6 +627,7 @@ impl From<&Node> for pb::Node {
             service_addr: node.service_addr.clone(),
             host_facts: node.host_facts.as_ref().map(Into::into),
             detected_capacity: node.detected_capacity.as_ref().map(Into::into),
+            preemptible_only: node.preemptible_only,
         }
     }
 }
@@ -648,6 +649,7 @@ impl TryFrom<pb::Node> for Node {
                 .detected_capacity
                 .map(Resources::try_from)
                 .transpose()?,
+            preemptible_only: node.preemptible_only,
         })
     }
 }

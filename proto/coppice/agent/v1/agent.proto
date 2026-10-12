@@ -180,6 +180,11 @@ message Register {
   // definition, not gone away, and `systemctl restart coppice-agent` therefore
   // never leaves a node permanently drained.
   bool draining = 6;
+  // The agent's `[preemption] preemptible_only` (ADR 0044 §4): this node
+  // takes only effectively preemptible work, typically because it is spot
+  // capacity. Registration rewrites the replicated flag, so changing the
+  // config and restarting the agent changes the node.
+  bool preemptible_only = 7;
 }
 
 // Periodic liveness, inventory, and running-set signal. The coordinator

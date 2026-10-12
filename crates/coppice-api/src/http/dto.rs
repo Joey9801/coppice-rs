@@ -278,6 +278,9 @@ pub struct NodeSummary {
     /// admin cordon: an operator did not necessarily ask for this. A node
     /// takes new placements only when `schedulable && !draining`.
     pub draining: bool,
+    /// The node takes only effectively preemptible work (ADR 0044 §4) —
+    /// spot capacity, from the agent's `[preemption] preemptible_only`.
+    pub preemptible_only: bool,
     pub health: NodeHealth,
     /// Bumps on (re)registration or loss; fences stale agent commands.
     pub epoch: u64,
@@ -2821,6 +2824,7 @@ mod tests {
             last_heartbeat: None,
             running_count: 2,
             accruing_count: 1,
+            preemptible_only: false,
         };
 
         let json = serde_json::to_value(&summary).unwrap();
@@ -2834,6 +2838,7 @@ mod tests {
                 "labels": { "zone": "a" },
                 "schedulable": true,
                 "draining": false,
+                "preemptible_only": false,
                 "health": "unknown",
                 "epoch": 3,
                 "last_heartbeat": null,

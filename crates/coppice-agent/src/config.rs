@@ -158,6 +158,33 @@ pub struct Config {
     /// the server binds eagerly at startup (fail-fast on a port conflict).
     #[serde(default)]
     pub metrics_addr: Option<SocketAddr>,
+
+    /// Preemption posture of this node (ADR 0044 §4/§6). Defaulted whole, so
+    /// a bare config describes an ordinary node.
+    #[serde(default)]
+    pub preemption: PreemptionConfig,
+}
+
+/// The agent's `[preemption]` table (ADR 0044 §6).
+///
+/// ```toml
+/// [preemption]
+/// preemptible_only = true   # this node takes only effectively preemptible work
+/// ```
+///
+/// `preemptible_only` rides `Register` onto the replicated node record, where
+/// the scheduler and apply both gate placements on it: a job is placed here
+/// only if it declared `preemptible = true` and no quota entity on its path
+/// switched preemption off. It is a node fact, not a cluster one, so it lives
+/// in the node config file (ADR 0020). The interruption-notice source of the
+/// same table arrives with the termination mechanism.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreemptionConfig {
+    /// Accept only effectively preemptible work (spot capacity). Default
+    /// `false`.
+    #[serde(default)]
+    pub preemptible_only: bool,
 }
 
 /// Bind/advertise addresses for the agent-hosted `NodeService` listener
@@ -1029,6 +1056,25 @@ token_path = "/etc/coppice/enroll-token"
         // Sized for a small instance: the default 20 GiB disk reservation
         // would swallow most of the demo's 30 GB root volume.
         assert_eq!(config.reservation.disk, ByteSize::from_gib(8));
+    }
+
+    /// `[preemption]` (ADR 0044 §6): absent is an ordinary node, present
+    /// turns spot-only on, and an unknown key fail-stops.
+    #[test]
+    fn preemption_table_parses_and_defaults_off() {
+        let (_guard, path) = write_config(&minimal_with(""));
+        assert!(
+            !load(&path)
+                .expect("minimal parses")
+                .preemption
+                .preemptible_only
+        );
+
+        let (_guard, path) = write_config(&minimal_with("[preemption]\npreemptible_only = true\n"));
+        assert!(load(&path).expect("parses").preemption.preemptible_only);
+
+        let (_guard, path) = write_config(&minimal_with("[preemption]\nspot = true\n"));
+        assert!(load(&path).is_err());
     }
 
     #[test]

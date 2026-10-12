@@ -52,11 +52,16 @@ struct JobGen {
     max_runtime_s: Option<i64>,
     multiplier_n: u64,
     seed_running: bool,
+    /// The job's `[preemption] preemptible` (ADR 0044 §1).
+    preemptible: bool,
 }
 
 #[derive(Debug, Clone)]
 struct Scenario {
     nodes: Vec<Resources>,
+    /// Which nodes beyond the first are spot-only (ADR 0044 §4). The first
+    /// node is always ordinary: seeding places on it without asking the gate.
+    spot: Vec<bool>,
     accrual_limit: u32,
     jobs: Vec<JobGen>,
 }
@@ -96,13 +101,15 @@ fn job_strategy() -> impl Strategy<Value = JobGen> {
         prop::option::of(300i64..86_400),
         1u64..6,
         any::<bool>(),
+        any::<bool>(),
     )
         .prop_map(
-            |(requests, max_runtime_s, multiplier_n, seed_running)| JobGen {
+            |(requests, max_runtime_s, multiplier_n, seed_running, preemptible)| JobGen {
                 requests,
                 max_runtime_s,
                 multiplier_n,
                 seed_running,
+                preemptible,
             },
         )
 }
@@ -110,11 +117,13 @@ fn job_strategy() -> impl Strategy<Value = JobGen> {
 fn scenario_strategy() -> impl Strategy<Value = Scenario> {
     (
         prop::collection::vec(node_strategy(), 1..4),
+        prop::collection::vec(any::<bool>(), 4),
         1u32..5,
         prop::collection::vec(job_strategy(), 1..30),
     )
-        .prop_map(|(nodes, accrual_limit, jobs)| Scenario {
+        .prop_map(|(nodes, spot, accrual_limit, jobs)| Scenario {
             nodes,
+            spot,
             accrual_limit,
             jobs,
         })
@@ -134,7 +143,7 @@ fn build_state(s: &Scenario) -> StateMachine {
     for (i, cap) in s.nodes.iter().enumerate() {
         apply_ok(
             &mut sm,
-            register_node_cmd(nid((i + 1) as u128), *cap, base_ts()),
+            register_node_cmd_with(nid((i + 1) as u128), *cap, base_ts(), i > 0 && s.spot[i]),
         );
     }
 
@@ -144,12 +153,16 @@ fn build_state(s: &Scenario) -> StateMachine {
         let multiplier = PriorityMultiplier(job.multiplier_n << 32);
         apply_ok(
             &mut sm,
-            submit_cmd(
+            submit_cmd_with(
                 job_id,
                 job.requests,
                 job.max_runtime_s,
                 multiplier,
                 base_ts(),
+                coppice_core::preemption::PreemptionSpec {
+                    preemptible: job.preemptible,
+                    ..Default::default()
+                },
             ),
         );
         // Seeding stops at the node's first accrual: a second would break the
