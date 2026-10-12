@@ -33,6 +33,19 @@ export function JobSpecCard({ job }: { job: JobDetail }) {
       }, user errors: ${spec.retry.retryUserErrors ? 'yes' : 'no'}`,
     },
     {
+      label: 'Preemption',
+      value: (
+        <span>
+          {spec.preemption.preemptible ? 'preemptible' : 'not preemptible'}
+          <span className="text-muted-foreground">
+            {' '}
+            · {formatDuration(spec.preemption.noticeSeconds)} notice ·{' '}
+            <span className="font-mono text-xs">{spec.preemption.noticeSignal}</span>
+          </span>
+        </span>
+      ),
+    },
+    {
       label: 'Quota entity',
       value: <EntityLabel id={spec.quotaEntity} path={spec.quotaEntityPath} variant="stacked" />,
     },

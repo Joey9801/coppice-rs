@@ -263,6 +263,12 @@ export interface AttemptView {
   rateUcuPerSecond: number
   /** Upfront charge for this attempt (trued-up at finalization). */
   chargedUcu: number
+  /**
+   * Effective preemptibility recorded at placement (ADR 0044 §1): the job
+   * opted in and no quota entity on its path switched preemption off. When
+   * true the charge carries the preemptible discount.
+   */
+  preemptible: boolean
 }
 
 // ---------------------------------------------------------------------------
@@ -304,6 +310,23 @@ export interface JobSpec {
     maxRetries: number
     retryUserErrors: boolean
   }
+  /** The job's `[preemption]` declarations (ADR 0044 §1); always present. */
+  preemption: JobPreemption
+}
+
+/** The signals a preemption notice can be delivered as. */
+export type NoticeSignal = 'SIGHUP' | 'SIGINT' | 'SIGUSR1' | 'SIGUSR2' | 'SIGTERM'
+
+/**
+ * A job's stored preemption declarations. `preemptible` is what the job
+ * asked for; whether an attempt actually was is `AttemptView.preemptible`,
+ * which also folds in the quota entities' switches.
+ */
+export interface JobPreemption {
+  preemptible: boolean
+  /** Notice given to the job before it is preempted, in whole seconds. */
+  noticeSeconds: number
+  noticeSignal: NoticeSignal
 }
 
 export interface JobSummary {
@@ -405,7 +428,12 @@ export interface CostReport {
    * (ADR 0029, default 2×); 1 when the job is bounded.
    */
   unboundedMultiplier: number
-  /** The µCU/second actually priced: `rateUcuPerSecond × priority × unbounded`. */
+  /**
+   * Discount folded in for an effectively preemptible job (ADR 0044 §1,
+   * default policy 0.5); 1 when the job is not.
+   */
+  preemptibleMultiplier: number
+  /** The µCU/second actually priced: `rateUcuPerSecond × priority × unbounded × preemptible`. */
   effectiveRateUcuPerSecond: number
   /**
    * Duration the upfront placement charge covers: the job's `max_runtime`. For
@@ -715,6 +743,11 @@ export interface NodeSummary {
    * takes new placements only when `schedulable && !draining`.
    */
   draining?: boolean
+  /**
+   * Spot capacity (ADR 0044 §4): the node accepts only effectively
+   * preemptible work.
+   */
+  preemptibleOnly: boolean
   health: NodeHealth
   /** Bumps on (re)registration or loss; fences stale agent commands. */
   epoch: number
@@ -832,6 +865,11 @@ export interface QuotaEntityNode {
   penalty: number
   createdAt: Date
   updatedAt: Date
+  /**
+   * The entity's own preemption switch (ADR 0044 §1), default true. False
+   * switches preemption off for the whole subtree.
+   */
+  preemptible: boolean
   /** Live job counts over this entity's subtree (itself + descendants). */
   queuedCount: number
   runningCount: number
@@ -871,6 +909,8 @@ export interface ConfigureQuotaEntityInput {
   /** One path segment — see `QuotaEntityNode.name`. */
   name: string
   quotaUcu: number
+  /** The entity's preemption switch; omitted leaves an existing entity's as is (new: on). */
+  preemptible?: boolean
 }
 
 // ---------------------------------------------------------------------------

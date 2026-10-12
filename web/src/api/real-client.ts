@@ -27,6 +27,7 @@ import {
   type JobMetadata,
   type JobPhase,
   type JobSpec,
+  type NoticeSignal,
   type JobState,
   type JobStateKind,
   type JobSummary,
@@ -381,6 +382,7 @@ interface WireAttemptView {
   ended_at: string | null
   rate_ucu_per_second: number
   charged_ucu: number
+  preemptible: boolean
 }
 
 function mapAttemptView(a: WireAttemptView): AttemptView {
@@ -395,6 +397,7 @@ function mapAttemptView(a: WireAttemptView): AttemptView {
     endedAt: toDateOrNull(a.ended_at),
     rateUcuPerSecond: a.rate_ucu_per_second,
     chargedUcu: a.charged_ucu,
+    preemptible: a.preemptible,
   }
 }
 
@@ -775,6 +778,7 @@ interface WireJobSpecView {
   quota_entity: QuotaEntityId
   quota_entity_path: string
   retry: { max_retries: number; retry_user_errors: boolean }
+  preemption: { preemptible: boolean; notice_seconds: number; notice_signal: string }
 }
 
 function mapJobSpec(s: WireJobSpecView): JobSpec {
@@ -789,6 +793,11 @@ function mapJobSpec(s: WireJobSpecView): JobSpec {
     quotaEntity: s.quota_entity,
     quotaEntityPath: s.quota_entity_path,
     retry: { maxRetries: s.retry.max_retries, retryUserErrors: s.retry.retry_user_errors },
+    preemption: {
+      preemptible: s.preemption.preemptible,
+      noticeSeconds: s.preemption.notice_seconds,
+      noticeSignal: s.preemption.notice_signal as NoticeSignal,
+    },
   }
 }
 
@@ -852,6 +861,7 @@ interface WireCostReport {
   rate_breakdown: { cpu: number; memory: number; disk: number }
   priority_multiplier: number
   unbounded_multiplier: number
+  preemptible_multiplier: number
   effective_rate_ucu_per_second: number
   charge_window_seconds: number
   charge_window_is_default: boolean
@@ -868,6 +878,7 @@ function mapCostReport(c: WireCostReport): CostReport {
     rateBreakdown: c.rate_breakdown,
     priorityMultiplier: c.priority_multiplier,
     unboundedMultiplier: c.unbounded_multiplier,
+    preemptibleMultiplier: c.preemptible_multiplier,
     effectiveRateUcuPerSecond: c.effective_rate_ucu_per_second,
     chargeWindowSeconds: c.charge_window_seconds,
     chargeWindowIsDefault: c.charge_window_is_default,
@@ -1144,6 +1155,7 @@ interface WireNodeSummary {
   labels: Record<string, string>
   schedulable: boolean
   draining?: boolean
+  preemptible_only: boolean
   health: WireNodeHealth
   epoch: number
   last_heartbeat: string | null
@@ -1160,6 +1172,7 @@ function mapNodeSummary(n: WireNodeSummary): NodeSummary {
     labels: n.labels,
     schedulable: n.schedulable,
     draining: n.draining ?? false,
+    preemptibleOnly: n.preemptible_only,
     health: snakeToPascal(n.health) as NodeHealth,
     epoch: n.epoch,
     lastHeartbeat: toDateOrNull(n.last_heartbeat),
@@ -1256,6 +1269,7 @@ interface WireQuotaEntityNode {
   penalty: number | null
   created_at: string
   updated_at: string
+  preemptible: boolean
   queued_count: number
   running_count: number
 }
@@ -1280,6 +1294,7 @@ function mapQuotaEntityNode(n: WireQuotaEntityNode): QuotaEntityNode {
     penalty: orInfinity(n.penalty),
     createdAt: toDate(n.created_at),
     updatedAt: toDate(n.updated_at),
+    preemptible: n.preemptible,
     queuedCount: n.queued_count,
     runningCount: n.running_count,
   }
@@ -1347,6 +1362,7 @@ async function configureQuotaEntity(input: ConfigureQuotaEntityInput): Promise<Q
     parent: input.parent,
     name: input.name,
     quota_ucu: input.quotaUcu,
+    ...(input.preemptible !== undefined ? { preemptible: input.preemptible } : {}),
   }
   const { logIndex } = await postJson(
     '/quota-entities',

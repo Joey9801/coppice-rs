@@ -18,6 +18,7 @@ function attempt(n: number, overrides: Partial<AttemptView> = {}): AttemptView {
     endedAt: new Date('2026-01-01T00:15:00Z'),
     rateUcuPerSecond: 1_000_000 / 3600,
     chargedUcu: 1_000_000,
+    preemptible: false,
     ...overrides,
   }
 }
@@ -30,6 +31,7 @@ function cost(overrides: Partial<CostReport> = {}): CostReport {
     rateBreakdown: { cpu: perSecond, memory: 0, disk: 0 },
     priorityMultiplier: 1,
     unboundedMultiplier: 1,
+    preemptibleMultiplier: 1,
     effectiveRateUcuPerSecond: perSecond,
     chargeWindowSeconds: 3600,
     chargeWindowIsDefault: false,
@@ -194,5 +196,24 @@ describe('JobCostCard', () => {
       />,
     )
     expect(screen.getByText('Will be charged')).toBeInTheDocument()
+  })
+
+  it('itemises the preemptible multiplier next to the others', () => {
+    render(
+      <JobCostCard
+        cost={cost({ preemptibleMultiplier: 0.5, effectiveRateUcuPerSecond: 500_000 / 3600 })}
+        requests={requests}
+        terminal={false}
+        attempts={[attempt(1, { preemptible: true })]}
+      />,
+    )
+    expect(screen.getByText('Preemptible')).toBeInTheDocument()
+    expect(screen.getByText('×0.5')).toBeInTheDocument()
+    expect(screen.getByText('Effective rate')).toBeInTheDocument()
+  })
+
+  it('omits the preemptible line when the job is not effectively preemptible', () => {
+    render(<JobCostCard cost={cost()} requests={requests} terminal={false} attempts={[]} />)
+    expect(screen.queryByText('Preemptible')).not.toBeInTheDocument()
   })
 })

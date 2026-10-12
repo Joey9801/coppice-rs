@@ -38,7 +38,10 @@ export function JobCostCard({
   terminal: boolean
   attempts: AttemptView[]
 }) {
-  const hasPenalty = cost.priorityMultiplier !== 1 || cost.unboundedMultiplier !== 1
+  const hasPenalty =
+    cost.priorityMultiplier !== 1 ||
+    cost.unboundedMultiplier !== 1 ||
+    cost.preemptibleMultiplier !== 1
   const charged = cost.chargedUcu > 0
   // Mirrors the server's retention rule (ADR 0029): the recorded refund
   // fraction applied only if the attempt ran and its end was the user's own.
@@ -131,6 +134,13 @@ function RateBreakdown({
           label="No runtime limit"
           value={formatMultiplier(cost.unboundedMultiplier)}
           warn
+        />
+      ) : null}
+      {cost.preemptibleMultiplier !== 1 ? (
+        <BuildupRow
+          label="Preemptible"
+          value={formatMultiplier(cost.preemptibleMultiplier)}
+          muted
         />
       ) : null}
       {hasPenalty ? (
