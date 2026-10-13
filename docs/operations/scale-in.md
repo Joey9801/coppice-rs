@@ -68,14 +68,63 @@ running attempt, its start plus its `max_runtime` plus the policy's
 - With no live allocation left the drain is **complete**. Admission stays
   closed until `coppice node undrain`.
 
+## Deadline drains
+
+A drain may carry a **deadline** `D` by which the node must be empty —
+containers gone and exits reported
+([ADR 0044](../decisions/0044-job-preemption-and-spot-capacity.md) §5):
+
+```text
+T_stop   = D − drain_cleanup_margin − abort_grace
+T_notice = T_stop − notice_cap
+```
+
+(`drain_cleanup_margin` and `notice_cap` are the formation policy's
+`[preemption]` knobs, 30 s and 5 m by default; `abort_grace` 30 s.)
+
+- Work finishes naturally where it can; an attempt that exits before
+  `T_notice` never hears of the drain.
+- Bounded backfill is admitted up to `T_notice` — regardless of the
+  horizon, since nothing outlives the deadline — and admission closes there.
+- At `T_notice` every attempt still running gets its job's notice signal,
+  with the common `notice_cap` window, and at `T_stop` the agent stops
+  whatever remains. Preemptible or not, each ends `Preempted { drain }` and
+  is requeued without consuming retry budget.
+- The deadline must leave at least `notice_cap + abort_grace +
+  drain_cleanup_margin` (6 m by default) from now; a shorter one is refused.
+  An operator who cannot wait drains without a deadline, stops the host,
+  and accepts `NodeLost` for what was running.
+- A deadline can be replaced, earlier or later, only before the recorded
+  deadline's `T_notice`. Attempts already notified keep their stops, so the
+  node may empty later than a replacement deadline; the node view's
+  "effectively empty by" says when. `coppice node undrain` cancels the plan:
+  a notice phase not yet begun never happens, but attempts already notified
+  still stop and still end `Preempted { drain }`. A plain `coppice node
+  drain` on a node with a deadline keeps the deadline; undrain and drain
+  again to drop it.
+- The deadline lives on the replicated drain record; the agent journals the
+  deadline it accepted and echoes it on every heartbeat, and the leader
+  re-sends it whenever the two disagree, so a disconnect, an agent restart
+  or a leader change cannot lose it. If the agent hears of it only after
+  `T_notice`, it notifies at once, still stops at `T_stop`, and reports the
+  notice it could not give as a **shortfall**, shown by `job status` and
+  the node view.
+
 ## Draining a node by hand
 
 ```sh
 coppice node drain <node-id> --wait          # drain, then wait up to 10 m
 coppice node drain <node-id> --wait 30m      # a longer deadline
 coppice node drain <node-id>                 # drain and return at once
+coppice node drain <node-id> --deadline 30m --wait   # empty within 30 minutes
+coppice node drain <node-id> --deadline 2026-10-14T02:00:00Z
 coppice node undrain <node-id>               # take it back into service
 ```
+
+`--deadline` takes an RFC 3339 instant or a duration from now (`15m`,
+`2h`). With a deadline, `--wait` and `coppice node show` also print the
+deadline, the notice time, the effective emptying time, and the largest
+notice shortfall when one was reported.
 
 `--wait` polls the node once a second and prints a line to stderr
 whenever its progress changes: the horizon ("empty by <time>", or
@@ -91,7 +140,12 @@ on the client API; they need an unscoped `operator` or `admin` binding
 
 ## What the agent does on SIGTERM
 
-`systemctl stop coppice-agent` (or any SIGTERM / SIGINT) is a drain:
+`systemctl stop coppice-agent` (or any SIGTERM / SIGINT) is a drain, and
+deliberately a **notice-free** one: it waits, it never signals or stops a
+workload. Planned scale-in that wants jobs to checkpoint runs a deadline
+drain first (`coppice node drain <id> --deadline <d> --wait`) and stops the
+agent once the node is empty; by then there is nothing left for the
+SIGTERM drain to wait for.
 
 1. The agent announces `draining` on its next report, sent immediately,
    and on every report after that. The leader replicates it, and no new
@@ -198,15 +252,24 @@ hook-free; these are the shapes the protocol is designed for, expressed
 as user-data and ASG configuration rather than product code.
 
 **Scale-in through an ASG lifecycle hook.** Put a hook on
-`autoscaling:EC2_INSTANCE_TERMINATING` with a heartbeat timeout of at
-least `shutdown_grace` plus a margin. The handler — a Lambda, or a
-systemd unit on the instance watching instance metadata's
-`autoscaling/target-lifecycle-state` — runs `systemctl stop
-coppice-agent` (which is the drain) and calls
-`complete-lifecycle-action` when the unit has stopped. Nothing needs the
-node id or an API token on the instance: the agent announces its own
-drain. An operator driving the scale-in from outside can equally run
-`coppice node drain <id> --wait` first and terminate afterwards.
+`autoscaling:EC2_INSTANCE_TERMINATING`. Two handler shapes:
+
+- *With notices (recommended where jobs checkpoint).* The handler — a
+  Lambda holding an operator credential for the client API — runs
+  `coppice node drain <id> --deadline <d> --wait`, with `<d>` inside the
+  hook's heartbeat timeout (at least `notice_cap + abort_grace +
+  drain_cleanup_margin` away), then `systemctl stop coppice-agent` on the
+  instance (an empty node's SIGTERM drain exits at once) and
+  `complete-lifecycle-action`. Running work gets its notice at `T_notice`,
+  ends `Preempted { drain }` and is requeued free; the node is empty by
+  the deadline.
+- *Without.* The handler — or a systemd unit on the instance watching
+  instance metadata's `autoscaling/target-lifecycle-state` — runs
+  `systemctl stop coppice-agent` (the notice-free drain) and calls
+  `complete-lifecycle-action` when the unit has stopped, with a heartbeat
+  timeout of at least `shutdown_grace` plus a margin. Nothing needs the
+  node id or an API token on the instance: the agent announces its own
+  drain. Work still running at `shutdown_grace` ends `NodeLost`.
 
 **Spot interruption.** The agent handles this itself
 ([ADR 0044](../decisions/0044-job-preemption-and-spot-capacity.md) §5);
@@ -215,14 +278,15 @@ no watcher unit is needed. With `[preemption] interruption_source =
 notice starts a drain plan with the reclaim time as its deadline: the node
 announces `draining` (and the deadline, shown in the node view), admits
 nothing, and every running attempt gets its job's notice signal at once,
-then the ordinary stop at `deadline − 30 s − abort_grace`. Each attempt
+then the ordinary stop at `deadline − drain_cleanup_margin − abort_grace`. Each attempt
 ends `Preempted { interruption }` and is requeued without consuming retry
 budget; `/readyz` answers `interrupted` meanwhile. None of this waits for a
 coordinator. Only work whose `Preempted` report never arrives (the
 instance vanished first) becomes `NodeLost`. Do not stop `coppice-agent`
 on the notice: the ADR 0041 SIGTERM drain sends no notices and would leave
 the reclaim to the liveness path. Size jobs' declared notice so that
-notice + `abort_grace` + 30 s fits the provider's two minutes; the agent
+notice + `abort_grace` + `drain_cleanup_margin` fits the provider's two
+minutes; the agent
 warns when one does not.
 
 **Ungraceful termination** — an instance killed without either — still

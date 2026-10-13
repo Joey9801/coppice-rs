@@ -1,5 +1,14 @@
 # 41. Graceful scale-in: drain, agent shutdown drain, node eviction, and health
 
+> **Amended by [ADR 0044](0044-job-preemption-and-spot-capacity.md) §5.**
+> The cordon (`Node.schedulable`, `SetNodeSchedulable`) is now the drain
+> record (`Node.drain`, `SetNodeDrain`), which admits bounded backfill and
+> may carry a deadline; `accepts_placements()` is now `admits(job, now)` and
+> `NodeNotSchedulable` is `NodeDraining`; `coppice node drain` gains
+> `--deadline`; the agent's SIGTERM drain is explicitly notice-free; and the
+> advisory `Drain` agent command carries the operator's deadline or its
+> withdrawal. The text below is as accepted.
+
 - **Status:** Accepted
 - **Date:** 2026-09-13
 - **Resolves:** [OD-15(b)](../roadmap/open-decisions.md#od-15-agent-enrollment-signer-and-decommission-protocol),

@@ -10,7 +10,8 @@ Coordinator-to-agent messages may include:
 - Desired assignments.
 - Start job command.
 - Stop job command.
-- Drain instruction.
+- Drain instruction: the operator's deadline drain, or its withdrawal
+  (ADR 0044 §5; see "Operator deadline drains" below).
 - Cache preparation request.
 - Cache eviction hint.
 - Health or configuration update.
@@ -155,7 +156,7 @@ filesystem seam with the storage engine's crash-safety discipline) holds:
 - `FencingUpdate { leader_term, node_epoch }` — the accepted-token
   watermark.
 - `StartIntent { allocation, attempt, job, node_epoch, max_runtime_us?,
-  notice_signal, notice_us, abort_grace_us }` —
+  notice_signal, notice_us, abort_grace_us, drain_cleanup_margin_us }` —
   journaled and fsynced **before** the container starts, so a running
   container always has durable intent behind it. `max_runtime_us` is the
   enforced bound copied from `StartJob`, journaled so the max-runtime
@@ -164,7 +165,9 @@ filesystem seam with the storage engine's crash-safety discipline) holds:
   minus the runtime the container reports (saturating at zero, which fires
   at once). No launch wall-clock is journaled; elapsed time comes from the
   runtime. The notice contract and `abort_grace_us` (from `StartJob`) let
-  the agent signal and stop the attempt on its own, below.
+  the agent signal and stop the attempt on its own, below, and
+  `drain_cleanup_margin_us` (the policy's `drain_cleanup_margin` at
+  dispatch) fixes the attempt's `T_stop` under any drain plan.
 - `AllocationTombstone { allocation, reason }` — journaled before a stop is
   acted on, so a racing or re-delivered `StartJob` is refused even across a
   restart (ADR 0013). `reason` names the command that wrote it — `Abort`
@@ -172,10 +175,12 @@ filesystem seam with the storage engine's crash-safety discipline) holds:
   and a refused `StartJob` resolves as that command: `Aborted` or
   `Preempted { reason }`.
 - `NoticeIntent { allocation, reason }`, `NoticeMark { allocation,
-  stop_at_us, shortfall_us, notified_at_us }`, `DrainPlan { deadline_us,
-  reason, accepted_target_us? }` and `DrainPlanRetired` — the termination
-  mechanism's records, below. The latest mark per allocation and the latest
-  plan are in force; compaction keeps only those, and drops a retired plan.
+  stop_at_us, shortfall_us, notified_at_us }` and `DrainPlan
+  { operator_deadline_us?, notice_window_us, interruption_deadline_us? }` —
+  the termination mechanism's records, below. `DrainPlan` is the node's
+  whole plan: the latest record is in force, and one with neither component
+  is "no plan". Compaction keeps the latest mark per allocation and the
+  latest plan, and drops an empty plan.
 - `ObservedExit { allocation, attempt, job, outcome, runtime_us }` — the
   classified exit, journaled before it is reported, so an outcome observed
   while the coordinator was unreachable survives to the next ObservedSet.
@@ -198,16 +203,24 @@ notice. The command carries no grace: the stop path runs with the
 `abort_grace_us` journaled from the attempt's `StartJob`, like every other
 platform stop.
 
-Otherwise the agent terminates attempts without a coordinator command. Only
-an **external interruption** starts that (a spot reclaim, read from the configured `[preemption]
-interruption_source`): it becomes the node's **drain plan** with the
-provider's reclaim time as its deadline `D`, journaled before anything else.
-From then on every `Register` and `Heartbeat` carries `draining = true` and
-`interruption_deadline_us = D` (agent wall-clock, display-only — the
-coordinator stores it on the node record for the node view and plans
-against nothing but marks), and every attempt still running is notified at
-once. For each, with `T_stop = D − 30 s − abort_grace` (the attempt's own
-`abort_grace_us`, dispatched on `StartJob`):
+Otherwise the agent terminates attempts on the platform's behalf without a
+per-attempt coordinator command. Two sources feed the node's **drain plan**,
+each a component of the one journaled `DrainPlan` record, journaled before
+anything acts on it:
+
+- an **external interruption** (a spot reclaim, read from the configured
+  `[preemption] interruption_source`), with the provider's reclaim time as
+  its deadline `D`. From then on every `Register` and `Heartbeat` carries
+  `draining = true` and `interruption_deadline_us = D` (agent wall-clock,
+  display-only — the coordinator stores it on the node record for the node
+  view and plans against nothing but marks), and every attempt still
+  running is notified at once;
+- the operator's **deadline drain**, from the coordinator's `Drain`
+  command (below), notified at `T_notice = T_stop − notice_window`.
+
+For each attempt, with `T_stop = D − drain_cleanup_margin − abort_grace`
+(the attempt's own `drain_cleanup_margin_us` and `abort_grace_us`,
+dispatched on `StartJob`), when its notice is due under the plan:
 
 1. journal `NoticeIntent { allocation, reason }`, fsynced;
 2. deliver the job's declared notice signal to PID 1;
@@ -223,12 +236,68 @@ once. For each, with `T_stop = D − 30 s − abort_grace` (the attempt's own
    so a node-wide stop over many containers never delays heartbeats or
    commands. The result is classified and reported as usual.
 
-A second notice may only make `D` earlier: the plan is replaced and every
-mark later than its new `T_stop` gets a replacement mark, journaled before
-it is re-reported, so a restart can never restore a stop later than one the
-coordinator has published. A `StartJob` that arrives under an active plan is
-still started — its committed intent predates the announcement — and is
-notified at once (its stop fires immediately if `T_stop` has passed).
+With both components active an attempt not yet notified is notified at
+once with reason `Interruption` and the provider's `T_stop` — unless the
+operator's notice time has already passed (both landing in one tick, or on
+recovery), when its stop is the earlier of the two.
+Once notified, an attempt has exactly one stop, and only an interruption
+may move it — earlier, never later (ADR 0044 §3's precedence table): a
+second interruption notice may only make its `D` earlier, and every mark
+later than the interruption's `T_stop` gets a replacement mark, journaled
+before it is re-reported, so a restart can never restore a stop later than
+one the coordinator has published. A `StartJob` that arrives under an
+interruption is still started — its committed intent predates the
+announcement — and is notified at once.
+
+**Starts in flight.** A container still starting at its plan `T_stop` never
+starts: every start carries a launch bound, the earlier of its own
+`latest_start_us` and its `T_stop` under the plan in force, and the agent
+recomputes the bound of every start in flight whenever the plan changes. A
+start in flight has been given no notice, so the bound may loosen as well
+as tighten: a withdrawal, or a replacement with a later deadline, hands it
+back, exactly as §3 treats any attempt not yet notified. The executor gives
+up on the image pull once the bound passes — re-reading it, and its wait,
+whenever it changes — and checks it again just before the container
+starts. A refusal at the plan's bound journals a
+`Preempt { reason }` tombstone and reports `Preempted { reason }`, runtime
+0 (a free retry); one at the backfill's own `latest_start_us` is still
+`Revoked`.
+
+### Operator deadline drains (ADR 0044 §5)
+
+The replicated `Node.drain` record is the source of intent; a regular drain
+(no deadline) concerns placement only and sends the agent nothing.
+
+- **`Drain { deadline_us?, notice_window_us }`.** `deadline_us` is the
+  operator's deadline `D`; absent is the **withdrawal**. `notice_window_us`
+  is the policy's `preemption_notice_cap`, the common window. A deadline
+  equal to the one the agent holds is a no-op (no journal write); anything
+  else journals the new plan, fsynced, then notifies whatever is already
+  due — so a command reaching the agent after `T_notice` notifies at once,
+  stops at `T_stop`, and reports the lost notice as shortfall. A
+  replacement is a withdrawal followed by a new plan: attempts already
+  notified keep their stops, the rest follow the new deadline. A
+  withdrawal never retracts an issued notice: a notified attempt still
+  stops at its stop and resolves `Preempted { Drain }`.
+- **The echo.** Every `Heartbeat` carries `drain_target_us`, the operator
+  deadline the agent last accepted (absent with none). An operator plan
+  alone does **not** set `draining` — admission is the drain record's to
+  close, at `T_notice`.
+- **Reconciliation.** On every current-epoch heartbeat the leader compares
+  the record's deadline with the echo (`drain_command_for` in
+  `tasks/dispatch.rs`) and, on a mismatch, routes `Drain` with the record's
+  deadline — or the withdrawal when the record has none — straight to the
+  node, never through the log. A command lost to a disconnect or a
+  leadership change is re-sent by the next leader to see the mismatch; a
+  restarted agent recovers its target from the journal, so a matching echo
+  sends nothing.
+- **Admission at the door.** Under an operator plan, a `StartJob` arriving
+  at or after its own `T_notice` (its dispatched grace and margin) is
+  refused: the agent journals a `Preempt { Drain }` tombstone and reports
+  the attempt terminal `Preempted { Drain }`, runtime 0 — a free retry. A
+  passed `latest_start_us` answers `Revoked` first. A start already in
+  flight at `T_notice` is notified once it has a container and stopped at
+  `T_stop`; one still starting at `T_stop` never launches (above).
 
 **Classification** is the agent's: a kill by its stop path is
 `Preempted { reason }` whether or not the signal landed; a non-zero exit the
@@ -262,17 +331,20 @@ running allocation with a mark in force carries it in its
 (remaining recomputed), and terminal outcomes come from the journal.
 
 **Recovery.** On start the agent resumes every mark's stop time (at once if
-past). A notice intent with no mark is signalled again: under an active plan
-its stop is the plan's `T_stop` and the shortfall is reported; with no plan
-it gets a fresh countdown of its declared notice. Under an active plan every
-mark later than the plan's `T_stop` is shortened, so a crash between an
-earlier replacement plan and its replacement marks cannot leave a later
-stop in force. A plan whose `D` has
-already passed came back from the dead (an EC2 `stop`, or a reclaim that
-never landed): whatever still runs under it is stopped at once and the plan
-is retired (`DrainPlanRetired`) so the node does not drain forever. A notice
-whose deadline has already passed while no plan is active is ignored as
-stale. The ADR 0041 SIGTERM drain is unchanged and notice-free.
+past) and notifies whatever the recovered plan says is due. A notice intent
+with no mark is signalled again: under an active plan its stop is the
+plan's `T_stop` and the shortfall is reported; with no plan it gets a fresh
+countdown of its declared notice. Under an interruption every mark later
+than its `T_stop` is shortened, so a crash between an earlier interruption
+and its replacement marks cannot leave a later stop in force. An
+interruption whose `D` has already passed came back from the dead (an EC2
+`stop`, or a reclaim that never landed): whatever still runs under it is
+stopped at once and the interruption component is retired (the plan is
+re-journaled without it) so the node does not drain forever. The operator
+component is never retired by recovery — only a withdrawal ends it. An
+interruption notice whose deadline has already passed while none is active
+is ignored as stale. The ADR 0041 SIGTERM drain is unchanged and
+notice-free.
 
 ### Restart reconciliation sequence
 
