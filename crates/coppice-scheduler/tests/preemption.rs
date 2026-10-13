@@ -549,3 +549,119 @@ fn no_preemption_is_proposed_past_the_accrual_cap() {
     assert_eq!(placement_of(&proposal, 10).preemptions, vec![alid(1)]);
     commit(&mut sm, &proposal);
 }
+
+// ---- relocation (ADR 0044 §4) ----
+
+fn relocation_reason(sm: &StateMachine, attempt_n: u128) -> Option<coppice_core::id::JobId> {
+    sm.attempts[&aid(attempt_n)]
+        .preemption
+        .and_then(|p| match p.reason {
+            PreemptReason::Relocation { for_job } => Some(for_job),
+            _ => None,
+        })
+}
+
+/// A persistent node (`nid(1)`, 4 cores) full of two 2-core preemptible
+/// jobs of a *higher* class than the beneficiary, a spot node (`nid(2)`) of
+/// `spot_millis`, and a 4-core non-preemptible beneficiary that only the
+/// persistent node can take.
+fn relocation_world(spot_millis: u64) -> StateMachine {
+    let mut sm = setup(cpu(4_000), 4);
+    apply_ok(
+        &mut sm,
+        register_node_cmd_with(nid(2), cpu(spot_millis), base_ts(), true),
+    );
+    submit_full(&mut sm, 1, cpu(2_000), 9, true, 1, None);
+    submit_full(&mut sm, 2, cpu(2_000), 9, true, 1, None);
+    run_on(&mut sm, 1, nid(1), base_ts());
+    run_on(&mut sm, 2, nid(1), base_ts());
+    beneficiary(&mut sm, 10, cpu(4_000));
+    sm
+}
+
+/// ADR 0044 §4 relocation: preemptible work holding persistent capacity is
+/// moved off it for a non-preemptible job, regardless of class and score,
+/// when spot capacity is free for it.
+#[test]
+fn relocation_moves_preemptible_work_off_a_persistent_node() {
+    let mut sm = relocation_world(4_000);
+    let proposal = schedule(&sm);
+    let p = placement_of(&proposal, 10);
+    assert_eq!(p.node, nid(1));
+    assert_eq!(p.preemptions, vec![alid(1), alid(2)]);
+    commit(&mut sm, &proposal);
+    assert_eq!(relocation_reason(&sm, 1), Some(jid(10)));
+    assert_eq!(relocation_reason(&sm, 2), Some(jid(10)));
+}
+
+/// The spot capacity is a precondition counted once per pass: room for one
+/// victim is not room for two, so the group that would need both is not
+/// proposed.
+#[test]
+fn relocation_needs_spot_room_for_every_victim() {
+    let mut sm = relocation_world(3_000);
+    let proposal = schedule(&sm);
+    assert!(preempting(&proposal).is_empty(), "{proposal:?}");
+    commit(&mut sm, &proposal);
+}
+
+/// Without any spot node there is nowhere to relocate to.
+#[test]
+fn no_relocation_without_a_spot_node() {
+    let mut sm = setup(cpu(4_000), 4);
+    submit_full(&mut sm, 1, cpu(4_000), 9, true, 1, None);
+    run_on(&mut sm, 1, nid(1), base_ts());
+    beneficiary(&mut sm, 10, cpu(4_000));
+    let proposal = schedule(&sm);
+    assert!(preempting(&proposal).is_empty(), "{proposal:?}");
+    commit(&mut sm, &proposal);
+}
+
+/// Relocation counts against the per-cycle cap like any preemption.
+#[test]
+fn relocation_counts_against_the_per_cycle_cap() {
+    let sm = relocation_world(4_000);
+    let cfg = SchedulerConfig {
+        max_preempting_placements_per_cycle: 0,
+        ..SchedulerConfig::default()
+    };
+    let proposal = schedule_with(&sm, cfg, ts(TS_US + 1));
+    assert!(preempting(&proposal).is_empty(), "{proposal:?}");
+}
+
+/// Relocated victims never share a spot slot, even those apply records
+/// `Priority` (class rule holds, score rule does not), whose spot room apply
+/// does not count: two 2-core victims need 4 free spot cores, not 2.
+#[test]
+fn outranked_relocations_do_not_share_a_spot_slot() {
+    let build = |spot_millis: u64| {
+        let mut sm = setup(cpu(4_000), 4);
+        apply_ok(
+            &mut sm,
+            register_node_cmd_with(nid(2), cpu(spot_millis), base_ts(), true),
+        );
+        // Lower class than the beneficiary, but a far higher score.
+        submit_full(&mut sm, 1, cpu(2_000), 0, true, 10, None);
+        submit_full(&mut sm, 2, cpu(2_000), 0, true, 10, None);
+        run_on(&mut sm, 1, nid(1), base_ts());
+        run_on(&mut sm, 2, nid(1), base_ts());
+        beneficiary(&mut sm, 10, cpu(4_000));
+        sm
+    };
+
+    let mut sm = build(2_000);
+    let proposal = schedule(&sm);
+    assert!(preempting(&proposal).is_empty(), "{proposal:?}");
+    commit(&mut sm, &proposal);
+
+    let mut sm = build(4_000);
+    let proposal = schedule(&sm);
+    assert_eq!(
+        placement_of(&proposal, 10).preemptions,
+        vec![alid(1), alid(2)]
+    );
+    commit(&mut sm, &proposal);
+    // The class rule covers both, so apply records them `Priority`.
+    assert_eq!(priority_record(&sm, 1), Some(jid(10)));
+    assert_eq!(priority_record(&sm, 2), Some(jid(10)));
+}

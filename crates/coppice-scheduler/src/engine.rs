@@ -257,6 +257,10 @@ struct Pass<'a> {
     preempting_left: usize,
     /// `SchedulerConfig::preemption_cooldown`.
     cooldown: Duration,
+    /// Spot capacity this pass's relocations already count on, per
+    /// `preemptible_only` node: apply's first-fit tally, replayed, and the
+    /// pass's own stricter one.
+    spot: preempt::SpotTally,
     /// `SchedulerConfig::preemption_min_improvement`.
     preempt_min_improvement: Duration,
     /// Each quota entity's ADR 0005 penalty product at `now`, computed once
@@ -379,6 +383,7 @@ impl<'a> Pass<'a> {
             evicted_nodes: BTreeSet::new(),
             preempting_left: config.max_preempting_placements_per_cycle,
             cooldown: config.preemption_cooldown,
+            spot: preempt::SpotTally::default(),
             preempt_min_improvement: config.preemption_min_improvement,
             penalties,
         }

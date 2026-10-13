@@ -444,3 +444,119 @@ fn a_beneficiary_already_accruing_may_be_reseated_with_an_eviction_group() {
         JobState::Attempting(aid(BENEFICIARY))
     );
 }
+
+// ---- relocation (ADR 0044 §4) ----
+
+fn register_spot(sm: &mut StateMachine, node: NodeId, millis: u64) {
+    apply_ok(
+        sm,
+        Command::RegisterNode(coppice_state::command::RegisterNode {
+            node,
+            capacity: cpu(millis),
+            labels: Default::default(),
+            registered_at: base_ts(),
+            service_addr: None,
+            host_facts: None,
+            detected_capacity: None,
+            draining: false,
+            preemptible_only: true,
+            interruption_deadline: None,
+        }),
+    );
+}
+
+/// Node 1 (persistent, 10 cores) full of preemptible work of a *higher*
+/// class than the beneficiary — 6 cores (`jid(1)`) and 4 (`jid(2)`) — and a
+/// non-preemptible beneficiary that needs 8.
+fn outranking_victims() -> StateMachine {
+    let mut sm = setup();
+    submit(&mut sm, jid(1), 6_000, 9, true);
+    submit(&mut sm, jid(2), 4_000, 9, true);
+    run(&mut sm, 1, nid(1), 6_000);
+    run(&mut sm, 2, nid(1), 4_000);
+    submit(&mut sm, jid(BENEFICIARY), 8_000, 5, false);
+    sm
+}
+
+#[test]
+fn relocation_evicts_outranking_preemptible_work_when_spot_capacity_is_free() {
+    let mut sm = outranking_victims();
+    register_spot(&mut sm, nid(2), 10_000);
+    let applied = apply_ok(&mut sm, place_cmd(preempting(&[1, 2]), secs(10)));
+    let reason = PreemptReason::Relocation {
+        for_job: jid(BENEFICIARY),
+    };
+    for n in [1, 2] {
+        assert_eq!(
+            sm.attempts[&aid(n)].preemption.map(|p| p.reason),
+            Some(reason)
+        );
+    }
+    assert_eq!(
+        applied
+            .events
+            .iter()
+            .filter(|e| matches!(e, Event::PreemptRequested { reason: r, .. } if *r == reason))
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn relocation_needs_free_spot_capacity_for_every_victim() {
+    // Room on the spot node for the 6-core victim, not for both: the first
+    // victim counts on it, the second finds it taken.
+    let mut sm = outranking_victims();
+    register_spot(&mut sm, nid(2), 8_000);
+    let err = commit(&mut sm, preempting(&[1, 2])).unwrap_err();
+    assert_eq!(refusal(err), (alid(2), PreemptionRefusal::NotOutranked));
+
+    // No spot node at all.
+    let mut sm = outranking_victims();
+    let err = commit(&mut sm, preempting(&[1, 2])).unwrap_err();
+    assert_eq!(refusal(err), (alid(1), PreemptionRefusal::NotOutranked));
+
+    // A draining spot node is not capacity.
+    let mut sm = outranking_victims();
+    register_spot(&mut sm, nid(2), 10_000);
+    apply_ok(&mut sm, set_draining_cmd(nid(2), true));
+    let err = commit(&mut sm, preempting(&[1, 2])).unwrap_err();
+    assert_eq!(refusal(err), (alid(1), PreemptionRefusal::NotOutranked));
+}
+
+#[test]
+fn relocation_is_only_for_a_beneficiary_that_cannot_go_to_spot_capacity() {
+    let mut sm = setup();
+    submit(&mut sm, jid(1), 6_000, 9, true);
+    submit(&mut sm, jid(2), 4_000, 9, true);
+    run(&mut sm, 1, nid(1), 6_000);
+    run(&mut sm, 2, nid(1), 4_000);
+    // Preemptible itself: it should go to the spot node, not evict.
+    submit(&mut sm, jid(BENEFICIARY), 8_000, 5, true);
+    register_spot(&mut sm, nid(2), 20_000);
+    let err = commit(&mut sm, preempting(&[1, 2])).unwrap_err();
+    assert_eq!(refusal(err), (alid(1), PreemptionRefusal::NotOutranked));
+}
+
+#[test]
+fn a_mixed_group_records_each_victims_own_reason() {
+    // `jid(1)` is outranked (class 0), `jid(2)` is not (class 9) and is
+    // relocated.
+    let mut sm = setup();
+    submit(&mut sm, jid(1), 6_000, 0, true);
+    submit(&mut sm, jid(2), 4_000, 9, true);
+    run(&mut sm, 1, nid(1), 6_000);
+    run(&mut sm, 2, nid(1), 4_000);
+    submit(&mut sm, jid(BENEFICIARY), 8_000, 5, false);
+    register_spot(&mut sm, nid(2), 4_000);
+    apply_ok(&mut sm, place_cmd(preempting(&[1, 2]), secs(10)));
+    let for_job = jid(BENEFICIARY);
+    assert_eq!(
+        sm.attempts[&aid(1)].preemption.map(|p| p.reason),
+        Some(PreemptReason::Priority { for_job })
+    );
+    assert_eq!(
+        sm.attempts[&aid(2)].preemption.map(|p| p.reason),
+        Some(PreemptReason::Relocation { for_job })
+    );
+}
