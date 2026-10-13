@@ -328,6 +328,14 @@ describe('MockWorld construction', () => {
     }
     expect(preempted.some((a) => (a.preemption?.noticeShortfallSeconds ?? 0) > 0)).toBe(true)
 
+    // ADR 0044 §7: one deadline-drained node, with a notice shortfall.
+    const deadlineDrained = world.buildNodeSummaries().filter((n) => n.drain?.deadline != null)
+    expect(deadlineDrained).toHaveLength(1)
+    const dd = deadlineDrained[0]!.drain!
+    expect(dd.noticeAt!.getTime()).toBeLessThan(dd.deadline!.getTime())
+    expect(dd.emptyBy!.getTime()).toBeGreaterThanOrEqual(dd.deadline!.getTime())
+    expect(dd.maxNoticeShortfallSeconds).toBeGreaterThan(0)
+
     const interrupted = world.buildNodeSummaries().filter((n) => n.interruptionDeadline != null)
     expect(interrupted).toHaveLength(1)
     const node = interrupted[0]!

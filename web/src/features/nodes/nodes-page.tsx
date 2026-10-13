@@ -2,7 +2,13 @@ import { useNavigate } from '@tanstack/react-router'
 import { Boxes } from 'lucide-react'
 import type { NodeSummary } from '@/api/types'
 import { useNodes } from '@/api/queries'
-import { formatNodeCapacity, formatPercent, formatTimestamp, resourceFractions } from '@/lib/format'
+import {
+  formatDuration,
+  formatNodeCapacity,
+  formatPercent,
+  formatTimestamp,
+  resourceFractions,
+} from '@/lib/format'
 import { cn } from '@/lib/utils'
 import { EmptyState, IdLink, PageHeader, StatePill, TimeAgo } from '@/components'
 import { Badge } from '@/components/ui/badge'
@@ -108,7 +114,13 @@ function StatusCell({ node }: { node: NodeSummary }) {
         <span
           className="text-xs text-muted-foreground"
           title={`Drain requested ${formatTimestamp(node.drain.requestedAt)}${
-            node.drain.horizon ? `; empty by ${formatTimestamp(node.drain.horizon)}` : ''
+            node.drain.deadline ? `; deadline ${formatTimestamp(node.drain.deadline)}` : ''
+          }${node.drain.noticeAt ? `; notices at ${formatTimestamp(node.drain.noticeAt)}` : ''}${
+            node.drain.emptyBy ? `; empty by ${formatTimestamp(node.drain.emptyBy)}` : ''
+          }${
+            node.drain.maxNoticeShortfallSeconds
+              ? `; notice short by up to ${formatDuration(node.drain.maxNoticeShortfallSeconds)}`
+              : ''
           }`}
         >
           {drainStatus(node.drain)}

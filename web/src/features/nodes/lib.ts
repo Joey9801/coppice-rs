@@ -31,13 +31,15 @@ export function nodeCapacityHistory(utilization: NodeUtilization): CapacityHisto
 }
 
 /**
- * Compact status of an operator drain (ADR 0044 §5): `complete` (the node
- * holds no live work), `empty in 2h` style bounded horizon (only backfill that
- * finishes by it is admitted), or `unbounded` (some live work has no enforced
- * bound, nothing new is admitted).
+ * Compact status of an operator drain (ADR 0044 §5, §7): `complete` (the node
+ * holds no live work), `empty in 2h` style bounded emptying time (a regular
+ * drain's horizon, or a deadline drain's effective time), or `unbounded`
+ * (some live work has no enforced bound, nothing new is admitted). A deadline
+ * drain is prefixed `deadline` so it reads differently from a regular one.
  */
 export function drainStatus(drain: NodeDrain, now: Date = new Date()): string {
   if (drain.complete) return 'complete'
-  if (drain.horizon === null) return 'unbounded'
-  return `empty ${formatTimeUntil(drain.horizon, now)}`
+  const prefix = drain.deadline === null ? '' : 'deadline: '
+  if (drain.emptyBy === null) return `${prefix}unbounded`
+  return `${prefix}empty ${formatTimeUntil(drain.emptyBy, now)}`
 }

@@ -116,6 +116,14 @@ const FIRST_SNAPSHOT_ENTRIES = 150
 /** Simulation µs → the `Date` a view type carries. */
 const at = (us: number): Date => new Date(us / 1000)
 
+/** The deadline-drain fields of a regular (horizon-only) drain. */
+const REGULAR_DRAIN = {
+  deadline: null,
+  noticeAt: null,
+  emptyBy: null,
+  maxNoticeShortfallSeconds: null,
+} as const
+
 /** A simulation µs span → the whole seconds a view type carries. */
 const secondsOf = (us: number): number => Math.trunc(us / SECOND_US)
 
@@ -864,19 +872,44 @@ export class MockWorld {
       const diskTiB = this.rng.range(0.5, 8)
       // Operator drains: i=3 bounded by a horizon (admits backfill only), i=8
       // unbounded (live work with no enforced bound), i=14 complete (empty).
-      // i=11 is the agent's own shutdown announcement; i=14 has both.
+      // i=1 is a deadline drain with a notice shortfall. i=11 is the agent's own
+      // shutdown announcement; i=14 has both.
       const drain: NodeDrain | null =
         i === 3
           ? {
               requestedAt: at(this.nowUs - 20 * MINUTE_US),
               horizon: at(this.nowUs + 2 * HOUR_US),
               complete: false,
+              ...REGULAR_DRAIN,
+              emptyBy: at(this.nowUs + 2 * HOUR_US),
             }
           : i === 8
-            ? { requestedAt: at(this.nowUs - HOUR_US), horizon: null, complete: false }
+            ? {
+                requestedAt: at(this.nowUs - HOUR_US),
+                horizon: null,
+                complete: false,
+                ...REGULAR_DRAIN,
+              }
             : i === 14
-              ? { requestedAt: at(this.nowUs - 3 * HOUR_US), horizon: null, complete: true }
-              : null
+              ? {
+                  requestedAt: at(this.nowUs - 3 * HOUR_US),
+                  horizon: null,
+                  complete: true,
+                  ...REGULAR_DRAIN,
+                }
+              : i === 1
+                ? // Deadline drain (ADR 0044 §7): D in 30m, notices at D - 10m; a
+                  // live attempt declared more notice than is left, hence a shortfall.
+                  {
+                    requestedAt: at(this.nowUs - 5 * MINUTE_US),
+                    horizon: at(this.nowUs + 6 * HOUR_US),
+                    complete: false,
+                    deadline: at(this.nowUs + 30 * MINUTE_US),
+                    noticeAt: at(this.nowUs + 20 * MINUTE_US),
+                    emptyBy: at(this.nowUs + 30 * MINUTE_US),
+                    maxNoticeShortfallSeconds: 180,
+                  }
+                : null
       const agentDraining = i === 11 || i === 14
       const lost = i === 7 // one node Lost (stale heartbeat)
       const noSampler = i === 10 // one node with no usage sampler wired up

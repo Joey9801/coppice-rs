@@ -772,6 +772,28 @@ export interface NodeDrain {
   requestedAt: Date
   horizon: Date | null
   complete: boolean
+  /**
+   * A deadline drain (ADR 0044 §7): the operator's deadline D. `null` is a
+   * regular drain, which waits for the horizon.
+   */
+  deadline: Date | null
+  /**
+   * Deadline drains: when preemption notices go out (T_notice), which is also
+   * the backfill cutoff. `null` for a regular drain.
+   */
+  noticeAt: Date | null
+  /**
+   * The effective emptying time: the horizon for a regular drain,
+   * `max(deadline, outstanding notices' ends)` for a deadline drain. `null`
+   * when unbounded or complete.
+   */
+  emptyBy: Date | null
+  /**
+   * The largest notice shortfall (seconds) among the node's live attempts
+   * being preempted — how much less notice than they declared they get.
+   * `null` when none is short.
+   */
+  maxNoticeShortfallSeconds: number | null
 }
 
 export interface NodeSummary {
