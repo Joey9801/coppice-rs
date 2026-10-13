@@ -22,6 +22,7 @@ use crate::follow::{FollowOptions, LogFollower};
 use crate::id::{JobId, NodeId};
 use crate::pagination::{JobPager, LogPager, TimelinePager, UsagePager};
 use crate::paths;
+use crate::time::Timestamp;
 use crate::types::{
     AbortJobRequest, AbortJobResponse, ConfigureQuotaEntityRequest, ConfigureQuotaEntityResponse,
     DrainNodeResponse, GetAuthConfigResponse, GetAuthorizationResponse, GetClusterOverviewResponse,
@@ -971,8 +972,23 @@ impl Client {
 
     /// `POST /api/v1/nodes/{node}/drain` — drain a node. Only bounded
     /// backfill is admitted from then on; running work continues.
-    pub async fn drain_node(&self, node: NodeId) -> Result<DrainNodeResponse> {
-        self.post_empty(&paths::node_drain(node)).await
+    ///
+    /// With a `deadline` the drain is a deadline drain (ADR 0044 §5): running
+    /// work is given notice and stopped so the node is empty by then. `None`
+    /// sends no body, a regular drain.
+    pub async fn drain_node(
+        &self,
+        node: NodeId,
+        deadline: Option<Timestamp>,
+    ) -> Result<DrainNodeResponse> {
+        let path = paths::node_drain(node);
+        match deadline {
+            Some(deadline) => {
+                self.post_json(&path, &serde_json::json!({ "deadline": deadline }))
+                    .await
+            }
+            None => self.post_empty(&path).await,
+        }
     }
 
     /// `POST /api/v1/nodes/{node}/undrain` — clear the operator's drain.

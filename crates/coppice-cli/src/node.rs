@@ -84,10 +84,18 @@ pub enum NodeVerb {
         json: bool,
     },
     /// Drain a node: running work continues, and only bounded backfill
-    /// guaranteed gone by the node's horizon is admitted.
+    /// guaranteed gone by the node's horizon is admitted. With `--deadline`,
+    /// running preemptible work is given notice and stopped so the node is
+    /// empty by then (ADR 0044 §5).
     Drain {
         /// Node id (`node-<uuid>`).
         node: NodeId,
+        /// Make this a deadline drain: the node is to be empty by this
+        /// instant. An RFC 3339 timestamp (`2030-01-02T03:04:05Z`) or a
+        /// duration from now (`15m`, `2h`), resolved against this machine's
+        /// clock. The coordinator rejects a deadline too close to now.
+        #[arg(long, value_parser = parse_drain_deadline)]
+        deadline: Option<DrainDeadline>,
         /// Poll the node until the drain is complete (no live work left on
         /// it), printing its horizon — the time by which it will be empty, or
         /// "unbounded" — as it changes, or until the duration elapses. Bare
@@ -140,6 +148,43 @@ fn parse_wait(raw: &str) -> Result<Duration, String> {
     humantime_serde::re::humantime::parse_duration(raw).map_err(|e| e.to_string())
 }
 
+/// A `--deadline` value: an absolute instant, or a span from now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrainDeadline {
+    At(Timestamp),
+    In(Duration),
+}
+
+impl DrainDeadline {
+    /// The instant this names, given the current time.
+    fn resolve(self, now: Timestamp) -> Result<Timestamp> {
+        match self {
+            DrainDeadline::At(at) => Ok(at),
+            DrainDeadline::In(span) => {
+                let micros = i64::try_from(span.as_micros())
+                    .ok()
+                    .and_then(|us| now.as_micros().checked_add(us))
+                    .and_then(Timestamp::from_micros);
+                micros.ok_or_else(|| anyhow!("--deadline {span:?} from now is out of range"))
+            }
+        }
+    }
+}
+
+/// Parse `--deadline`: an RFC 3339 instant if it parses as one, else a
+/// humantime duration (`15m`).
+fn parse_drain_deadline(raw: &str) -> Result<DrainDeadline, String> {
+    if let Ok(at) = raw.parse::<Timestamp>() {
+        return Ok(DrainDeadline::At(at));
+    }
+    match humantime_serde::re::humantime::parse_duration(raw) {
+        Ok(span) => Ok(DrainDeadline::In(span)),
+        Err(e) => Err(format!(
+            "expected an RFC 3339 timestamp or a duration like `15m`: {e}"
+        )),
+    }
+}
+
 /// Run the selected `coppice node` verb, routing to the transport it needs.
 pub async fn run(args: NodeArgs) -> Result<()> {
     match args.verb {
@@ -151,9 +196,15 @@ pub async fn run(args: NodeArgs) -> Result<()> {
             let client = args.connection.client()?;
             show(&client, node, json).await
         }
-        NodeVerb::Drain { node, wait, json } => {
+        NodeVerb::Drain {
+            node,
+            deadline,
+            wait,
+            json,
+        } => {
             let client = args.connection.client()?;
-            drain(&client, node, wait, json).await
+            let deadline = deadline.map(|d| d.resolve(Timestamp::now())).transpose()?;
+            drain(&client, node, deadline, wait, json).await
         }
         NodeVerb::Undrain { node, json } => {
             let client = args.connection.client()?;
@@ -270,15 +321,29 @@ async fn show(client: &Client, node: NodeId, json: bool) -> Result<()> {
 ///
 /// With `--wait`, polls `GET /nodes/{node}` once a second until the drain's
 /// derived status reads complete, or the wait duration elapses.
-async fn drain(client: &Client, node: NodeId, wait: Option<Duration>, json: bool) -> Result<()> {
+async fn drain(
+    client: &Client,
+    node: NodeId,
+    deadline: Option<Timestamp>,
+    wait: Option<Duration>,
+    json: bool,
+) -> Result<()> {
     let path = paths::node_drain(node);
+    let body = match deadline {
+        Some(deadline) => serde_json::json!({ "deadline": deadline }),
+        None => serde_json::json!({}),
+    };
     post_node_action(
         client,
         &path,
         "requesting drain",
         json,
-        || client.drain_node(node),
-        || format!("node {node} draining"),
+        &body,
+        || client.drain_node(node, deadline),
+        || match deadline {
+            Some(deadline) => format!("node {node} draining, deadline {deadline}"),
+            None => format!("node {node} draining"),
+        },
     )
     .await?;
     if let Some(deadline) = wait {
@@ -295,6 +360,7 @@ async fn undrain(client: &Client, node: NodeId, json: bool) -> Result<()> {
         &path,
         "requesting undrain",
         json,
+        &serde_json::json!({}),
         || client.undrain_node(node),
         || format!("node {node} undrained"),
     )
@@ -309,6 +375,7 @@ async fn remove(client: &Client, node: NodeId, json: bool) -> Result<()> {
         &path,
         "requesting removal",
         json,
+        &serde_json::json!({}),
         || client.remove_node(node),
         || format!("node {node} removed"),
     )
@@ -329,6 +396,7 @@ async fn post_node_action<T, F>(
     path: &str,
     sending: &'static str,
     json: bool,
+    json_body: &serde_json::Value,
     typed_call: impl FnOnce() -> F,
     confirmation: impl FnOnce() -> String,
 ) -> Result<()>
@@ -337,7 +405,7 @@ where
 {
     if json {
         let body = client
-            .post_value(path, &serde_json::json!({}))
+            .post_value(path, json_body)
             .await
             .api_ctx(ctx(sending, "reading response"))?;
         print_json(&body);
@@ -403,6 +471,12 @@ struct DrainProgress {
     recorded: bool,
     /// The node's horizon; `None` while unbounded (or not recorded).
     horizon: Option<Timestamp>,
+    /// A deadline drain's deadline, notice time, and effective emptying
+    /// time, and the worst notice shortfall so far.
+    deadline: Option<Timestamp>,
+    notice_at: Option<Timestamp>,
+    empty_by: Option<Timestamp>,
+    shortfall_seconds: Option<u64>,
     complete: bool,
     running: u32,
     accruing: u32,
@@ -415,10 +489,23 @@ impl DrainProgress {
             (true, Some(at)) => format!("empty by {at}"),
             (true, None) => "horizon unbounded".to_string(),
         };
-        format!(
+        let mut line = format!(
             "{horizon}, running {}, accruing {}",
             self.running, self.accruing
-        )
+        );
+        if let Some(deadline) = self.deadline {
+            line.push_str(&format!(", deadline {deadline}"));
+            if let Some(at) = self.notice_at {
+                line.push_str(&format!(", notice at {at}"));
+            }
+            if let Some(at) = self.empty_by {
+                line.push_str(&format!(", effectively empty by {at}"));
+            }
+            if let Some(seconds) = self.shortfall_seconds {
+                line.push_str(&format!(", notice shortfall {seconds}s"));
+            }
+        }
+        line
     }
 }
 
@@ -428,6 +515,10 @@ fn drain_progress(summary: &NodeSummary) -> DrainProgress {
     DrainProgress {
         recorded: drain.is_some(),
         horizon: drain.and_then(|d| d.horizon),
+        deadline: drain.and_then(|d| d.deadline),
+        notice_at: drain.and_then(|d| d.notice_at),
+        empty_by: drain.and_then(|d| d.empty_by),
+        shortfall_seconds: drain.and_then(|d| d.max_notice_shortfall_seconds),
         complete: drain.is_some_and(|d| d.complete),
         running: summary.running_count,
         accruing: summary.accruing_count,
@@ -445,7 +536,20 @@ fn drain_detail(drain: &NodeDrain) -> String {
             None => "unbounded (live work with no runtime bound)".to_string(),
         }
     };
-    format!("requested {}, {status}", drain.requested_at)
+    let mut out = format!("requested {}, {status}", drain.requested_at);
+    if let Some(deadline) = drain.deadline {
+        out.push_str(&format!(", deadline {deadline}"));
+        if let Some(at) = drain.notice_at {
+            out.push_str(&format!(", notice at {at}"));
+        }
+        if let Some(at) = drain.empty_by {
+            out.push_str(&format!(", effectively empty by {at}"));
+        }
+        if let Some(seconds) = drain.max_notice_shortfall_seconds {
+            out.push_str(&format!(", notice shortfall {seconds}s"));
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1023,7 +1127,11 @@ mod tests {
                 accruing_count: accruing,
                 drain: Some(dto::NodeDrain {
                     requested_at: coppice_core::time::Timestamp::UNIX_EPOCH,
+                    deadline: None,
+                    notice_at: None,
                     horizon,
+                    empty_by: horizon,
+                    max_notice_shortfall_seconds: None,
                     complete,
                 }),
                 ..sample_summary()
@@ -1052,7 +1160,7 @@ mod tests {
             .with_state(seen.clone());
         let base = spawn(router).await;
 
-        drain(&Client::new(&base).unwrap(), node_id(), None, false)
+        drain(&Client::new(&base).unwrap(), node_id(), None, None, false)
             .await
             .expect("drain succeeds");
         assert_eq!(*seen.lock().unwrap(), [node_id().to_string()]);
@@ -1111,7 +1219,7 @@ mod tests {
             post(|| async { Json(serde_json::json!({})) }),
         );
         let base = spawn(router).await;
-        drain(&Client::new(&base).unwrap(), node_id(), None, true)
+        drain(&Client::new(&base).unwrap(), node_id(), None, None, true)
             .await
             .expect("drain --json succeeds");
     }
@@ -1229,5 +1337,53 @@ mod tests {
         assert!(rendered.contains("drained, agent draining"), "{rendered}");
         assert!(rendered.contains("unbounded"), "{rendered}");
         assert!(rendered.contains("draining (shutting down)"), "{rendered}");
+    }
+
+    #[test]
+    fn deadline_parses_as_a_timestamp_or_a_duration() {
+        let at = parse_drain_deadline("2030-01-02T03:04:05Z").unwrap();
+        assert_eq!(
+            at,
+            DrainDeadline::At("2030-01-02T03:04:05Z".parse().unwrap())
+        );
+        assert_eq!(
+            parse_drain_deadline("15m").unwrap(),
+            DrainDeadline::In(Duration::from_secs(900))
+        );
+        assert!(parse_drain_deadline("soon").is_err());
+        assert!(parse_drain_deadline("15").is_err());
+
+        let now: Timestamp = "2030-01-01T00:00:00Z".parse().unwrap();
+        assert_eq!(
+            DrainDeadline::In(Duration::from_secs(900))
+                .resolve(now)
+                .unwrap()
+                .to_string(),
+            "2030-01-01T00:15:00.000000Z"
+        );
+    }
+
+    #[test]
+    fn detail_and_progress_show_a_deadline_drain() {
+        let mut response = drained_node_response(1, 0, None, false);
+        let drain = response.summary.drain.as_mut().unwrap();
+        let d = coppice_core::time::Timestamp::UNIX_EPOCH
+            + coppice_core::time::Duration::from_secs(3_600);
+        drain.deadline = Some(d);
+        drain.notice_at = Some(d - coppice_core::time::Duration::from_secs(300));
+        drain.empty_by = Some(d + coppice_core::time::Duration::from_secs(10));
+        drain.max_notice_shortfall_seconds = Some(12);
+        let response = client(response);
+        let rendered = render_detail(&response);
+        for want in [
+            "deadline 1970-01-01T01:00:00.000000Z",
+            "notice at 1970-01-01T00:55:00.000000Z",
+            "effectively empty by 1970-01-01T01:00:10.000000Z",
+            "notice shortfall 12s",
+        ] {
+            assert!(rendered.contains(want), "{want}: {rendered}");
+        }
+        let line = drain_progress(&response.summary).describe();
+        assert!(line.contains("notice shortfall 12s"), "{line}");
     }
 }

@@ -80,11 +80,25 @@ impl NodeHealth {
 pub struct NodeDrain {
     /// When the drain was first requested; a repeated drain keeps it.
     pub requested_at: Timestamp,
+    /// A deadline drain's deadline; `None` for a regular drain.
+    pub deadline: Option<Timestamp>,
+    /// A deadline drain's notice time (`T_notice`): when notices go out and
+    /// backfill admission closes. `None` for a regular drain.
+    pub notice_at: Option<Timestamp>,
     /// The node's horizon: the latest enforced completion bound among its
     /// live work, by which it will be empty and up to which it still admits
     /// bounded backfill. `None` either when the drain is `complete` or when
     /// some live work is unbounded, so nothing bounds when the node empties.
     pub horizon: Option<Timestamp>,
+    /// When the node will be empty: a regular drain's `horizon`; a deadline
+    /// drain's deadline, or later while a notice issued under an earlier,
+    /// later deadline is still outstanding. `None` when `complete` or when a
+    /// regular drain is unbounded.
+    pub empty_by: Option<Timestamp>,
+    /// The largest acknowledged notice shortfall among the node's live
+    /// attempts, in whole seconds; `None` when none has an acknowledged
+    /// preemption.
+    pub max_notice_shortfall_seconds: Option<u64>,
     /// The node holds no live allocation: the drain is done.
     pub complete: bool,
 }

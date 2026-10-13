@@ -19,7 +19,7 @@ use coppice_core::quota::{
 };
 use coppice_core::resource::Resources;
 
-use coppice_core::time::Duration;
+use coppice_core::time::{Duration, Timestamp};
 
 use super::{nonnegative_duration, positive_duration, req, timestamp, ConvertError};
 use crate::pb::core::v1 as pb;
@@ -749,6 +749,7 @@ impl From<&Drain> for pb::Drain {
     fn from(drain: &Drain) -> Self {
         pb::Drain {
             requested_at_us: drain.requested_at.as_micros(),
+            deadline_us: drain.deadline.map(Timestamp::as_micros),
         }
     }
 }
@@ -759,6 +760,10 @@ impl TryFrom<pb::Drain> for Drain {
     fn try_from(drain: pb::Drain) -> Result<Self, ConvertError> {
         Ok(Drain {
             requested_at: timestamp(drain.requested_at_us, "Drain.requested_at_us")?,
+            deadline: drain
+                .deadline_us
+                .map(|us| timestamp(us, "Drain.deadline_us"))
+                .transpose()?,
         })
     }
 }

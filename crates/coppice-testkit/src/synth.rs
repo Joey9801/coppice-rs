@@ -900,6 +900,7 @@ fn build_nodes(rng: &mut Rng, count: usize) -> BTreeMap<NodeId, NodeRecord> {
                     labels,
                     drain: drained.then_some(Drain {
                         requested_at: Timestamp::UNIX_EPOCH,
+                        deadline: None,
                     }),
                     service_addr: None,
                     host_facts: None,

@@ -853,6 +853,44 @@ fn a_drained_node_takes_bounded_backfill_within_its_horizon() {
     assert_eq!(attempt.drain_cutoff, Some(secs(3_630)));
 }
 
+/// Under a deadline drain the cutoff is `T_notice`, whatever runs there
+/// (ADR 0044 §5): backfill is proposed iff `now + max_runtime + abort_grace
+/// <= T_notice`, even beside an unbounded anchor that a regular drain would
+/// let block all backfill.
+#[test]
+fn a_deadline_drained_node_takes_backfill_by_its_notice_time() {
+    let mut sm = setup(cpu(32_000), 4);
+    seed_running(&mut sm, 1, 1, cpu(8_000), None);
+    let deadline = secs(4_000);
+    apply_ok(&mut sm, deadline_drain_cmd(nid(1), base_ts(), deadline));
+    let t_notice = sm.policy.deadline_drain_times(deadline).t_notice;
+    let grace_s = sm.policy.abort_grace.as_micros() / 1_000_000;
+    let now = secs(60);
+    // The longest runtime that still lands exactly on T_notice, and one past.
+    let fits = (t_notice.duration_since(now).as_micros() / 1_000_000) - grace_s;
+    for (job, runtime) in [(2, fits + 1), (3, fits)] {
+        apply_ok(
+            &mut sm,
+            submit_cmd(
+                jid(job),
+                cpu(1_000),
+                Some(runtime),
+                PriorityMultiplier::ONE,
+                base_ts(),
+            ),
+        );
+    }
+    let proposal = schedule(&sm, now);
+    let jobs: Vec<_> = proposal.placements.iter().map(|p| p.job).collect();
+    assert_eq!(
+        jobs,
+        vec![jid(3)],
+        "admitted iff now + max_runtime + grace <= T_notice"
+    );
+    let minted = commit(&mut sm, &proposal).expect("apply admits what the pass proposed");
+    assert_eq!(sm.attempts[&minted[0].0].drain_cutoff, Some(t_notice));
+}
+
 #[test]
 fn unbounded_running_work_leaves_a_drained_node_nothing_to_backfill() {
     let mut sm = drained_with_anchor(None);

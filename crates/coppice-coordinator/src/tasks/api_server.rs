@@ -1166,6 +1166,7 @@ impl<C: Consensus> ControlPlane for CoordinatorControlPlane<C> {
         // clock exactly as `updated_at` does on the direct path.
         let drain = req.drain.then(|| Drain {
             requested_at: Timestamp::now(),
+            deadline: req.deadline,
         });
         match set_node_drain_here(&*self.consensus, req.node, drain, &actor).await {
             Ok(()) => Ok(()),
@@ -2461,6 +2462,7 @@ mod tests {
             SetNodeDrainRequest {
                 node: drained,
                 drain: true,
+                deadline: None,
             },
             test_actor(),
         )
@@ -2491,6 +2493,7 @@ mod tests {
                 SetNodeDrainRequest {
                     node: NodeId::new(),
                     drain: true,
+                    deadline: None,
                 },
                 test_actor(),
             )

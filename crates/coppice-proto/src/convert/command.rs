@@ -28,8 +28,8 @@ use coppice_state::command::{
     SubmitJob, UpdateAuthorization, UpdateJobMetadata, UpdatePolicy,
 };
 use coppice_state::{
-    CaCertBundle, EnrollRole, PolicyConfig, RevokedIdentity, DEFAULT_GROUPS_CLAIM,
-    DEFAULT_PREEMPTION_NOTICE_CAP, DEFAULT_PREEMPTION_NOTICE_FLOOR,
+    CaCertBundle, EnrollRole, PolicyConfig, RevokedIdentity, DEFAULT_DRAIN_CLEANUP_MARGIN,
+    DEFAULT_GROUPS_CLAIM, DEFAULT_PREEMPTION_NOTICE_CAP, DEFAULT_PREEMPTION_NOTICE_FLOOR,
 };
 
 use super::core::{
@@ -1245,6 +1245,7 @@ impl From<&PolicyConfig> for pbcore::PolicyConfig {
             preemptible_multiplier_q32_32: Some(policy.preemptible_multiplier.0),
             preemption_notice_floor_us: Some(policy.preemption_notice_floor.as_micros()),
             preemption_notice_cap_us: Some(policy.preemption_notice_cap.as_micros()),
+            drain_cleanup_margin_us: Some(policy.drain_cleanup_margin.as_micros()),
         }
     }
 }
@@ -1298,6 +1299,10 @@ impl TryFrom<pbcore::PolicyConfig> for PolicyConfig {
             preemption_notice_cap: policy
                 .preemption_notice_cap_us
                 .map_or(DEFAULT_PREEMPTION_NOTICE_CAP, Duration::from_micros),
+            // ADR 0044 §5: absent decodes to the documented default.
+            drain_cleanup_margin: policy
+                .drain_cleanup_margin_us
+                .map_or(DEFAULT_DRAIN_CLEANUP_MARGIN, Duration::from_micros),
         })
     }
 }

@@ -387,6 +387,11 @@ pub struct NodeSummary {
 pub struct NodeDrain {
     /// When the drain was first requested; a repeated drain keeps it.
     pub requested_at: Timestamp,
+    /// A deadline drain's deadline `D`; `null` for a regular drain.
+    pub deadline: Option<Timestamp>,
+    /// A deadline drain's `T_notice` (`T_stop - preemption_notice_cap`): when
+    /// notices go out, and its backfill cutoff. `null` for a regular drain.
+    pub notice_at: Option<Timestamp>,
     /// The node's horizon: the latest enforced completion bound among its
     /// live commitments, by which it will be empty and up to which it still
     /// admits bounded backfill. `null` either when the drain is `complete`
@@ -394,6 +399,17 @@ pub struct NodeDrain {
     /// yet started, an accrual) is unbounded — then nothing bounds when the
     /// node empties, and no backfill is admitted.
     pub horizon: Option<Timestamp>,
+    /// When the node will be empty. A regular drain: its `horizon`. A deadline
+    /// drain: `max(D, ack.deadline + abort_grace + drain_cleanup_margin)` over
+    /// live attempts holding an acknowledged preemption, so later than `D`
+    /// only while a notice issued under an earlier, later deadline is still
+    /// outstanding. `null` when `complete` (either kind), and for a regular
+    /// drain whose horizon is unbounded.
+    pub empty_by: Option<Timestamp>,
+    /// The largest acknowledged notice shortfall among the node's live
+    /// attempts, in whole seconds (rounded up); `null` when none of them has
+    /// an acknowledged preemption.
+    pub max_notice_shortfall_seconds: Option<u64>,
     /// The node holds no live allocation: the drain is done. Admission stays
     /// closed until the operator undrains.
     pub complete: bool,
@@ -1984,9 +2000,10 @@ pub struct UpdateJobMetadataResponse {
 /// (ADR 0044 §5) — the operator's drain, as the `SetNodeDrain` command spells
 /// it.
 ///
-/// **Not a request body.** Both routes take no body; this is the argument
-/// type of the [`ControlPlane`](crate::ControlPlane) seam the two handlers
-/// share, serde-derived only so a test can build and compare one.
+/// **Not a request body.** This is the argument type of the
+/// [`ControlPlane`](crate::ControlPlane) seam the two handlers share,
+/// serde-derived only so a test can build and compare one. The drain route's
+/// optional wire body is [`DrainNodeBody`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SetNodeDrainRequest {
@@ -1995,6 +2012,18 @@ pub struct SetNodeDrainRequest {
     /// work continues; `false` undrains it. The control plane stamps the
     /// drain's `requested_at`; a node already draining keeps its own.
     pub drain: bool,
+    /// A deadline drain's deadline (ADR 0044 §5); `None` is a regular drain,
+    /// and always `None` for an undrain.
+    pub deadline: Option<Timestamp>,
+}
+
+/// The optional body of `POST /api/v1/nodes/{node}/drain`: absent or `{}` is
+/// a regular drain, `{"deadline": <timestamp>}` a deadline drain.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DrainNodeBody {
+    #[serde(default)]
+    pub deadline: Option<Timestamp>,
 }
 
 /// The answer to a drain or an undrain: empty, like an abort's.

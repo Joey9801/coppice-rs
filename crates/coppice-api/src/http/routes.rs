@@ -764,9 +764,10 @@ async fn update_job_metadata<P: ControlPlane>(
 
 /// `POST /api/v1/nodes/{node}/drain` (ADR 0041) — the operator's drain on.
 ///
-/// No body either way; the resulting state is read back from
-/// `GET /api/v1/nodes/{node}`, which is also where `--wait` watches the
-/// work drain away.
+/// The body is optional: absent (or empty) is a regular drain,
+/// `{"deadline": <timestamp>}` a deadline drain (ADR 0044 §5). The resulting
+/// state is read back from `GET /api/v1/nodes/{node}`, which is also where
+/// `--wait` watches the work drain away.
 ///
 /// Gated on `Verb::Drain` — an unscoped `operator` binding or higher
 /// (ADR 0023). Draining is idempotent: a drained node drains again happily.
@@ -774,8 +775,16 @@ async fn drain_node<P: ControlPlane>(
     State(plane): State<Arc<P>>,
     RequestActor(actor): RequestActor,
     IdPath(node): IdPath<NodeId>,
+    body: axum::body::Bytes,
 ) -> Result<impl IntoResponse, HttpError> {
-    set_node_drain(&*plane, actor, node, true).await
+    let deadline = if body.iter().all(u8::is_ascii_whitespace) {
+        None
+    } else {
+        serde_json::from_slice::<dto::DrainNodeBody>(&body)
+            .map_err(|e| HttpError::invalid(e.to_string()))?
+            .deadline
+    };
+    set_node_drain(&*plane, actor, node, true, deadline).await
 }
 
 /// `POST /api/v1/nodes/{node}/undrain` — the operator's drain off, and the exact
@@ -785,7 +794,7 @@ async fn undrain_node<P: ControlPlane>(
     RequestActor(actor): RequestActor,
     IdPath(node): IdPath<NodeId>,
 ) -> Result<impl IntoResponse, HttpError> {
-    set_node_drain(&*plane, actor, node, false).await
+    set_node_drain(&*plane, actor, node, false, None).await
 }
 
 /// The half [`drain_node`] and [`undrain_node`] share: pre-check the cluster
@@ -799,10 +808,18 @@ async fn set_node_drain<P: ControlPlane>(
     actor: coppice_state::Actor,
     node: NodeId,
     drain: bool,
+    deadline: Option<Timestamp>,
 ) -> Result<impl IntoResponse, HttpError> {
     precheck(plane, &actor, Intent::Drain).await?;
     plane
-        .set_node_drain(dto::SetNodeDrainRequest { node, drain }, actor)
+        .set_node_drain(
+            dto::SetNodeDrainRequest {
+                node,
+                drain,
+                deadline,
+            },
+            actor,
+        )
         .await
         .map_err(node_write_error)?;
     Ok(Json(dto::DrainNodeResponse {}))
@@ -1508,9 +1525,10 @@ mod tests {
             self.apply(coppice_state::Command::SetNodeDrain(
                 coppice_state::command::SetNodeDrain {
                     node: req.node,
-                    drain: req
-                        .drain
-                        .then_some(coppice_core::node::Drain { requested_at: now }),
+                    drain: req.drain.then_some(coppice_core::node::Drain {
+                        requested_at: now,
+                        deadline: req.deadline,
+                    }),
                     actor: Some(actor),
                     updated_at: now,
                 },
@@ -2559,6 +2577,7 @@ mod tests {
         let mut record = utilization_node(id);
         record.node.drain = drained.then_some(coppice_core::node::Drain {
             requested_at: Timestamp::UNIX_EPOCH,
+            deadline: None,
         });
         state.nodes.insert(id, record);
         state
@@ -2608,6 +2627,62 @@ mod tests {
                 "after {verb}: {body}"
             );
         }
+    }
+
+    /// A JSON body `{"deadline": ...}` makes a deadline drain, which the node
+    /// view reports with its notice time; `{}` and a whitespace body are
+    /// regular drains; a malformed body is a 400.
+    #[tokio::test]
+    async fn drain_takes_an_optional_deadline_body() {
+        let deadline =
+            Timestamp::now().saturating_add(coppice_core::time::Duration::from_hours(24));
+        let deadline_json = serde_json::to_value(deadline).unwrap();
+        let node = NodeId::new();
+        let app = app_with_state(None, state_with_node(node, false));
+        let uri = format!("/api/v1/nodes/{node}/drain");
+        let response = app
+            .clone()
+            .oneshot(post_json(
+                &uri,
+                &serde_json::json!({ "deadline": deadline_json }).to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let (_, body) = get_node_via(&app, node).await;
+        let drain = &body["summary"]["drain"];
+        assert_eq!(drain["deadline"], deadline_json, "{body}");
+        assert!(drain["notice_at"].is_string(), "{body}");
+        // The fixture node holds no work, so the drain is already complete.
+        assert_eq!(drain["complete"], true, "{body}");
+        assert!(drain["empty_by"].is_null(), "{body}");
+
+        for raw in ["{}", "  "] {
+            let node = NodeId::new();
+            let app = app_with_state(None, state_with_node(node, false));
+            let response = app
+                .clone()
+                .oneshot(post_json(&format!("/api/v1/nodes/{node}/drain"), raw))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{raw:?}");
+            let (_, body) = get_node_via(&app, node).await;
+            assert_eq!(
+                body["summary"]["drain"]["deadline"],
+                serde_json::Value::Null
+            );
+            assert_eq!(
+                body["summary"]["drain"]["notice_at"],
+                serde_json::Value::Null
+            );
+        }
+
+        let response = app
+            .clone()
+            .oneshot(post_json(&uri, r#"{"deadline": "soon"}"#))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     /// Draining is an assignment, not a toggle — which is what makes the CLI
@@ -5508,6 +5583,7 @@ mod tests {
         let mut record = utilization_node(node);
         record.node.drain = Some(coppice_core::node::Drain {
             requested_at: Timestamp::UNIX_EPOCH,
+            deadline: None,
         });
         state.nodes.insert(node, record);
 
