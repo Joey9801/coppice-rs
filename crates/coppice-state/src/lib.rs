@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use imbl::OrdMap;
 
 use coppice_core::allocation::Allocation;
-use coppice_core::attempt::{Attempt, AttemptState, Preemption};
+use coppice_core::attempt::{Attempt, AttemptState, PreemptReason, Preemption};
 use coppice_core::entity_ref::{QuotaEntityPath, QuotaEntityRef};
 use coppice_core::id::{
     AllocationId, AttemptId, EnrollTokenId, GroupId, JobId, MachineId, NodeId, QuotaEntityId,
@@ -39,11 +39,13 @@ mod apply;
 pub mod authz;
 pub mod command;
 mod drain;
+mod preempt;
 pub mod view_memos;
 
 pub use authz::{Actor, Binding, Denial, Role, Subject, Verb};
 pub use command::Command;
 pub use drain::{Admission, NodeAdmission, NodeHorizon};
+pub use preempt::{PreemptionLedger, PreemptionRefusal};
 pub use view_memos::ViewMemos;
 
 /// The authoritative, replicated control-plane state.
@@ -957,6 +959,14 @@ pub enum RejectionReason {
     /// Eviction of a node that is not draining by either flag (ADR 0041).
     #[error("node {0} is not draining")]
     NodeNotDraining(NodeId),
+    /// A preempting placement's victim, or its eviction group, failed apply's
+    /// re-validation (ADR 0044 §4) — a proposer bug. `allocation` is the
+    /// victim refused, or the group's first victim for a group-wide refusal.
+    #[error("allocation {allocation} cannot be preempted: {refusal}")]
+    InvalidPreemption {
+        allocation: AllocationId,
+        refusal: PreemptionRefusal,
+    },
     #[error("node {0} still holds a live allocation")]
     NodeNotEmpty(NodeId),
     #[error("attempt {0} is not charged in intervals")]
@@ -1107,6 +1117,19 @@ pub enum Event {
         allocation: AllocationId,
         job: JobId,
     },
+    /// The scheduler chose this running attempt as a victim (ADR 0044 §4):
+    /// its termination record was created unacknowledged, and the runtime
+    /// sends `PreemptJob` to its node — apply does no I/O.
+    PreemptRequested {
+        attempt: AttemptId,
+        allocation: AllocationId,
+        job: JobId,
+        node: NodeId,
+        reason: PreemptReason,
+        /// The victim's declared notice, resolved at submission: what the
+        /// agent counts down from delivery.
+        notice: Duration,
+    },
     /// A running attempt's termination record was created or its
     /// acknowledged deadline moved earlier (ADR 0044 §3).
     AttemptNotified {
@@ -1167,6 +1190,7 @@ impl Event {
             | Event::AttemptStateChanged { job, .. }
             | Event::AllocationFunded { job, .. }
             | Event::StopRequested { job, .. }
+            | Event::PreemptRequested { job, .. }
             | Event::AttemptNotified { job, .. }
             | Event::JobEvicted { job, .. }
             | Event::JobMetadataUpdated { job, .. } => Some(*job),

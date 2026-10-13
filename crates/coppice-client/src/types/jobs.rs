@@ -14,7 +14,7 @@ use crate::time::Timestamp;
 
 use super::{
     AccrualView, AttemptOutcome, AttemptState, AttemptView, JobFilter, JobStateKind, NoticeSignal,
-    QuotaEntityView, Resources, RetryPolicy,
+    PreemptReason, QuotaEntityView, Resources, RetryPolicy,
 };
 
 /// Deserialize a float that may arrive as `null`, mapping `null` to
@@ -446,6 +446,23 @@ pub enum TimelineEventBody {
         /// The job.
         job: JobId,
     },
+    /// The scheduler chose a running attempt as a victim (ADR 0044 §4); its
+    /// notice deadline arrives later, with `AttemptNotified`.
+    PreemptRequested {
+        /// The victim attempt.
+        attempt: AttemptId,
+        /// Its allocation.
+        allocation: AllocationId,
+        /// Its job.
+        job: JobId,
+        /// Its node.
+        node: NodeId,
+        /// Why it is being terminated.
+        reason: PreemptReason,
+        /// The job it makes room for.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        for_job: Option<JobId>,
+    },
     /// A running attempt's termination record was created or its deadline
     /// moved earlier (ADR 0044 §3); re-read the attempt for the record.
     AttemptNotified {
@@ -510,6 +527,7 @@ impl TimelineEventBody {
             | TimelineEventBody::AttemptStateChanged { job, .. }
             | TimelineEventBody::AllocationFunded { job, .. }
             | TimelineEventBody::StopRequested { job, .. }
+            | TimelineEventBody::PreemptRequested { job, .. }
             | TimelineEventBody::AttemptNotified { job, .. }
             | TimelineEventBody::JobEvicted { job }
             | TimelineEventBody::JobMetadataUpdated { job } => Some(*job),

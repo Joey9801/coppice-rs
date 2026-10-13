@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use coppice_core::allocation::{Allocation, AllocationState};
 use coppice_core::attempt::{
-    Acknowledged, Attempt, AttemptOutcome, AttemptState, OutcomeClass, Preemption,
+    Acknowledged, Attempt, AttemptOutcome, AttemptState, OutcomeClass, PreemptReason, Preemption,
 };
 use coppice_core::entity_ref;
 use coppice_core::env;
@@ -38,6 +38,7 @@ use crate::command::{
     RevokeEnrollToken, RevokeIdentity, SetNodeDrain, SetNodeDraining, SubmitJob,
     UpdateAuthorization, UpdateJobMetadata, UpdatePolicy,
 };
+use crate::preempt::PreemptCheck;
 use crate::{
     Admission, AllocationRecord, Applied, AttemptRecord, CaCertificate, Command, EnrollToken,
     Event, JobRecord, MachineBinding, NodeHorizon, NodeRecord, QuotaEntity, Rejection,
@@ -423,20 +424,33 @@ impl StateMachine {
         let mut seen_attempts: BTreeSet<AttemptId> = BTreeSet::new();
         let mut seen_allocs: BTreeSet<AllocationId> = BTreeSet::new();
         let mut cutoffs: Vec<Option<Timestamp>> = Vec::with_capacity(c.placements.len());
+        // Eviction groups (ADR 0044 §4), re-validated against a ledger and
+        // per-node allocation memo built only when the batch preempts.
+        let mut preempt = PreemptCheck::for_batch(self, c);
+        let mut victims: Vec<Vec<(AllocationId, PreemptReason)>> =
+            Vec::with_capacity(c.placements.len());
         for p in &c.placements {
-            match self.validate_placement(
-                p,
-                &revoked,
-                &seen_jobs,
-                &seen_attempts,
-                &seen_allocs,
-                &mut backfill,
-            ) {
+            let verdict = self
+                .validate_placement(
+                    p,
+                    &revoked,
+                    &seen_jobs,
+                    &seen_attempts,
+                    &seen_allocs,
+                    &mut backfill,
+                )
+                .and_then(|cutoff| match preempt.as_mut() {
+                    Some(check) => self
+                        .validate_preemptions(p, &revoked, check)
+                        .map(|group| (cutoff, group)),
+                    None => Ok((cutoff, Vec::new())),
+                });
+            match verdict {
                 Err(reason) => items.push(Rejection {
                     item_index: idx,
                     reason,
                 }),
-                Ok(cutoff) => {
+                Ok((cutoff, group)) => {
                     seen_jobs.insert(p.job);
                     seen_attempts.insert(p.attempt);
                     // Validation guarantees exactly one allocation (v1 shape).
@@ -444,6 +458,7 @@ impl StateMachine {
                         seen_allocs.insert(spec.id);
                     }
                     cutoffs.push(cutoff);
+                    victims.push(group);
                 }
             }
             idx += 1;
@@ -473,7 +488,7 @@ impl StateMachine {
                 );
             }
         }
-        for (p, drain_cutoff) in c.placements.iter().zip(cutoffs) {
+        for ((p, drain_cutoff), group) in c.placements.iter().zip(cutoffs).zip(victims) {
             // Validation guarantees exactly one allocation (v1 shape).
             let Some(spec) = p.allocations.first() else {
                 continue;
@@ -629,6 +644,40 @@ impl StateMachine {
             // this at terminal resolution using the recorded rate and
             // multiplier.
             self.charge_ancestors(entity, charge, c.proposed_at);
+            // The eviction group this placement enables (ADR 0044 §4): each
+            // victim's termination record, unacknowledged until its agent
+            // reports the notice mark. The beneficiary was just committed
+            // accruing on the same node, so the released capacity funds it
+            // through the ordinary pledge-in-commit-order path.
+            for (victim, reason) in group {
+                let Some((attempt, job)) = self
+                    .allocations
+                    .get(&victim)
+                    .map(|a| (a.allocation.attempt, a.allocation.job))
+                else {
+                    continue;
+                };
+                let notice = self
+                    .jobs
+                    .get(&job)
+                    .map(|j| self.declared_notice(&j.spec))
+                    .unwrap_or(self.policy.preemption_notice_floor);
+                if let Some(record) = self.attempts.get_mut(&attempt) {
+                    record.preemption = Some(Preemption {
+                        reason,
+                        requested_at: c.proposed_at,
+                        acknowledged: None,
+                    });
+                }
+                events.push(Event::PreemptRequested {
+                    attempt,
+                    allocation: victim,
+                    job,
+                    node: spec.node,
+                    reason,
+                    notice,
+                });
+            }
         }
         Ok(Applied { events })
     }

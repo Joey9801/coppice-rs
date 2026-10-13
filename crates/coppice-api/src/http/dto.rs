@@ -758,6 +758,20 @@ pub enum TimelineEventBody {
         allocation: AllocationId,
         job: JobId,
     },
+    /// The scheduler chose a running attempt as a victim (ADR 0044 §4): its
+    /// termination record exists, unacknowledged until the agent reports
+    /// the notice. `reason` and `for_job` are fixed at this moment, so they
+    /// ride the event; the notice deadline is re-read from the attempt.
+    PreemptRequested {
+        attempt: AttemptId,
+        allocation: AllocationId,
+        job: JobId,
+        node: NodeId,
+        reason: PreemptReason,
+        /// The job the victim makes room for.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        for_job: Option<JobId>,
+    },
     /// A running attempt's termination record was created or its deadline
     /// moved earlier (ADR 0044 §3); re-read the attempt for the record.
     AttemptNotified {
@@ -823,6 +837,21 @@ impl From<&coppice_state::Event> for TimelineEventBody {
                 node: *node,
                 allocation: *allocation,
                 job: *job,
+            },
+            E::PreemptRequested {
+                attempt,
+                allocation,
+                job,
+                node,
+                reason,
+                notice: _,
+            } => TimelineEventBody::PreemptRequested {
+                attempt: *attempt,
+                allocation: *allocation,
+                job: *job,
+                node: *node,
+                reason: reason.into(),
+                for_job: reason.for_job(),
             },
             E::AttemptNotified { attempt, job, node } => TimelineEventBody::AttemptNotified {
                 attempt: *attempt,

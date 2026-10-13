@@ -238,6 +238,12 @@ pub struct Placement {
     pub attempt: AttemptId,
     pub group: GroupId,
     pub allocations: Vec<AllocationSpec>,
+    /// Running allocations on the placement's node to terminate so this job
+    /// can run there (ADR 0044 §4): the eviction group the placement enables.
+    /// Empty for every placement but a scheduler preemption. The job is then
+    /// committed accruing, and each victim's attempt gets a termination
+    /// record that dispatch turns into `PreemptJob`.
+    pub preemptions: Vec<AllocationId>,
 }
 
 /// The allocation a placement creates.

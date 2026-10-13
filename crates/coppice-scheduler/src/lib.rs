@@ -102,6 +102,10 @@ pub struct ProposedPlacement {
     pub node: NodeId,
     pub requested: Resources,
     pub expect_funded: bool,
+    /// Running allocations on `node` this placement preempts (ADR 0044 §4):
+    /// the victims whose release funds it, proposed whole or not at all.
+    /// Empty for every placement but a preemption, which always accrues.
+    pub preemptions: Vec<AllocationId>,
 }
 
 /// A batch of proposed placements and accrual revocations, valid against a
@@ -129,6 +133,8 @@ impl PlacementProposal {
     /// Whether the pass decided nothing. The driver backs off on empty
     /// passes, so a pass over a state with nothing actionable must be empty.
     pub fn is_empty(&self) -> bool {
+        // A preemption always rides a placement, so an empty placement list
+        // means no eviction group either.
         self.revocations.is_empty() && self.placements.is_empty()
     }
 
@@ -157,6 +163,7 @@ impl PlacementProposal {
                         node: p.node,
                         requested: p.requested,
                     }],
+                    preemptions: p.preemptions.clone(),
                 }
             })
             .collect();

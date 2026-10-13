@@ -449,6 +449,14 @@ fn job_read_models_round_trip_through_the_client() {
             allocation: aid(1),
             job: jid(1),
         },
+        dto::TimelineEventBody::PreemptRequested {
+            attempt: atid(1),
+            allocation: aid(1),
+            job: jid(1),
+            node: nid(1),
+            reason: dto::PreemptReason::Priority,
+            for_job: Some(jid(2)),
+        },
         dto::TimelineEventBody::AttemptNotified {
             attempt: atid(1),
             job: jid(1),
@@ -1950,6 +1958,14 @@ fn every_timeline_event_kind_is_known_to_the_client() {
             node: nid(1),
             allocation: aid(1),
             job: jid(1),
+        },
+        dto::TimelineEventBody::PreemptRequested {
+            attempt: atid(1),
+            allocation: aid(1),
+            job: jid(1),
+            node: nid(1),
+            reason: dto::PreemptReason::Priority,
+            for_job: Some(jid(2)),
         },
         dto::TimelineEventBody::AttemptNotified {
             attempt: atid(1),

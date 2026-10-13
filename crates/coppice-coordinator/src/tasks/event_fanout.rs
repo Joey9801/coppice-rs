@@ -1004,6 +1004,8 @@ fn event_matches(
         EventFilter::Job(job) => event.job() == Some(*job),
         EventFilter::Node(node) => match event {
             Event::StopRequested { node: n, .. }
+            | Event::PreemptRequested { node: n, .. }
+            | Event::AttemptNotified { node: n, .. }
             | Event::NodeEpochBumped { node: n, .. }
             | Event::AttemptStateChanged { node: n, .. }
             | Event::AllocationFunded { node: n, .. } => n == node,
@@ -1135,6 +1137,19 @@ mod tests {
                 allocation: AllocationId::new(),
                 job,
             },
+            Event::PreemptRequested {
+                attempt: AttemptId::new(),
+                allocation: AllocationId::new(),
+                job,
+                node,
+                reason: coppice_core::attempt::PreemptReason::Priority { for_job: job },
+                notice: coppice_core::time::Duration::ZERO,
+            },
+            Event::AttemptNotified {
+                attempt: AttemptId::new(),
+                job,
+                node,
+            },
         ]
     }
 
@@ -1213,8 +1228,18 @@ mod tests {
         let batch = batch_of(1, scoped_events(job, NodeId::new()));
         let filtered = filter_events(&EventFilter::Job(job), &batch)
             .expect("attempt/allocation events carry their owning job");
-        assert_eq!(filtered.events.len(), 3);
+        assert_eq!(filtered.events.len(), 5);
         assert!(filter_events(&EventFilter::Job(other), &batch).is_none());
+    }
+
+    #[test]
+    fn node_filter_admits_attempt_and_allocation_events() {
+        let node = NodeId::new();
+        let batch = batch_of(1, scoped_events(JobId::new(), node));
+        let filtered = filter_events(&EventFilter::Node(node), &batch)
+            .expect("attempt/allocation events carry their node");
+        assert_eq!(filtered.events.len(), batch.events.len());
+        assert!(filter_events(&EventFilter::Node(NodeId::new()), &batch).is_none());
     }
 
     /// ADR 0032 (T6): ordinals are batch positions assigned before the

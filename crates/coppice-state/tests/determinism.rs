@@ -168,6 +168,7 @@ fn arb_job_chain(i: u64) -> impl Strategy<Value = Vec<Command>> {
         arb_env(),
         arb_preemption(),
         arb_notices(),
+        0i32..3,
     )
         .prop_map(
             move |(
@@ -182,19 +183,26 @@ fn arb_job_chain(i: u64) -> impl Strategy<Value = Vec<Command>> {
                 env,
                 preemption,
                 notices,
+                priority,
             )| {
                 let job = jid(1_000 + i as u128);
                 let attempt = aid(2_000 + i as u128);
                 let alloc = alid(3_000 + i as u128);
+                let mut submit = submit_cmd_full(
+                    job,
+                    cpu(cpu_millis),
+                    max_rt,
+                    RetryPolicy::default(),
+                    env,
+                    preemption,
+                );
+                // Classes vary so a preempting placement (below, in the
+                // global commands) can find outranked victims.
+                if let Command::SubmitJob(c) = &mut submit {
+                    c.job.priority = priority;
+                }
                 let mut chain = vec![
-                    submit_cmd_full(
-                        job,
-                        cpu(cpu_millis),
-                        max_rt,
-                        RetryPolicy::default(),
-                        env,
-                        preemption,
-                    ),
+                    submit,
                     place_cmd(
                         placement(job, attempt, alloc, node_of(node_ix), cpu(cpu_millis)),
                         ts,
@@ -374,6 +382,32 @@ fn arb_global() -> impl Strategy<Value = Command> {
             policy.preemption_notice_cap = Duration::from_secs(cap_s);
             update_policy_cmd(policy)
         }),
+        // A preempting placement (ADR 0044 §4): a job from the pool seated
+        // on a node with an eviction group drawn from the pool's
+        // allocations. Most are refused (the job is not queued, a victim is
+        // not running, not outranked, on another node, already terminating),
+        // some land and create termination records — both deterministically.
+        (
+            0u128..MAX_JOBS as u128,
+            0u128..4,
+            0usize..NODES as usize,
+            any::<u8>(),
+            arb_ts()
+        )
+            .prop_map(|(b, n, node_ix, mask, ts)| {
+                let mut p = placement(
+                    jid(1_000 + b),
+                    aid(7_000 + n),
+                    alid(8_000 + n),
+                    node_of(node_ix),
+                    cpu(500),
+                );
+                p.preemptions = (0..MAX_JOBS)
+                    .filter(|k| mask & (1 << k) != 0)
+                    .map(|k| alid(3_000 + k as u128))
+                    .collect();
+                place_cmd(p, ts)
+            }),
         (1u32..6, arb_ts()).prop_map(|(to, ts)| {
             Command::BumpClusterVersion(BumpClusterVersion {
                 to,
