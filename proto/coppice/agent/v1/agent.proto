@@ -52,6 +52,7 @@ message AgentCommand {
     PrepareCache prepare_cache = 11;
     EvictImageHint evict_image_hint = 12;
     RegisterAccepted register_accepted = 13;
+    PreemptJob preempt_job = 14;
   }
 }
 
@@ -127,6 +128,25 @@ message StopJob {
   coppice.core.v1.AllocationId allocation = 1;
   // SIGTERM→SIGKILL grace in microseconds (from replicated policy).
   int64 grace_us = 2;
+}
+
+// Terminate a running attempt the scheduler chose as a victim (ADR 0044 §3,
+// §4). Re-sent on reconnect and on leadership gain while the coordinator's
+// termination record is unacknowledged, so it is idempotent on the agent's
+// journaled notice intent: an attempt already notified keeps its one stop
+// time (the mark is re-reported), and one already ended is unaffected.
+// Otherwise the agent journals the intent, delivers the job's notice signal,
+// journals the mark (stop = delivery + notice_us), reports it as an
+// AttemptNotice, and at the stop time runs the stop path, classifying the
+// kill Preempted { reason }. The stop path's grace is the abort_grace_us the
+// attempt's StartJob carried, journaled with its start intent, as for every
+// other platform stop.
+message PreemptJob {
+  coppice.core.v1.AllocationId allocation = 1;
+  // The victim job's declared notice, counted from delivery.
+  uint64 notice_us = 2;
+  // Priority or Relocation, with the job the victim makes room for.
+  coppice.core.v1.PreemptReason reason = 3;
 }
 
 // Ask the node to stop accepting new work. Advisory mirror of the
