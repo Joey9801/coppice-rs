@@ -167,6 +167,10 @@ fn every_command() -> Vec<Command> {
                         disk: ByteSize::ZERO,
                     },
                 }],
+                preemptions: vec![
+                    AllocationId(Uuid::from_u128(10)),
+                    AllocationId(Uuid::from_u128(11)),
+                ],
             }],
             proposed_at: ts(),
         }),

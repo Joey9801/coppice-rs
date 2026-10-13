@@ -284,6 +284,7 @@ impl From<&Placement> for pb::Placement {
             attempt: Some(p.attempt.into()),
             group: Some(p.group.into()),
             allocations: p.allocations.iter().map(Into::into).collect(),
+            preemptions: p.preemptions.iter().map(|id| (*id).into()).collect(),
         }
     }
 }
@@ -298,6 +299,11 @@ impl TryFrom<pb::Placement> for Placement {
             group: req(p.group, "Placement.group")?.try_into()?,
             allocations: p
                 .allocations
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<_, _>>()?,
+            preemptions: p
+                .preemptions
                 .into_iter()
                 .map(TryInto::try_into)
                 .collect::<Result<_, _>>()?,

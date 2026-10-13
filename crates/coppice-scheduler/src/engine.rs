@@ -478,6 +478,7 @@ impl<'a> Pass<'a> {
                     node: target_id,
                     requested,
                     expect_funded: true,
+                    preemptions: Vec::new(),
                 });
                 continue;
             }
@@ -530,6 +531,7 @@ impl<'a> Pass<'a> {
             node: target_id,
             requested: *requested,
             expect_funded: false,
+            preemptions: Vec::new(),
         });
         if simulate_batch(self.snapshot, &self.base_free, &revocations, &placements).rejected() {
             return false;
@@ -792,6 +794,7 @@ impl<'a> Pass<'a> {
             node: node_id,
             requested: *requested,
             expect_funded: true,
+            preemptions: Vec::new(),
         });
         true
     }
@@ -853,6 +856,7 @@ impl<'a> Pass<'a> {
             node: node_id,
             requested: *requested,
             expect_funded: true,
+            preemptions: Vec::new(),
         });
         true
     }
@@ -965,6 +969,7 @@ impl<'a> Pass<'a> {
             node: node_id,
             requested: *requested,
             expect_funded: true,
+            preemptions: Vec::new(),
         });
         for a in &survivors {
             placements.push(ProposedPlacement {
@@ -972,6 +977,7 @@ impl<'a> Pass<'a> {
                 node: node_id,
                 requested: a.requested,
                 expect_funded: false,
+                preemptions: Vec::new(),
             });
         }
         if simulate_batch(self.snapshot, &self.base_free, &revocations, &placements).rejected() {
@@ -1075,6 +1081,7 @@ impl<'a> Pass<'a> {
             node: node_id,
             requested: *requested,
             expect_funded: false,
+            preemptions: Vec::new(),
         });
         if simulate_batch(
             self.snapshot,
@@ -1404,12 +1411,14 @@ mod tests {
                 node,
                 requested: res(20_000, ByteSize::ZERO, ByteSize::ZERO),
                 expect_funded: false,
+                preemptions: Vec::new(),
             },
             ProposedPlacement {
                 job: JobId(uuid::Uuid::from_u128(11)),
                 node,
                 requested: res(20_000, ByteSize::ZERO, ByteSize::ZERO),
                 expect_funded: false,
+                preemptions: Vec::new(),
             },
         ];
         let sim = simulate_batch(&sm, &base, &[], &placements);
@@ -1432,6 +1441,7 @@ mod tests {
             node,
             requested: res(2_000, ByteSize::ZERO, ByteSize::ZERO),
             expect_funded: false,
+            preemptions: Vec::new(),
         }];
         let sim = simulate_batch(&sm, &base, &[], &placements);
         assert_eq!(sim.funded, vec![false]);
@@ -1474,6 +1484,7 @@ mod tests {
             node,
             requested: res(32_000, ByteSize::ZERO, ByteSize::ZERO),
             expect_funded: false,
+            preemptions: Vec::new(),
         }];
         let sim = simulate_batch(&sm, &base, &[alloc], &placements);
         assert_eq!(sim.funded, vec![true], "revoked 16 + 16 free funds the 32");

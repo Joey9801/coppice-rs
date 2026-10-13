@@ -224,6 +224,7 @@ pub fn placement(
             node,
             requested,
         }],
+        preemptions: vec![],
     }
 }
 

@@ -1653,6 +1653,16 @@ fn timeline_description(body: &TimelineEventBody) -> String {
         B::StopRequested {
             allocation, node, ..
         } => format!("stop requested for allocation {allocation} on node {node}"),
+        B::PreemptRequested {
+            attempt,
+            node,
+            reason,
+            for_job,
+            ..
+        } => format!(
+            "attempt {attempt} on node {node} chosen for preemption: {}",
+            reason_label(reason, *for_job)
+        ),
         B::AttemptNotified { attempt, node, .. } => {
             format!("attempt {attempt} notified on node {node}")
         }
