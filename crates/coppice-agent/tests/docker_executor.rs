@@ -86,11 +86,32 @@ use anyhow::{anyhow, bail, ensure};
 mod harness {
     use super::*;
 
+    // Every image the suite pulls comes from `mirror.gcr.io`, Google's
+    // pull-through cache of Docker Hub's official images, not from Docker Hub
+    // itself: GitHub-hosted runners share egress IPs, so anonymous Hub pulls
+    // hit Hub's rate limit often enough to fail dozens of tests at once
+    // (issue #175). The list in `docker-test-images.txt` is what
+    // `scripts/pull-test-images.sh` pre-pulls in CI; `image_list_is_complete`
+    // keeps it in step with the consts below.
     /// Pinned busybox image — a small, single-layer image that carries `sh`,
     /// `id`, `su`, `sleep`, and `trap`, everything the suite needs. Pinned to an
     /// exact tag so a daemon that already has it never re-resolves, and so a
     /// registry change never shifts test behaviour under us.
-    pub const BUSYBOX: &str = "busybox:1.37.0";
+    pub const BUSYBOX: &str = "mirror.gcr.io/library/busybox:1.37.0";
+    /// Dedicated tags, each used by exactly one test (see there).
+    pub const BUSYBOX_MUSL: &str = "mirror.gcr.io/library/busybox:musl";
+    pub const BUSYBOX_UCLIBC: &str = "mirror.gcr.io/library/busybox:uclibc";
+    pub const BUSYBOX_GLIBC: &str = "mirror.gcr.io/library/busybox:glibc";
+    pub const HELLO_WORLD: &str = "mirror.gcr.io/library/hello-world:latest";
+
+    /// Every image any test here can pull.
+    pub const ALL_IMAGES: &[&str] = &[
+        BUSYBOX,
+        BUSYBOX_MUSL,
+        BUSYBOX_UCLIBC,
+        BUSYBOX_GLIBC,
+        HELLO_WORLD,
+    ];
 
     /// The Docker endpoint under test. Runs the production resolver (which honors
     /// `DOCKER_HOST` and then probes well-known sockets, so CI and local Colima
@@ -2050,7 +2071,7 @@ async fn concurrent_starts_pull_once() {
     let Some(docker) = harness::docker().await else {
         return;
     };
-    const IMAGE: &str = "busybox:musl";
+    const IMAGE: &str = harness::BUSYBOX_MUSL;
     // Force the pull: drop the tag before the executor exists so its recover
     // reconcile never adopts it.
     harness::remove_image_best_effort(&docker, IMAGE).await;
@@ -2122,7 +2143,7 @@ async fn evict_hint_respects_pins() {
     let Some(docker) = harness::docker().await else {
         return;
     };
-    const IMAGE: &str = "busybox:uclibc";
+    const IMAGE: &str = harness::BUSYBOX_UCLIBC;
     let (exec, _tx) = harness::executor(docker.clone()).await;
     let sp = harness::spec(IMAGE, &["sleep", "300"], Resources::ZERO);
     let alloc = sp.allocation;
@@ -2228,7 +2249,7 @@ async fn ttl_eviction_removes_image() {
     let Some(docker) = harness::docker().await else {
         return;
     };
-    const IMAGE: &str = "hello-world:latest";
+    const IMAGE: &str = harness::HELLO_WORLD;
     let (exec, _tx) = harness::executor(docker.clone()).await;
     let sp = harness::spec(IMAGE, &["/hello"], Resources::ZERO);
     let alloc = sp.allocation;
@@ -2275,7 +2296,7 @@ async fn inventory_lists_pulled_image() {
     let Some(docker) = harness::docker().await else {
         return;
     };
-    const IMAGE: &str = "busybox:glibc";
+    const IMAGE: &str = harness::BUSYBOX_GLIBC;
     let (exec, _tx) = harness::executor(docker.clone()).await;
     let sp = harness::spec(IMAGE, &["true"], Resources::ZERO);
     let alloc = sp.allocation;
@@ -3933,4 +3954,24 @@ async fn resumption_identity_reaches_the_container() {
 
     harness::cleanup(&exec, &[alloc]).await;
     r.unwrap();
+}
+
+/// `docker-test-images.txt` is the one list `scripts/pull-test-images.sh` reads
+/// to pre-pull the suite's images in CI; it must name exactly the images the
+/// tests use, or CI would either miss a pull or fetch dead weight. Needs no
+/// daemon.
+#[test]
+fn image_list_is_complete() {
+    let mut listed: Vec<&str> = include_str!("docker-test-images.txt")
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect();
+    let mut used: Vec<&str> = harness::ALL_IMAGES.to_vec();
+    listed.sort_unstable();
+    used.sort_unstable();
+    assert_eq!(
+        listed, used,
+        "tests/docker-test-images.txt is out of step with harness::ALL_IMAGES"
+    );
 }

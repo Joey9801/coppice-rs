@@ -89,6 +89,9 @@ jobs:
       # This still includes the heavy integration binaries a plain local
       # `cargo nextest run` skips by default. Docker ships preinstalled on
       # GitHub-hosted ubuntu runners, which docker_executor needs.
+      # Pre-pull the docker_executor images from mirror.gcr.io with retries,
+      # so a registry failure is this named step, not dozens of tests (#175).
+      - run: scripts/pull-test-images.sh
       - run: cargo nextest run --workspace --all-features --locked --profile ci
 
   fleet:

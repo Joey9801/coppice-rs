@@ -1,0 +1,8 @@
+# Images the docker_executor suite pulls, one per line. Read by
+# scripts/pull-test-images.sh (CI pre-pull) and checked against the test
+# consts by `image_list_is_complete`. All via mirror.gcr.io (issue #175).
+mirror.gcr.io/library/busybox:1.37.0
+mirror.gcr.io/library/busybox:musl
+mirror.gcr.io/library/busybox:uclibc
+mirror.gcr.io/library/busybox:glibc
+mirror.gcr.io/library/hello-world:latest
