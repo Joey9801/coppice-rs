@@ -475,6 +475,8 @@ pub async fn run_with(
         // above: node-local, liveness-only, and 60 s unless the file says
         // otherwise.
         resolved.config.pacing.housekeeping_interval,
+        // The `[scheduler]` table (ADR 0044 §4).
+        resolved.config.scheduler.to_scheduler_config(),
         // The declared auth posture (ADR 0022, issue #45): `[sso]` or the
         // conspicuous `[auth] insecure_open = true`. `config::load` already
         // rejected a config that declared neither (or both), so this cannot
@@ -627,6 +629,8 @@ pub async fn serve_runtime(
         // Likewise the production sweep cadence: an embedder with nothing to
         // say about pacing gets what a deployment gets.
         crate::limits::HOUSEKEEPING_INTERVAL,
+        // Likewise the scheduler's own defaults.
+        coppice_scheduler::SchedulerConfig::default(),
         auth,
         // No config in hand on this seam, so nothing is armed — which is also
         // what every release build gets, since `[test_failpoints]` cannot load
@@ -670,6 +674,7 @@ pub async fn serve_runtime_with_serving_sans(
     renewal_pacing: RenewalPacing,
     history: HistorySink,
     housekeeping_interval: std::time::Duration,
+    scheduler: coppice_scheduler::SchedulerConfig,
     auth: coppice_authn::AuthMode,
     failpoints: crate::failpoints::Failpoints,
     liveness: crate::NodeLiveness,
@@ -691,6 +696,7 @@ pub async fn serve_runtime_with_serving_sans(
         renewal_pacing,
         history,
         housekeeping_interval,
+        scheduler,
         auth,
         failpoints,
         liveness,
