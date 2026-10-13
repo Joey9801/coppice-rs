@@ -551,6 +551,15 @@ type WireTimelineEventBody =
     }
   | { kind: 'allocation_funded'; allocation: string; job: JobId; node: NodeId }
   | { kind: 'stop_requested'; node: NodeId; allocation: string; job: JobId }
+  | {
+      kind: 'preempt_requested'
+      attempt: AttemptId
+      allocation: string
+      job: JobId
+      node: NodeId
+      reason: WirePreemptReason
+      for_job?: JobId | null
+    }
   | { kind: 'attempt_notified'; attempt: AttemptId; job: JobId; node: NodeId }
   | { kind: 'node_epoch_bumped'; node: NodeId; epoch: number }
   | { kind: 'job_evicted'; job: JobId }
@@ -600,6 +609,16 @@ function mapTimelineEventBody(e: WireTimelineEvent): TimelineEventBody {
         node: e.node as NodeId,
         allocation: e.allocation as string,
         job: e.job as JobId,
+      }
+    case 'preempt_requested':
+      return {
+        kind: 'PreemptRequested',
+        attempt: e.attempt as AttemptId,
+        allocation: e.allocation as string,
+        job: e.job as JobId,
+        node: e.node as NodeId,
+        reason: mapPreemptReason(e.reason as WirePreemptReason),
+        forJob: (e.for_job as JobId | null | undefined) ?? null,
       }
     case 'attempt_notified':
       return {

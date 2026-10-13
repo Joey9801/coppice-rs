@@ -302,6 +302,24 @@ describe('MockWorld construction', () => {
     expect(preempting.some((a) => a.preemption?.deadline != null)).toBe(true)
     expect(preempting.some((a) => a.preemption?.forJob != null)).toBe(true)
 
+    // The scheduler's victim whose notice is in flight shows the request on
+    // its timeline, naming the job it makes way for (ADR 0044 §4).
+    const victim = world
+      .listJobs({ limit: 1000 })
+      .jobs.find((j) =>
+        world
+          .buildJobDetail(j.id)
+          .attempts.some(
+            (a) =>
+              a.state === 'Preempting' &&
+              a.preemption?.reason === 'Priority' &&
+              a.preemption.notifiedAt == null,
+          ),
+      )
+    expect(victim).toBeDefined()
+    const requested = world.buildJobTimeline(victim!.id).find((e) => e.kind === 'PreemptRequested')
+    expect(requested).toMatchObject({ kind: 'PreemptRequested', reason: 'Priority' })
+
     const preempted = attempts.filter((a) => a.outcome?.kind === 'Preempted')
     expect(preempted.length).toBeGreaterThanOrEqual(1)
     for (const a of preempted) {

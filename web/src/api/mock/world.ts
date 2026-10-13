@@ -1438,6 +1438,16 @@ export class MockWorld {
         deadlineUs: null,
         noticeShortfallSeconds: null,
       }
+      this.pushEvent({
+        atUs: this.nowUs - 3 * SECOND_US,
+        kind: 'PreemptRequested',
+        attempt: priority.attempt.id,
+        allocation: priority.attempt.allocation,
+        job: priority.job.id,
+        node: priority.attempt.node,
+        reason: 'Priority',
+        forJob: priority.attempt.preemption.forJob,
+      })
     }
 
     // An acknowledged relocation, given its full notice.

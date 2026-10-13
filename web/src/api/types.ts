@@ -633,6 +633,16 @@ export type TimelineEventBody =
     }
   | { kind: 'AllocationFunded'; allocation: AllocationId; job: JobId; node: NodeId }
   | { kind: 'StopRequested'; node: NodeId; allocation: AllocationId; job: JobId }
+  /** The scheduler chose a running attempt as a victim (ADR 0044 §4); scoped to the victim's job. */
+  | {
+      kind: 'PreemptRequested'
+      attempt: AttemptId
+      allocation: AllocationId
+      job: JobId
+      node: NodeId
+      reason: PreemptReason
+      forJob: JobId | null
+    }
   /** A termination record was created or its deadline moved earlier (ADR 0044 §3); re-read the attempt. */
   | { kind: 'AttemptNotified'; attempt: AttemptId; job: JobId; node: NodeId }
   | { kind: 'NodeEpochBumped'; node: NodeId; epoch: number }

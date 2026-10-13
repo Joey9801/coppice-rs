@@ -712,6 +712,46 @@ describe('platform terminations (ADR 0044 §2–§5)', () => {
     expect(plain!.interruptionDeadline).toBeNull()
   })
 
+  it('maps the preempt_requested timeline event', async () => {
+    const wire = (extra: object) =>
+      jsonResponse({
+        events: [
+          {
+            index: 6,
+            ordinal: 0,
+            at: '2026-01-01T00:04:00.000000Z',
+            kind: 'preempt_requested',
+            attempt: 'attempt-00000000-0000-0000-0000-000000000003',
+            allocation: 'alloc-1',
+            job: jobId,
+            node: 'node-00000000-0000-0000-0000-000000000001',
+            reason: 'priority',
+            ...extra,
+          },
+        ],
+        floor_index: 0,
+        next_cursor: null,
+      })
+    const beneficiary = 'job-00000000-0000-0000-0000-000000000009'
+    fetchMock.mockResolvedValueOnce(wire({ for_job: beneficiary }))
+    const [withFor] = await createRealClient().getJobTimeline(jobId)
+    expect(withFor).toEqual({
+      index: 6,
+      ordinal: 0,
+      at: new Date('2026-01-01T00:04:00Z'),
+      kind: 'PreemptRequested',
+      attempt: 'attempt-00000000-0000-0000-0000-000000000003',
+      allocation: 'alloc-1',
+      job: jobId,
+      node: 'node-00000000-0000-0000-0000-000000000001',
+      reason: 'Priority',
+      forJob: beneficiary,
+    })
+    fetchMock.mockResolvedValueOnce(wire({}))
+    const [without] = await createRealClient().getJobTimeline(jobId)
+    expect(without).toMatchObject({ kind: 'PreemptRequested', forJob: null })
+  })
+
   it('maps the attempt_notified timeline event', async () => {
     fetchMock.mockResolvedValueOnce(
       jsonResponse({
