@@ -862,7 +862,7 @@ pub(crate) async fn set_node_drain_here<C: Consensus>(
 ///
 /// The same command the leader's retention GC proposes, with an actor
 /// attached. Apply skips ids it cannot find — so a retried removal succeeds
-/// rather than 404ing — and refuses a node that still accepts placements or
+/// rather than 404ing — and refuses a node that is not draining or
 /// still holds a live allocation. Such refusals arrive wrapped in
 /// `InvalidBatch`; [`unwrap_single_item`] reduces that to the one item's own
 /// reason before it reaches the operator.

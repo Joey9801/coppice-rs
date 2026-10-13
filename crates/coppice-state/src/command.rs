@@ -432,7 +432,7 @@ pub struct EvictTerminalJobs {
 /// GC, for nodes silent longer than `PolicyConfig::node_retention`, and the
 /// admin API's explicit `node remove`. Missing ids are skipped (duplicate
 /// proposals across leader changes must be idempotent); a listed node that
-/// still accepts placements or still holds a live allocation is a proposer
+/// is not draining or still holds a live allocation is a proposer
 /// bug and rejects the whole command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EvictNodes {

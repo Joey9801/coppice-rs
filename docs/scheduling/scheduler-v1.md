@@ -41,9 +41,14 @@ itself stays cheap even with a queue in the hundreds of thousands.
 For a candidate job, a node is eligible only if it passes every hard
 filter:
 
-- **Open** — the node is not draining (`NodeRecord::is_draining()`: no `drain` record and no agent `draining` announcement). Draining nodes are
-  skipped entirely; their capacity isn't even loaded into the pass's node
-  model.
+- **Open** — the node is not draining (`NodeRecord::admission()` is
+  `Open`: no `drain` record and no agent `draining` announcement). Every
+  path below — free fit, strict backfill, accrual opens, re-planning —
+  considers open nodes only. A drained node whose horizon is bounded is
+  kept in the pass model as a [drain backfill](#drain-backfill) target and
+  nothing else; a closed node (announced, or drained with an empty or
+  unbounded horizon) is loaded only when it hosts an accrual to re-plan
+  off of.
 - **Labels** — `node_satisfies_labels(required, node.labels)`: every
   `(key, value)` in the job's required set must be present on the node
   with an equal value. **v1 seam:** the frozen `Job` proto carries no
@@ -84,6 +89,34 @@ fn cache_affinity_bonus(_job: &Job, _node: &Node) -> f64 { 0.0 }
 folded into (subtracted from, i.e. preferring warm nodes) the fit key.
 It is a fixed `0.0` in v1 — image-cache soft scoring (ADR 0010) slots in
 here without changing the packing structure.
+
+## Drain backfill
+
+A node under the operator's regular drain ([ADR 0044 §5](../decisions/0044-job-preemption-and-spot-capacity.md))
+still takes work that is guaranteed gone by its **horizon** `H`: the latest
+enforced completion bound among its live commitments — a running attempt's
+`started_at + max_runtime + abort_grace`, a not-yet-started drain
+backfill's recorded cutoff (the earlier of the two once it runs), and for a
+running attempt with an acknowledged termination record (ADR 0044 §3) its
+`deadline + abort_grace`, the earlier of all that apply. Any running
+attempt with neither `max_runtime` nor an acknowledged termination, any
+other attempt not yet started,
+or any accrual leaves the node with no `H`, and then nothing is admitted;
+a drained node with no live allocation is *complete* and admits nothing
+either. `StateMachine::node_horizons` computes `H` for every drained node
+in one allocation scan per pass — a pass-scoped memo, never stored state —
+and apply's `CommitPlacements` validation computes the same value for the
+nodes a batch targets.
+
+A candidate that found no open free fit is tried as drain backfill before
+strict backfill and accrual opening: it needs an enforced `max_runtime`
+with `now + max_runtime + abort_grace ≤ H`, and its whole request must fit
+the drained node's free capacity now (best-fit among such nodes, the
+spot-only rule applying as everywhere). Backfill is always fully funded —
+no accrual is ever opened on, or moved onto, a draining node — and its
+attempt records `H` as its `drain_cutoff`. Because the cutoff *is* `H`,
+seating backfill never moves the horizon later, and one pass-start value
+serves every candidate in the pass.
 
 ## The accrual trigger: license to backfill
 

@@ -38,10 +38,12 @@ use coppice_core::time::{Duration, Timestamp};
 mod apply;
 pub mod authz;
 pub mod command;
+mod drain;
 pub mod view_memos;
 
 pub use authz::{Actor, Binding, Denial, Role, Subject, Verb};
 pub use command::Command;
+pub use drain::{Admission, NodeAdmission, NodeHorizon};
 pub use view_memos::ViewMemos;
 
 /// The authoritative, replicated control-plane state.
@@ -725,6 +727,12 @@ pub struct AttemptRecord {
     /// while `Running`, by [`RecordAttemptNotified`](crate::command::RecordAttemptNotified).
     /// Its acknowledged `deadline` only ever moves earlier.
     pub preemption: Option<Preemption>,
+    /// The completion cutoff this attempt was admitted under as drain
+    /// backfill (ADR 0044 §5): the draining node's horizon at placement.
+    /// `None` for an ordinary placement. It bounds the attempt for its whole
+    /// life — dispatch derives the launch bound from it, and it keeps the
+    /// node's horizon from moving later even once the attempt runs.
+    pub drain_cutoff: Option<Timestamp>,
 }
 
 /// An allocation's replicated record plus its commit-order sequence.
@@ -756,18 +764,6 @@ pub struct NodeRecord {
     /// [`draining`](Self::draining) by registration and by
     /// [`SetNodeDraining`](crate::command::SetNodeDraining).
     pub interruption_deadline: Option<Timestamp>,
-}
-
-impl NodeRecord {
-    /// Whether the node is being emptied, by the operator's drain record or
-    /// by the agent's own announcement (ADR 0044 §5 amending ADR 0041).
-    /// Everything that decides "may this node take new work" asks this, so
-    /// the two flags can never disagree. Display surfaces that report either
-    /// flag on its own still read [`Node::drain`] or
-    /// [`draining`](Self::draining) directly.
-    pub fn is_draining(&self) -> bool {
-        self.node.drain.is_some() || self.draining
-    }
 }
 
 /// One node of the quota-entity tree.
@@ -844,7 +840,7 @@ pub struct PolicyConfig {
     ///
     /// Consulted by the proposer, never by apply.
     pub terminal_retention: Duration,
-    /// A node record that no longer accepts placements and holds no live
+    /// A node record that is draining and holds no live
     /// allocation is eligible for `EvictNodes` this long after the leader
     /// last heard from it (ADR 0041).
     ///

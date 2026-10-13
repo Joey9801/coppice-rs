@@ -81,6 +81,7 @@ impl From<&AttemptRecord> for pb::AttemptRecord {
             settlement: r.settlement.map(Into::into),
             effective_preemptible: r.effective_preemptible,
             preemption: r.preemption.as_ref().map(Into::into),
+            drain_cutoff_us: r.drain_cutoff.map(|t| t.as_micros()),
         }
     }
 }
@@ -106,6 +107,10 @@ impl TryFrom<pb::AttemptRecord> for AttemptRecord {
             settlement: r.settlement.map(TryInto::try_into).transpose()?,
             effective_preemptible: r.effective_preemptible,
             preemption: r.preemption.map(TryInto::try_into).transpose()?,
+            drain_cutoff: r
+                .drain_cutoff_us
+                .map(|us| timestamp(us, "AttemptRecord.drain_cutoff_us"))
+                .transpose()?,
         })
     }
 }

@@ -39,9 +39,9 @@ use crate::command::{
     UpdateAuthorization, UpdateJobMetadata, UpdatePolicy,
 };
 use crate::{
-    AllocationRecord, Applied, AttemptRecord, CaCertificate, Command, EnrollToken, Event,
-    JobRecord, MachineBinding, NodeRecord, QuotaEntity, Rejection, RejectionReason, StagedRoot,
-    StateMachine, QUOTA_TREE_DEPTH_CAP,
+    Admission, AllocationRecord, Applied, AttemptRecord, CaCertificate, Command, EnrollToken,
+    Event, JobRecord, MachineBinding, NodeHorizon, NodeRecord, QuotaEntity, Rejection,
+    RejectionReason, StagedRoot, StateMachine, QUOTA_TREE_DEPTH_CAP,
 };
 
 type ApplyResult = Result<Applied, RejectionReason>;
@@ -392,22 +392,58 @@ impl StateMachine {
             }
             idx += 1;
         }
+        // One allocation scan builds the per-node funded-hold memo; every
+        // free-capacity read in this batch consults it instead of rescanning,
+        // and the batch keeps it current as it frees and seats capacity. This
+        // is what makes a target-scale apply O(batch) rather than
+        // O(batch × allocations) (KOI-5). Built before validation because
+        // drain backfill's fit check reads the pre-batch free capacity.
+        let mut used = self.used_capacity_memo();
+        // The horizon of every drained node the batch places onto, in one
+        // more allocation scan, only when there is one (ADR 0044 §5). A
+        // handler-scoped memo: backfill's cutoff is the horizon itself, so
+        // seating it never moves the horizon and one value serves the batch.
+        let drained_targets: BTreeSet<NodeId> = c
+            .placements
+            .iter()
+            .flat_map(|p| p.allocations.iter().map(|a| a.node))
+            .filter(|n| {
+                self.nodes
+                    .get(n)
+                    .is_some_and(|r| r.node.drain.is_some() && !r.draining)
+            })
+            .collect();
+        let mut backfill = BackfillCheck {
+            now: c.proposed_at,
+            horizons: self.node_horizons(&drained_targets),
+            used: &used,
+            seated: BTreeMap::new(),
+        };
         let mut seen_jobs: BTreeSet<JobId> = BTreeSet::new();
         let mut seen_attempts: BTreeSet<AttemptId> = BTreeSet::new();
         let mut seen_allocs: BTreeSet<AllocationId> = BTreeSet::new();
+        let mut cutoffs: Vec<Option<Timestamp>> = Vec::with_capacity(c.placements.len());
         for p in &c.placements {
-            match self.validate_placement(p, &revoked, &seen_jobs, &seen_attempts, &seen_allocs) {
-                Some(reason) => items.push(Rejection {
+            match self.validate_placement(
+                p,
+                &revoked,
+                &seen_jobs,
+                &seen_attempts,
+                &seen_allocs,
+                &mut backfill,
+            ) {
+                Err(reason) => items.push(Rejection {
                     item_index: idx,
                     reason,
                 }),
-                None => {
+                Ok(cutoff) => {
                     seen_jobs.insert(p.job);
                     seen_attempts.insert(p.attempt);
                     // Validation guarantees exactly one allocation (v1 shape).
                     if let Some(spec) = p.allocations.first() {
                         seen_allocs.insert(spec.id);
                     }
+                    cutoffs.push(cutoff);
                 }
             }
             idx += 1;
@@ -415,13 +451,6 @@ impl StateMachine {
         if !items.is_empty() {
             return Err(RejectionReason::InvalidBatch(items));
         }
-
-        // One allocation scan builds the per-node funded-hold memo; every
-        // free-capacity read in this batch consults it instead of rescanning,
-        // and the batch keeps it current as it frees and seats capacity. This
-        // is what makes a target-scale apply O(batch) rather than
-        // O(batch × allocations) (KOI-5).
-        let mut used = self.used_capacity_memo();
 
         if let Some(reason) = self.check_accrual_limit(c, &revoked, &used) {
             return Err(reason);
@@ -444,7 +473,7 @@ impl StateMachine {
                 );
             }
         }
-        for p in &c.placements {
+        for (p, drain_cutoff) in c.placements.iter().zip(cutoffs) {
             // Validation guarantees exactly one allocation (v1 shape).
             let Some(spec) = p.allocations.first() else {
                 continue;
@@ -574,6 +603,7 @@ impl StateMachine {
                     settlement: None,
                     preemption: None,
                     effective_preemptible: preemptible,
+                    drain_cutoff,
                 },
             );
             events.push(Event::AttemptStateChanged {
@@ -603,6 +633,8 @@ impl StateMachine {
         Ok(Applied { events })
     }
 
+    /// Validate one placement; on success, the drain cutoff its attempt
+    /// records (`Some` exactly for drain backfill, ADR 0044 §5).
     fn validate_placement(
         &self,
         p: &Placement,
@@ -610,9 +642,10 @@ impl StateMachine {
         seen_jobs: &BTreeSet<JobId>,
         seen_attempts: &BTreeSet<AttemptId>,
         seen_allocs: &BTreeSet<AllocationId>,
-    ) -> Option<RejectionReason> {
+        backfill: &mut BackfillCheck<'_>,
+    ) -> Result<Option<Timestamp>, RejectionReason> {
         let Some(job) = self.jobs.get(&p.job) else {
-            return Some(RejectionReason::UnknownJob(p.job));
+            return Err(RejectionReason::UnknownJob(p.job));
         };
         // Queued, or Attempting with its current accrual revoked in this same
         // batch — the revoke-and-reseat re-plan of ADR 0014. The revocation
@@ -626,41 +659,74 @@ impl StateMachine {
             .map(|a| revoked.contains(&a.attempt.allocation))
             .unwrap_or(false);
         if (job.state != JobState::Queued && !reseat) || seen_jobs.contains(&p.job) {
-            return Some(RejectionReason::JobNotQueued(p.job));
+            return Err(RejectionReason::JobNotQueued(p.job));
         }
         // v1 shape gate: exactly one allocation, singleton groups keyed by
         // the job id. The plural field is the gang-scheduling seam; until
         // that ADR, other shapes are committed-but-rejected.
         if p.group.0 != p.job.0 || p.allocations.len() != 1 {
-            return Some(RejectionReason::UnsupportedPlacementShape);
+            return Err(RejectionReason::UnsupportedPlacementShape);
         }
         let spec = &p.allocations[0];
         if self.attempts.contains_key(&p.attempt) || seen_attempts.contains(&p.attempt) {
-            return Some(RejectionReason::DuplicateAttempt(p.attempt));
+            return Err(RejectionReason::DuplicateAttempt(p.attempt));
         }
         if self.allocations.contains_key(&spec.id) || seen_allocs.contains(&spec.id) {
-            return Some(RejectionReason::DuplicateAllocation(spec.id));
+            return Err(RejectionReason::DuplicateAllocation(spec.id));
         }
         let Some(node) = self.nodes.get(&spec.node) else {
-            return Some(RejectionReason::UnknownNode(spec.node));
+            return Err(RejectionReason::UnknownNode(spec.node));
         };
-        // One gate for both reasons a node refuses work (ADR 0044 §5): the
-        // operator's drain and the agent's own shutdown announcement.
-        if node.is_draining() {
-            return Some(RejectionReason::NodeDraining(spec.node));
-        }
+        // The admission gate (ADR 0044 §5): an announced node admits nothing,
+        // an open node anything, and a drained one only bounded backfill
+        // that completes by its horizon — the same `admits` the scheduler
+        // asks, with this batch's `proposed_at` as the scheduler's `now`.
+        let admission = node.admits(&job.spec, backfill.now, self.policy.abort_grace, || {
+            backfill
+                .horizons
+                .get(&spec.node)
+                .copied()
+                .unwrap_or(NodeHorizon::Unbounded)
+        });
+        let cutoff = match admission {
+            Admission::Open => None,
+            Admission::Backfill { cutoff } => Some(cutoff),
+            Admission::Refused => return Err(RejectionReason::NodeDraining(spec.node)),
+        };
         // ADR 0044 §4: a spot-only node takes only effectively preemptible
         // work, resolved exactly as the effects phase will record it.
         if node.node.preemptible_only && !self.effective_preemptible(&job.spec) {
-            return Some(RejectionReason::NodeRequiresPreemptible(spec.node));
+            return Err(RejectionReason::NodeRequiresPreemptible(spec.node));
         }
         if !spec.requested.fits_within(&node.node.capacity) {
-            return Some(RejectionReason::RequestExceedsNodeCapacity(spec.id));
+            return Err(RejectionReason::RequestExceedsNodeCapacity(spec.id));
         }
         if !self.quota_entities.contains_key(&job.spec.quota_entity) {
-            return Some(RejectionReason::UnknownQuotaEntity(job.spec.quota_entity));
+            return Err(RejectionReason::UnknownQuotaEntity(job.spec.quota_entity));
         }
-        None
+        if cutoff.is_some() {
+            // Backfill is fully funded at once — it never opens an accrual on
+            // a draining node. Checked conservatively: the node's free
+            // capacity before any of the batch's revocations, less the
+            // batch's earlier seats there. Revoking an accrual never shrinks
+            // free capacity (and a node with a bounded horizon holds no
+            // accrual anyway), so the effects phase funds this seat in full.
+            let seated = backfill
+                .seated
+                .get(&spec.node)
+                .copied()
+                .unwrap_or(Resources::ZERO);
+            let free = self
+                .free_capacity(&spec.node, Some(backfill.used))
+                .saturating_sub(&seated);
+            if !spec.requested.fits_within(&free) {
+                return Err(RejectionReason::NodeDraining(spec.node));
+            }
+            backfill
+                .seated
+                .insert(spec.node, seated.saturating_add(&spec.requested));
+        }
+        Ok(cutoff)
     }
 
     /// Simulate the batch and check both accrual guards (ADR 0027): the
@@ -2391,4 +2457,17 @@ fn same_submission(existing: &Job, retried: &Job) -> bool {
         && existing.metadata == retried.metadata
         && existing.env == retried.env
         && existing.preemption == retried.preemption
+}
+
+/// The batch-scoped inputs of drain-backfill admission in
+/// `commit_placements` (ADR 0044 §5): a throwaway memo, never state.
+struct BackfillCheck<'a> {
+    /// The batch's `proposed_at`, which is the scheduler pass's `now`.
+    now: Timestamp,
+    /// The horizon of every drained, unannounced node the batch targets.
+    horizons: BTreeMap<NodeId, NodeHorizon>,
+    /// The pre-batch funded-hold memo.
+    used: &'a BTreeMap<NodeId, Resources>,
+    /// Requests of the backfill seats accepted so far, per node.
+    seated: BTreeMap<NodeId, Resources>,
 }
