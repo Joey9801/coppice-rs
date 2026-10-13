@@ -44,8 +44,8 @@ policy keys off that classification and should avoid retry storms.
 
 ## Platform termination (preemption and spot interruption)
 
-When the platform ends a running attempt on purpose — a spot reclaim today,
-a scheduler preemption or deadline drain later
+When the platform ends a running attempt on purpose — a spot reclaim, a
+scheduler preemption for a higher-class job, or (later) a deadline drain
 ([ADR 0044](../decisions/0044-job-preemption-and-spot-capacity.md)) — the
 workload is sent its declared notice signal first, and the agent reports the
 notice so the coordinator records the attempt's stop deadline (the attempt
@@ -53,6 +53,14 @@ shows as *preempting*). The attempt then ends `Preempted { reason }`, which
 is free: the job requeues without consuming retry budget, however often it
 happens, and the unused charge is refunded in full. A pending abort still
 wins, ending the job `Aborted`.
+
+A scheduler preemption only ever takes work that is effectively
+preemptible, of a strictly lower class than the job it makes room for, and
+scoring below it; `coppice job status` names the job it made way for. The
+victim keeps running through its whole notice: the waiting job accrues on
+the node and starts once the victim has gone. Churn is bounded per pass and
+per node (scheduler `[scheduler]` knobs, `scheduler-v1.md`), and a node
+with an eviction under way takes no second one.
 
 Only a *reported* preemption is free. A host that disappears before the
 agent's `Preempted` report reaches the coordinator is resolved `NodeLost`

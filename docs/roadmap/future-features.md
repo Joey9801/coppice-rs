@@ -170,7 +170,9 @@ waiting for capacity.
 **Implementing.** [ADR 0044](../decisions/0044-job-preemption-and-spot-capacity.md)
 (accepted) fixes the opt-in and discount, the notice contract, the
 `Preempted` outcome, victim selection with churn guards, and preemption as a
-manufactured release event the incoming job accrues against. The entry below
+manufactured release event the incoming job accrues against. Scheduler
+priority preemption and relocation are implemented; the deadline drain
+remains. The entry below
 is kept as the record of what the design started from.
 
 **Already anticipated.** The mechanics mostly exist: `Revoked` is a first-class

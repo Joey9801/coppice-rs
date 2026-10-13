@@ -81,6 +81,15 @@ API derives the display status **preempting** from the record. The deadline
 only ever moves earlier, and `deadline + abort_grace` becomes the
 allocation's guaranteed release for backfill.
 
+A **scheduler preemption** (ADR 0044 §4) creates the record in the same
+`CommitPlacements` batch that places the job it makes room for — reason
+`priority` (or `relocation`) with that job as `for_job`, unacknowledged —
+and the beneficiary is committed `Accruing` on the victim's node. Dispatch
+sends the agent `PreemptJob`; once the agent reports the notice the record
+is acknowledged, the victim's release bounds the beneficiary's
+`projected_ready`, and when the victim ends (`Preempted`, free requeue) its
+capacity funds the beneficiary in commit order.
+
 Each terminal attempt records an **outcome** with a classification:
 
 | Outcome | Classification | Retried by default? |

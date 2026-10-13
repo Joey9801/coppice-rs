@@ -3,6 +3,7 @@ import {
   Activity,
   AlarmClock,
   Ban,
+  Gavel,
   CircleCheck,
   CircleDot,
   type LucideIcon,
@@ -15,7 +16,7 @@ import {
 import type { JobId, TimelineEvent } from '@/api/types'
 import { useJobTimeline } from '@/api/queries'
 import { formatTimeAgo, formatTimestamp } from '@/lib/format'
-import { EmptyState, IdLink } from '@/components'
+import { EmptyState, IdLink, preemptReasonLabel } from '@/components'
 import { Skeleton } from '@/components/ui/skeleton'
 
 export function JobTimeline({ jobId }: { jobId: JobId }) {
@@ -79,6 +80,8 @@ function eventIcon(event: TimelineEvent): LucideIcon {
       return CircleCheck
     case 'StopRequested':
       return Ban
+    case 'PreemptRequested':
+      return Gavel
     case 'AttemptNotified':
       return AlarmClock
     case 'NodeEpochBumped':
@@ -120,6 +123,19 @@ function eventSentence(event: TimelineEvent): ReactNode {
       return (
         <>
           Stop requested on <IdLink id={event.node} />
+        </>
+      )
+    case 'PreemptRequested':
+      return (
+        <>
+          Attempt <IdLink id={event.attempt} /> chosen for {preemptReasonLabel(event.reason)}{' '}
+          preemption on <IdLink id={event.node} />
+          {event.forJob != null ? (
+            <>
+              {' '}
+              · made way for <IdLink id={event.forJob} />
+            </>
+          ) : null}
         </>
       )
     case 'AttemptNotified':
