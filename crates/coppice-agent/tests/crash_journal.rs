@@ -39,8 +39,8 @@ use coppice_agent::executor::{
     classify_exit, ContainerState, ExitCause, ExitInfo, ObservedContainer,
 };
 use coppice_agent::journal::{
-    DrainPlanRec, ExitRec, IntentRec, Journal, JournalState, NoticeMarkRec, TombstoneReason,
-    Watermark,
+    DrainPlanRec, ExitRec, IntentRec, Journal, JournalState, NoticeMarkRec, OperatorDrain,
+    TombstoneReason, Watermark,
 };
 use coppice_agent::observed::{build_observed_set, ObservedAllocation};
 use coppice_core::attempt::{AttemptOutcome, PreemptReason};
@@ -138,6 +138,7 @@ fn drive(fs: SimFs, runtime: &mut RuntimeModel, ids: &[Ids]) -> io::Result<()> {
             notice_signal: Default::default(),
             notice: Default::default(),
             abort_grace: Default::default(),
+            cleanup_margin: Default::default(),
         };
         journal.journal_intent(&intent)?;
         runtime.start(&ids[i]);
@@ -175,6 +176,7 @@ fn drive(fs: SimFs, runtime: &mut RuntimeModel, ids: &[Ids]) -> io::Result<()> {
         notice_signal: Default::default(),
         notice: Default::default(),
         abort_grace: Default::default(),
+        cleanup_margin: Default::default(),
     };
     journal.journal_intent(&intent2)?;
     runtime.start(&ids[2]);
@@ -229,6 +231,7 @@ fn drive(fs: SimFs, runtime: &mut RuntimeModel, ids: &[Ids]) -> io::Result<()> {
         notice_signal: Default::default(),
         notice,
         abort_grace: grace,
+        cleanup_margin: Duration::from_secs(30),
     })?;
     runtime.start(&ids[3]);
 
@@ -236,9 +239,8 @@ fn drive(fs: SimFs, runtime: &mut RuntimeModel, ids: &[Ids]) -> io::Result<()> {
     let notified_at = Timestamp::from_micros(1_800_000_000_000_000).unwrap();
     let d1 = notified_at + Duration::from_secs(120);
     journal.journal_drain_plan(&DrainPlanRec {
-        deadline: d1,
-        reason: interruption,
-        accepted_target: None,
+        operator: None,
+        interruption: Some(d1),
     })?;
     runtime.plan = Some(d1);
     journal.journal_notice_intent(ids[3].allocation, interruption)?;
@@ -255,9 +257,8 @@ fn drive(fs: SimFs, runtime: &mut RuntimeModel, ids: &[Ids]) -> io::Result<()> {
 
     let d2 = d1 - Duration::from_secs(40);
     journal.journal_drain_plan(&DrainPlanRec {
-        deadline: d2,
-        reason: interruption,
-        accepted_target: None,
+        operator: None,
+        interruption: Some(d2),
     })?;
     runtime.plan = Some(d2);
     let replacement = NoticeMarkRec {
@@ -295,7 +296,7 @@ fn drive(fs: SimFs, runtime: &mut RuntimeModel, ids: &[Ids]) -> io::Result<()> {
         },
         runtime: exit3.runtime,
     })?;
-    journal.journal_drain_plan_retired()?;
+    journal.journal_drain_plan(&DrainPlanRec::default())?;
     runtime.plan_retired = true;
 
     Ok(())
@@ -394,13 +395,13 @@ fn check_invariants(
     // record can land even when its append reported the crash, so recovery
     // may be one step ahead of the model — never behind it.)
     if runtime.plan_retired {
-        assert!(recovered.plan.is_none(), "{ctx}: a retired plan came back");
+        assert!(recovered.plan.is_empty(), "{ctx}: a retired plan came back");
     } else if let Some(acted_on) = runtime.plan {
-        if let Some(plan) = recovered.plan {
+        if let Some(recovered_deadline) = recovered.plan.interruption {
             assert!(
-                plan.deadline <= acted_on,
+                recovered_deadline <= acted_on,
                 "{ctx}: recovered plan deadline {} is later than the one acted on {}",
-                plan.deadline,
+                recovered_deadline,
                 acted_on
             );
         } else {
@@ -561,20 +562,22 @@ fn notice_records_round_trip_through_compaction() {
             notice_signal: coppice_core::preemption::NoticeSignal::Sigusr2,
             notice: Duration::from_secs(45),
             abort_grace: Duration::from_secs(7),
+            cleanup_margin: Duration::from_secs(11),
         })
         .unwrap();
     journal
         .journal_drain_plan(&DrainPlanRec {
-            deadline: at(120),
-            reason: interruption,
-            accepted_target: Some(at(30)),
+            operator: Some(OperatorDrain {
+                deadline: at(30),
+                notice_window: Duration::from_secs(15),
+            }),
+            interruption: Some(at(120)),
         })
         .unwrap();
     journal
         .journal_drain_plan(&DrainPlanRec {
-            deadline: at(100),
-            reason: interruption,
-            accepted_target: None,
+            operator: None,
+            interruption: Some(at(100)),
         })
         .unwrap();
     journal
@@ -612,12 +615,12 @@ fn notice_records_round_trip_through_compaction() {
     );
     assert_eq!(intent.notice, Duration::from_secs(45));
     assert_eq!(intent.abort_grace, Duration::from_secs(7));
+    assert_eq!(intent.cleanup_margin, Duration::from_secs(11));
     assert_eq!(
         first.plan,
-        Some(DrainPlanRec {
-            deadline: at(100),
-            reason: interruption,
-            accepted_target: None,
+        (DrainPlanRec {
+            operator: None,
+            interruption: Some(at(100)),
         })
     );
     assert_eq!(first.notice_intents[&ids[0].allocation], interruption);
@@ -642,10 +645,59 @@ fn notice_records_round_trip_through_compaction() {
 
     // A retirement drops the plan for good, through compaction too.
     let (mut journal, _) = Journal::open(fs.clone()).unwrap();
-    journal.journal_drain_plan_retired().unwrap();
+    journal
+        .journal_drain_plan(&DrainPlanRec::default())
+        .unwrap();
     drop(journal);
     let retired = recover(&fs, "retired");
-    assert!(retired.plan.is_none());
+    assert!(retired.plan.is_empty());
     assert_eq!(retired.marks, first.marks);
     assert_eq!(recover(&fs, "retired again"), retired);
+}
+
+/// Each shape of the node's plan record survives the compaction rewrite field
+/// for field, and an empty plan record — how a plan ends — is dropped by it.
+#[test]
+fn drain_plan_shapes_round_trip_and_an_empty_plan_is_dropped_by_compaction() {
+    let fs = SimFs::new(SimConfig::default());
+    let at = |s: i64| Timestamp::from_micros(1_800_000_000_000_000 + s * 1_000_000).unwrap();
+    let operator = OperatorDrain {
+        deadline: at(500),
+        notice_window: Duration::from_secs(90),
+    };
+    let shapes = [
+        DrainPlanRec {
+            operator: Some(operator),
+            interruption: None,
+        },
+        DrainPlanRec {
+            operator: None,
+            interruption: Some(at(120)),
+        },
+        DrainPlanRec {
+            operator: Some(operator),
+            interruption: Some(at(120)),
+        },
+    ];
+    for (n, plan) in shapes.into_iter().enumerate() {
+        let (mut journal, _) = Journal::open(fs.clone()).unwrap();
+        journal.journal_drain_plan(&plan).unwrap();
+        drop(journal);
+        let first = recover(&fs, &format!("shape {n}"));
+        assert_eq!(first.plan, plan, "shape {n}");
+        // Compaction already ran inside the open: the rewritten file says
+        // the same thing, and says it again.
+        assert_eq!(recover(&fs, &format!("shape {n} again")), first);
+    }
+
+    // The empty record ends the plan and compaction forgets it.
+    let (mut journal, _) = Journal::open(fs.clone()).unwrap();
+    journal
+        .journal_drain_plan(&DrainPlanRec::default())
+        .unwrap();
+    drop(journal);
+    let ended = recover(&fs, "ended");
+    assert!(ended.plan.is_empty());
+    assert_eq!(ended.plan, DrainPlanRec::default());
+    assert_eq!(recover(&fs, "ended again"), ended);
 }

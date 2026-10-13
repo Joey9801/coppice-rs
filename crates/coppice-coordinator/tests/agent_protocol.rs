@@ -389,6 +389,16 @@ async fn run_to_running() -> RunningJob {
 /// [`run_to_running`] with a last look at the agent's config before it starts —
 /// the drain tests turn `shutdown_grace` down to something a test can wait out.
 async fn run_to_running_with(tweak: impl FnOnce(&mut Config)) -> RunningJob {
+    run_to_running_under(None, tweak).await
+}
+
+/// [`run_to_running_with`], with the replicated policy edited first — before
+/// the job is submitted, so its notice resolves against the edited floor and
+/// its `StartJob` carries the edited grace and cleanup margin.
+async fn run_to_running_under(
+    policy: Option<fn(&mut coppice_state::PolicyConfig)>,
+    tweak: impl FnOnce(&mut Config),
+) -> RunningJob {
     let ca = Ca::new();
     let coord = RunningCoordinator::start(ClusterId::new(), &ca).await;
     poll(DEADLINE, "coordinator leadership", || {
@@ -418,6 +428,27 @@ async fn run_to_running_with(tweak: impl FnOnce(&mut Config)) -> RunningJob {
         async move { node_epoch(&views, node).is_some_and(|e| e >= 1) }
     })
     .await;
+
+    if let Some(edit) = policy {
+        let mut edited = views.latest().state().policy.clone();
+        edit(&mut edited);
+        let applied = coord
+            .consensus()
+            .propose(Command::UpdatePolicy(
+                coppice_state::command::UpdatePolicy {
+                    policy: edited,
+                    updated_at: Timestamp::now(),
+                    actor: None,
+                },
+            ))
+            .await
+            .expect("propose UpdatePolicy");
+        assert!(
+            applied.outcome.is_ok(),
+            "UpdatePolicy rejected: {:?}",
+            applied.outcome
+        );
+    }
 
     // Seed the quota entity, then submit a placeable job.
     let entity = QuotaEntityId::new();
@@ -2345,4 +2376,242 @@ async fn a_higher_class_job_preempts_running_work_and_runs_once_it_is_gone() {
     stop_agent(agent).await;
     coord.shutdown().await;
     drop(agent_dir);
+}
+
+// ---- operator deadline drain (ADR 0044 §5) ---------------------------------
+
+/// Short policy values so a deadline drain plays out in seconds: a 2 s notice
+/// (floor = cap, so the job declares exactly the common window), 1 s grace
+/// and 1 s cleanup margin — a deadline needs 4 s of lead, `T_stop = D − 2 s`
+/// and `T_notice = D − 4 s`.
+fn short_drain_policy(policy: &mut coppice_state::PolicyConfig) {
+    policy.preemption_notice_floor = coppice_core::time::Duration::from_secs(2);
+    policy.preemption_notice_cap = coppice_core::time::Duration::from_secs(2);
+    policy.abort_grace = coppice_core::time::Duration::from_secs(1);
+    policy.drain_cleanup_margin = coppice_core::time::Duration::from_secs(1);
+}
+
+/// Propose the operator's drain of `node` — with `deadline`, or none for an
+/// undrain when `drain` is false — stamped now, as the HTTP handler would.
+async fn set_drain(
+    coord: &RunningCoordinator,
+    node: NodeId,
+    drain: bool,
+    deadline: Option<Timestamp>,
+) {
+    let now = Timestamp::now();
+    let applied = coord
+        .consensus()
+        .propose(Command::SetNodeDrain(
+            coppice_state::command::SetNodeDrain {
+                node,
+                drain: drain.then_some(coppice_core::node::Drain {
+                    requested_at: now,
+                    deadline,
+                }),
+                updated_at: now,
+                actor: None,
+            },
+        ))
+        .await
+        .expect("propose SetNodeDrain");
+    assert!(
+        applied.outcome.is_ok(),
+        "SetNodeDrain rejected: {:?}",
+        applied.outcome
+    );
+}
+
+fn preemption_of(
+    views: &StateViews,
+    attempt: AttemptId,
+) -> Option<coppice_core::attempt::Preemption> {
+    views
+        .latest()
+        .state()
+        .attempts
+        .get(&attempt)
+        .and_then(|a| a.preemption)
+}
+
+async fn wait_preempted_by_drain(views: &StateViews, attempt: AttemptId) {
+    let preempted = AttemptState::Terminal(AttemptOutcome::Preempted {
+        reason: coppice_core::attempt::PreemptReason::Drain,
+    });
+    poll(DEADLINE, "attempt Preempted { Drain }", || {
+        let views = views.clone();
+        let preempted = preempted.clone();
+        async move { attempt_state(&views, attempt) == Some(preempted) }
+    })
+    .await;
+}
+
+async fn wait_requeued_free(views: &StateViews, job: JobId) {
+    poll(DEADLINE, "job requeued", || {
+        let views = views.clone();
+        async move { job_state(&views, job) == Some(JobState::Queued) }
+    })
+    .await;
+    assert_eq!(
+        views.latest().state().jobs.get(&job).unwrap().retries_used,
+        0,
+        "a drain preemption is a free retry"
+    );
+}
+
+/// A deadline drain with a non-preemptible running job: the leader delivers
+/// the deadline on the next heartbeat, the agent notifies at `T_notice` with
+/// the full window, stops at `T_stop`, and the attempt resolves
+/// `Preempted { Drain }` with a free retry. The job stays queued: the node
+/// admits only bounded backfill, and it has no `max_runtime`.
+#[tokio::test]
+async fn a_deadline_drain_notifies_at_its_notice_time_and_requeues_free() {
+    use coppice_core::preemption::NoticeSignal;
+
+    init_tracing();
+    let world = run_to_running_under(Some(short_drain_policy), |_| {}).await;
+    let views = world.coord.views();
+
+    let deadline = Timestamp::now() + coppice_core::time::Duration::from_secs(6);
+    let t_stop = deadline - coppice_core::time::Duration::from_secs(2);
+    let t_notice = t_stop - coppice_core::time::Duration::from_secs(2);
+    set_drain(&world.coord, world.node, true, Some(deadline)).await;
+
+    // Nothing is said before T_notice.
+    let now = Timestamp::now();
+    if now < t_notice - coppice_core::time::Duration::from_millis(500) {
+        assert!(world.executor.signals_delivered(world.alloc).is_empty());
+    }
+
+    wait_preempted_by_drain(&views, world.attempt).await;
+    assert!(
+        Timestamp::now() >= t_stop,
+        "the stop ran no earlier than T_stop"
+    );
+    assert_eq!(
+        world.executor.signals_delivered(world.alloc),
+        vec![NoticeSignal::Sigusr1]
+    );
+    let preemption = preemption_of(&views, world.attempt).expect("a preemption record");
+    assert_eq!(
+        preemption.reason,
+        coppice_core::attempt::PreemptReason::Drain
+    );
+    let acknowledged = preemption.acknowledged.expect("the mark was acknowledged");
+    // Notified at T_notice, so the window is the declared notice less only
+    // the timer's wake-up latency.
+    assert!(
+        acknowledged.notice_shortfall < coppice_core::time::Duration::from_millis(500),
+        "notified on time, with (nearly) the full declared window: {}",
+        acknowledged.notice_shortfall
+    );
+    wait_requeued_free(&views, world.job).await;
+
+    // The node record is the operator's; the agent never announced draining.
+    let state = views.latest().state().clone();
+    let node = state.nodes.get(&world.node).expect("node record");
+    assert_eq!(node.node.drain.and_then(|d| d.deadline), Some(deadline));
+    assert!(!node.draining);
+    // Nothing more is placed there: the job has no bound to backfill with.
+    holds_for(
+        Duration::from_millis(800),
+        "the requeued job stays queued on the deadline-drained node",
+        || {
+            let views = views.clone();
+            let job = world.job;
+            async move { job_state(&views, job) == Some(JobState::Queued) }
+        },
+    )
+    .await;
+
+    stop_agent(world.agent).await;
+    world.coord.shutdown().await;
+    drop(world.agent_dir);
+}
+
+/// A drain that reaches the agent after `T_notice` (here: the agent was down
+/// when it was recorded, and reconnects late) notifies at once, still stops
+/// at `T_stop`, and reports the notice it could not give as shortfall.
+#[tokio::test]
+async fn a_deadline_drain_reaching_the_agent_late_reports_a_shortfall() {
+    init_tracing();
+    let mut agent_config_used = None;
+    let world = run_to_running_under(Some(short_drain_policy), |config| {
+        agent_config_used = Some(config.clone());
+    })
+    .await;
+    let config = agent_config_used.expect("the tweak ran");
+    let views = world.coord.views();
+
+    stop_agent(world.agent).await;
+    let deadline = Timestamp::now() + coppice_core::time::Duration::from_secs(6);
+    let t_notice = deadline - coppice_core::time::Duration::from_secs(4);
+    set_drain(&world.coord, world.node, true, Some(deadline)).await;
+    // Past T_notice by a clear second before the agent hears of it.
+    while Timestamp::now() <= t_notice + coppice_core::time::Duration::from_secs(1) {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let agent = spawn_agent(config, world.executor.fork()).await;
+
+    wait_preempted_by_drain(&views, world.attempt).await;
+    let acknowledged = preemption_of(&views, world.attempt)
+        .and_then(|p| p.acknowledged)
+        .expect("the late notice was acknowledged");
+    assert!(
+        acknowledged.notice_shortfall >= coppice_core::time::Duration::from_secs(1),
+        "at least the second it arrived late is short, got {}",
+        acknowledged.notice_shortfall
+    );
+    wait_requeued_free(&views, world.job).await;
+
+    stop_agent(agent).await;
+    world.coord.shutdown().await;
+    drop(world.agent_dir);
+}
+
+/// Undraining mid-notice withdraws the plan but not the notice: the notified
+/// attempt still stops at its `T_stop` and resolves `Preempted { Drain }`, and
+/// the reopened node takes the requeued job again.
+#[tokio::test]
+async fn an_undrain_mid_notice_leaves_the_notified_attempt_stopping() {
+    init_tracing();
+    let world = run_to_running_under(Some(short_drain_policy), |_| {}).await;
+    let views = world.coord.views();
+
+    let deadline = Timestamp::now() + coppice_core::time::Duration::from_secs(6);
+    let t_stop = deadline - coppice_core::time::Duration::from_secs(2);
+    set_drain(&world.coord, world.node, true, Some(deadline)).await;
+    poll(DEADLINE, "notice acknowledged", || {
+        let views = views.clone();
+        let attempt = world.attempt;
+        async move { preemption_of(&views, attempt).is_some_and(|p| p.acknowledged.is_some()) }
+    })
+    .await;
+    assert!(
+        Timestamp::now() < t_stop,
+        "the undrain must land inside the notice window for this test to mean anything"
+    );
+    set_drain(&world.coord, world.node, false, None).await;
+
+    wait_preempted_by_drain(&views, world.attempt).await;
+    assert!(Timestamp::now() >= t_stop, "the issued stop held");
+    wait_requeued_free(&views, world.job).await;
+
+    // The node is open again: the job runs a fresh attempt there.
+    poll(DEADLINE, "next attempt Running", || {
+        let views = views.clone();
+        let job = world.job;
+        let first = world.attempt;
+        async move {
+            current_attempt_id(&views, job)
+                .filter(|a| *a != first)
+                .and_then(|a| attempt_state(&views, a))
+                == Some(AttemptState::Running)
+        }
+    })
+    .await;
+
+    stop_agent(world.agent).await;
+    world.coord.shutdown().await;
+    drop(world.agent_dir);
 }

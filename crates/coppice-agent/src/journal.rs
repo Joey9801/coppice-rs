@@ -75,6 +75,10 @@ pub struct IntentRec {
     /// The stop-path grace dispatched with `StartJob` (the policy's
     /// `abort_grace`), for a stop the agent runs on its own.
     pub abort_grace: Duration,
+    /// The policy's `drain_cleanup_margin` dispatched with `StartJob` (ADR
+    /// 0044 §5): a drain plan stops this attempt at `deadline −
+    /// cleanup_margin − abort_grace`.
+    pub cleanup_margin: Duration,
 }
 
 /// Which command wrote a tombstone (ADR 0044 §3), so a tombstone found on
@@ -112,16 +116,33 @@ pub struct NoticeMarkRec {
     pub notified_at: Timestamp,
 }
 
-/// The node's journaled drain plan (ADR 0044 §5). In slice 2 only an external
-/// interruption starts one.
+/// The operator's component of the node's drain plan (ADR 0044 §5): the
+/// deadline from a `Drain` command and the notice window that came with it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DrainPlanRec {
-    /// The plan's deadline `D`, agent wall-clock: the provider's reclaim time.
+pub struct OperatorDrain {
+    /// The operator's deadline `D`, wall-clock: the accepted target the
+    /// heartbeat echoes.
     pub deadline: Timestamp,
-    pub reason: PreemptReason,
-    /// A deadline drain's accepted-work target; unused until operator
-    /// deadline drains exist.
-    pub accepted_target: Option<Timestamp>,
+    /// The common notice window (the policy's `preemption_notice_cap`): an
+    /// attempt is notified at its `T_stop − notice_window`.
+    pub notice_window: Duration,
+}
+
+/// The node's whole journaled drain plan (ADR 0044 §5): an operator deadline
+/// drain and an external interruption, each independently present. The
+/// latest record is in force; with neither component there is no plan.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DrainPlanRec {
+    pub operator: Option<OperatorDrain>,
+    /// The provider's reclaim time, agent wall-clock.
+    pub interruption: Option<Timestamp>,
+}
+
+impl DrainPlanRec {
+    /// Neither component: no plan at all.
+    pub fn is_empty(&self) -> bool {
+        self.operator.is_none() && self.interruption.is_none()
+    }
 }
 
 /// A journaled, classified exit (ADR 0013).
@@ -149,8 +170,8 @@ pub struct JournalState {
     pub notice_intents: BTreeMap<AllocationId, PreemptReason>,
     /// The notice mark in force per allocation (the latest written).
     pub marks: BTreeMap<AllocationId, NoticeMarkRec>,
-    /// The active drain plan, if any; `None` once retired.
-    pub plan: Option<DrainPlanRec>,
+    /// The drain plan in force; empty when there is none.
+    pub plan: DrainPlanRec,
 }
 
 impl JournalState {
@@ -201,6 +222,10 @@ impl JournalState {
                         notice_signal,
                         notice: try_duration(si.notice_us, "StartIntent.notice_us")?,
                         abort_grace: try_duration(si.abort_grace_us, "StartIntent.abort_grace_us")?,
+                        cleanup_margin: try_duration(
+                            si.drain_cleanup_margin_us,
+                            "StartIntent.drain_cleanup_margin_us",
+                        )?,
                     },
                 );
             }
@@ -249,16 +274,26 @@ impl JournalState {
                 );
             }
             Body::DrainPlan(p) => {
-                self.plan = Some(DrainPlanRec {
-                    deadline: try_timestamp(p.deadline_us, "DrainPlan.deadline_us")?,
-                    reason: try_reason(p.reason.clone(), "DrainPlan.reason")?,
-                    accepted_target: p
-                        .accepted_target_us
-                        .map(|us| try_timestamp(us, "DrainPlan.accepted_target_us"))
+                // The whole plan: the latest record replaces it outright.
+                self.plan = DrainPlanRec {
+                    operator: p
+                        .operator_deadline_us
+                        .map(|us| -> io::Result<OperatorDrain> {
+                            Ok(OperatorDrain {
+                                deadline: try_timestamp(us, "DrainPlan.operator_deadline_us")?,
+                                notice_window: try_duration(
+                                    p.notice_window_us,
+                                    "DrainPlan.notice_window_us",
+                                )?,
+                            })
+                        })
                         .transpose()?,
-                });
+                    interruption: p
+                        .interruption_deadline_us
+                        .map(|us| try_timestamp(us, "DrainPlan.interruption_deadline_us"))
+                        .transpose()?,
+                };
             }
-            Body::DrainPlanRetired(_) => self.plan = None,
         }
         Ok(())
     }
@@ -287,9 +322,9 @@ impl JournalState {
         for (allocation, mark) in &self.marks {
             records.push(record_notice_mark(*allocation, mark));
         }
-        // A retired plan is simply absent: there is nothing left to retire.
-        if let Some(plan) = &self.plan {
-            records.push(record_drain_plan(plan));
+        // An empty plan is simply absent: there is nothing to restore.
+        if !self.plan.is_empty() {
+            records.push(record_drain_plan(&self.plan));
         }
         for exit in self.exits.values() {
             records.push(record_exit(exit));
@@ -416,18 +451,10 @@ impl<F: Fs> Journal<F> {
         self.append(&record_notice_mark(allocation, mark))
     }
 
-    /// Journal the node's drain plan (fsynced) before acting on it.
+    /// Journal the node's whole drain plan (fsynced) before acting on it. An
+    /// empty plan is how a plan ends.
     pub fn journal_drain_plan(&mut self, plan: &DrainPlanRec) -> io::Result<()> {
         self.append(&record_drain_plan(plan))
-    }
-
-    /// Journal that the active drain plan is over (fsynced).
-    pub fn journal_drain_plan_retired(&mut self) -> io::Result<()> {
-        self.append(&pb::JournalRecord {
-            body: Some(pb::journal_record::Body::DrainPlanRetired(
-                pb::DrainPlanRetired {},
-            )),
-        })
     }
 
     /// Journal a classified exit (fsynced) *before* reporting it.
@@ -456,6 +483,7 @@ fn record_intent(intent: &IntentRec) -> pb::JournalRecord {
             notice_signal: coppice_proto::convert::notice_signal_to_pb(intent.notice_signal) as i32,
             notice_us: u64::try_from(intent.notice.as_micros()).unwrap_or(0),
             abort_grace_us: u64::try_from(intent.abort_grace.as_micros()).unwrap_or(0),
+            drain_cleanup_margin_us: u64::try_from(intent.cleanup_margin.as_micros()).unwrap_or(0),
         })),
     }
 }
@@ -520,9 +548,11 @@ fn record_notice_mark(allocation: AllocationId, mark: &NoticeMarkRec) -> pb::Jou
 fn record_drain_plan(plan: &DrainPlanRec) -> pb::JournalRecord {
     pb::JournalRecord {
         body: Some(pb::journal_record::Body::DrainPlan(pb::DrainPlan {
-            deadline_us: plan.deadline.as_micros(),
-            reason: Some(plan.reason.into()),
-            accepted_target_us: plan.accepted_target.map(Timestamp::as_micros),
+            operator_deadline_us: plan.operator.map(|o| o.deadline.as_micros()),
+            notice_window_us: plan.operator.map_or(0, |o| {
+                u64::try_from(o.notice_window.as_micros()).unwrap_or(0)
+            }),
+            interruption_deadline_us: plan.interruption.map(Timestamp::as_micros),
         })),
     }
 }
@@ -665,6 +695,7 @@ mod tests {
                 notice_signal: Default::default(),
                 notice: Default::default(),
                 abort_grace: Default::default(),
+                cleanup_margin: Default::default(),
             };
             journal.journal_intent(&intent).unwrap();
             state.intents.insert(alloc, intent);
@@ -715,6 +746,7 @@ mod tests {
                     notice_signal: Default::default(),
                     notice: Default::default(),
                     abort_grace: Default::default(),
+                    cleanup_margin: Default::default(),
                 })
                 .unwrap();
         }
@@ -742,6 +774,7 @@ mod tests {
                     notice_signal: Default::default(),
                     notice: Default::default(),
                     abort_grace: Default::default(),
+                    cleanup_margin: Default::default(),
                 })
                 .unwrap();
         }

@@ -244,6 +244,7 @@ mod tests {
                 notice_signal: Default::default(),
                 notice: Default::default(),
                 abort_grace: Default::default(),
+                cleanup_margin: Default::default(),
             },
         );
         let runtime = vec![ObservedContainer {
@@ -319,6 +320,7 @@ mod tests {
                 notice_signal: Default::default(),
                 notice: Default::default(),
                 abort_grace: Default::default(),
+                cleanup_margin: Default::default(),
             },
         );
         let set = build_observed_set(&state, &[]);

@@ -27,8 +27,9 @@ message JournalRecord {
     NoticeIntent notice_intent = 5;
     NoticeMark notice_mark = 6;
     DrainPlan drain_plan = 7;
-    DrainPlanRetired drain_plan_retired = 8;
   }
+  reserved 8;
+  reserved "drain_plan_retired";
 }
 
 // The highest fencing token the agent has accepted (ADR 0009): journaled
@@ -60,6 +61,9 @@ message StartIntent {
   coppice.core.v1.NoticeSignal notice_signal = 6;
   uint64 notice_us = 7;
   uint64 abort_grace_us = 8;
+  // The policy's `drain_cleanup_margin` copied from StartJob (ADR 0044 §5),
+  // so a drain plan computes this attempt's T_stop across a restart.
+  uint64 drain_cleanup_margin_us = 9;
 }
 
 // A StopJob was accepted for this allocation (ADR 0013): journaled before
@@ -108,21 +112,27 @@ message NoticeMark {
   int64 notified_at_us = 4;
 }
 
-// The node's active drain plan (ADR 0044 §5), so a restarted agent still
-// runs it. The latest record is in force.
+// The node's whole drain plan (ADR 0044 §5), so a restarted agent still runs
+// it. The latest record is in force; one with neither component is "no plan",
+// and compaction drops it.
 message DrainPlan {
-  // The plan's deadline D, agent wall-clock µs.
-  int64 deadline_us = 1;
-  coppice.core.v1.PreemptReason reason = 2;
-  // The accepted-work target of a deadline drain; unused until operator
-  // deadline drains exist.
-  optional int64 accepted_target_us = 3;
+  reserved 1, 2, 3;
+  reserved "deadline_us", "reason", "accepted_target_us";
+  // The operator's deadline D the agent accepted from a `Drain` command,
+  // agent wall-clock µs: the target it echoes as `Heartbeat.drain_target_us`.
+  // Absent = no operator plan (never drained with a deadline, or withdrawn).
+  optional int64 operator_deadline_us = 4;
+  // The common notice window that came with the operator deadline.
+  uint64 notice_window_us = 5;
+  // The provider's reclaim time from an external interruption, agent
+  // wall-clock µs. Absent = no interruption, or one retired on recovery
+  // because the host survived it.
+  optional int64 interruption_deadline_us = 6;
 }
 
-// The active drain plan is over (ADR 0044 §5): an interruption plan whose
-// deadline had already passed when a restarted agent recovered it. The host
-// came back (a `stop` reclaim, or a notice that never landed), so the node
-// must not stay draining; compaction drops both records.
+// Retired (ADR 0044 slice 5): a DrainPlan with neither component now says
+// "no plan". Kept empty only because the breaking gate never lets a message
+// name disappear.
 message DrainPlanRetired {}
 
 // The container's exit was observed and classified (ADR 0013 taxonomy).

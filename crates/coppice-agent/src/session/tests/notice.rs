@@ -12,10 +12,10 @@ use coppice_proto::pb::core::v1 as pbcore;
 
 use super::{command, register, restarted, session, terminal_outcome, TestSession};
 use crate::executor::{Executor, ExitCause, ExitInfo, FakeExecutor};
-use crate::session::DRAIN_CLEANUP_MARGIN;
 
 const NOTICE: Duration = Duration::from_secs(60);
 const GRACE: Duration = Duration::from_secs(10);
+const CLEANUP_MARGIN: Duration = Duration::from_secs(30);
 const INTERRUPTED: PreemptReason = PreemptReason::Interruption;
 const PREEMPTED: AttemptOutcome = AttemptOutcome::Preempted {
     reason: PreemptReason::Interruption,
@@ -47,6 +47,7 @@ fn start_body(
         notice_signal: pbcore::NoticeSignal::Sigusr1 as i32,
         notice_us: NOTICE.as_micros() as u64,
         abort_grace_us: GRACE.as_micros() as u64,
+        drain_cleanup_margin_us: CLEANUP_MARGIN.as_micros() as u64,
         ..Default::default()
     })
 }
@@ -81,7 +82,7 @@ fn notices(reports: &[pb::AgentReport]) -> Vec<(AllocationId, Duration, Duration
 
 /// The stop time an attempt with [`GRACE`] gets under a plan with deadline `d`.
 fn t_stop(d: Timestamp) -> Timestamp {
-    d - DRAIN_CLEANUP_MARGIN - GRACE
+    d - CLEANUP_MARGIN - GRACE
 }
 
 /// Run every stop due at `now` to completion through the fake, as the live
@@ -122,7 +123,7 @@ async fn an_interruption_notifies_every_attempt_then_stops_it_at_its_stop_time()
     let reports = session.on_interruption(d, now).await.unwrap();
 
     // Plan journaled, both attempts notified: intent, signal, mark, report.
-    assert_eq!(session.active_plan().unwrap().deadline, d);
+    assert_eq!(session.active_plan().interruption, Some(d));
     let window = t_stop(d).duration_since(now); // 80 s: more than the 60 s notice
     let mut reported = notices(&reports);
     reported.sort();
@@ -390,7 +391,7 @@ async fn recovery_resumes_a_journaled_mark_without_signalling_again() {
     assert!(session.resume_notices(now).await.unwrap().is_empty());
     assert_eq!(exec.signals_delivered(a).len(), 1, "no second signal");
     assert_eq!(session.next_stop_at(), Some(t_stop(d)));
-    assert_eq!(session.active_plan().unwrap().deadline, d);
+    assert_eq!(session.active_plan().interruption, Some(d));
 
     // The ObservedSet repeats the live mark, remaining recomputed.
     let reports = session
@@ -427,9 +428,8 @@ async fn recovery_of_an_intent_without_a_mark_signals_again_under_the_plan() {
     session
         .journal
         .journal_drain_plan(&crate::journal::DrainPlanRec {
-            deadline: d,
-            reason: INTERRUPTED,
-            accepted_target: None,
+            operator: None,
+            interruption: Some(d),
         })
         .unwrap();
     session
@@ -481,9 +481,8 @@ async fn a_plan_whose_deadline_passed_stops_its_work_at_once_and_retires() {
     session
         .journal
         .journal_drain_plan(&crate::journal::DrainPlanRec {
-            deadline: d,
-            reason: INTERRUPTED,
-            accepted_target: None,
+            operator: None,
+            interruption: Some(d),
         })
         .unwrap();
     session
@@ -507,7 +506,7 @@ async fn a_plan_whose_deadline_passed_stops_its_work_at_once_and_retires() {
     let later = d + Duration::from_secs(600);
     let mut session = restarted(&dir, &exec);
     session.resume_notices(later).await.unwrap();
-    assert!(session.active_plan().is_none(), "retired");
+    assert!(session.active_plan().interruption.is_none(), "retired");
     assert!(!super::draining_of(&session.register_report()));
     assert_eq!(session.state().notice_intents[&b], INTERRUPTED);
     let reports = run_due_stops(&mut session, &exec, later).await;
@@ -517,7 +516,7 @@ async fn a_plan_whose_deadline_passed_stops_its_work_at_once_and_retires() {
     // The retirement is durable.
     drop(session);
     let session = restarted(&dir, &exec);
-    assert!(session.active_plan().is_none());
+    assert!(session.active_plan().interruption.is_none());
 }
 
 // ---- replacement marks ----
@@ -550,13 +549,13 @@ async fn an_earlier_deadline_shortens_marks_and_a_later_one_changes_nothing() {
     // A later or equal deadline is a no-op.
     assert!(session.on_interruption(d1, now).await.unwrap().is_empty());
     assert!(session.on_interruption(d2, now).await.unwrap().is_empty());
-    assert_eq!(session.active_plan().unwrap().deadline, d2);
+    assert_eq!(session.active_plan().interruption, Some(d2));
 
     // The replacement is what a restart restores.
     drop(session);
     let session = restarted(&dir, &exec);
     assert_eq!(session.state().marks[&a].stop_at, t_stop(d2));
-    assert_eq!(session.active_plan().unwrap().deadline, d2);
+    assert_eq!(session.active_plan().interruption, Some(d2));
 }
 
 #[tokio::test]
@@ -569,7 +568,7 @@ async fn a_stale_notice_starts_no_plan() {
         .await
         .unwrap()
         .is_empty());
-    assert!(session.active_plan().is_none());
+    assert!(session.active_plan().interruption.is_none());
 }
 
 // ---- StartJob under a plan ----
@@ -594,10 +593,15 @@ async fn a_start_under_an_active_plan_is_notified_at_once() {
     assert_eq!(session.state().marks[&ids.0].stop_at, t_stop(d));
 }
 
+/// A start whose plan stop has already passed when it reaches the agent
+/// never launches (ADR 0044 §5: at `T_stop` the plan stops what remains,
+/// "including containers still starting"): it resolves as the plan's
+/// preemption, runtime 0, with nothing signalled.
 #[tokio::test]
-async fn a_start_whose_stop_time_has_passed_is_stopped_at_once() {
+async fn a_start_whose_stop_time_has_passed_never_launches() {
     let (_dir, mut session, exec) = registered().await;
-    let now = Timestamp::now();
+    exec.set_now(Timestamp::now());
+    let now = exec.now();
     // D is 35 s out: T_stop = D − 30 s − 10 s is already 5 s past.
     session
         .on_interruption(now + Duration::from_secs(35), now)
@@ -608,12 +612,16 @@ async fn a_start_whose_stop_time_has_passed_is_stopped_at_once() {
         .handle_command_settled(command(1, 1, 2, start_body(ids, None)))
         .await
         .unwrap();
-    let reported = notices(&reports);
-    assert_eq!(reported[0].1, Duration::ZERO, "no notice left");
-    assert_eq!(reported[0].2, NOTICE, "the whole notice is short");
-    assert!(session.next_stop_at().unwrap() <= Timestamp::now());
-    let reports = run_due_stops(&mut session, &exec, Timestamp::now()).await;
+    assert!(notices(&reports).is_empty(), "nothing ran to be noticed");
     assert_eq!(terminal_outcome(&reports), Some(PREEMPTED));
+    assert_eq!(exec.start_count(ids.0), 0, "no container was launched");
+    assert_eq!(
+        session.state().tombstones.get(&ids.0),
+        Some(&crate::journal::TombstoneReason::Preempt {
+            reason: INTERRUPTED
+        })
+    );
+    assert!(session.outstanding_live_work().is_empty());
 }
 
 // ---- readiness ----
@@ -847,9 +855,8 @@ async fn recovery_shortens_marks_a_crash_left_behind_an_earlier_plan() {
     session
         .journal
         .journal_drain_plan(&crate::journal::DrainPlanRec {
-            deadline: d2,
-            reason: INTERRUPTED,
-            accepted_target: None,
+            operator: None,
+            interruption: Some(d2),
         })
         .unwrap();
     drop(session);
@@ -1151,4 +1158,906 @@ async fn recovery_of_a_preempt_job_intent_without_a_mark_counts_down_afresh() {
         terminal_outcome(&reports),
         Some(AttemptOutcome::Preempted { reason })
     );
+}
+
+// ---- the operator's deadline drain (ADR 0044 §3 precedence, §5) ----
+
+const DRAINED: AttemptOutcome = AttemptOutcome::Preempted {
+    reason: PreemptReason::Drain,
+};
+
+fn secs(s: i64) -> Duration {
+    Duration::from_secs(s)
+}
+
+fn drain_cmd(deadline: Option<Timestamp>, window: Duration) -> pb::Drain {
+    pb::Drain {
+        deadline_us: deadline.map(Timestamp::as_micros),
+        notice_window_us: window.as_micros() as u64,
+    }
+}
+
+/// An operator plan's `T_stop` for an attempt with grace `grace` (and the
+/// tests' [`CLEANUP_MARGIN`]).
+fn op_stop(d: Timestamp, grace: Duration) -> Timestamp {
+    d - CLEANUP_MARGIN - grace
+}
+
+/// Every `attempt_notice` in `reports`, as `(allocation, reason, remaining,
+/// shortfall)`.
+fn notice_reports(
+    reports: &[pb::AgentReport],
+) -> Vec<(AllocationId, PreemptReason, Duration, Duration)> {
+    reports
+        .iter()
+        .filter_map(|r| match r.body.as_ref()? {
+            pb::agent_report::Body::AttemptNotice(n) => Some((
+                n.allocation.clone().unwrap().try_into().unwrap(),
+                PreemptReason::try_from(n.reason.clone().unwrap()).unwrap(),
+                Duration::from_micros(n.remaining_us as i64),
+                Duration::from_micros(n.shortfall_us as i64),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A StartJob body with `edit` applied.
+fn start_body_with(
+    ids: (AllocationId, AttemptId, JobId),
+    edit: impl FnOnce(&mut pb::StartJob),
+) -> pb::agent_command::Body {
+    let pb::agent_command::Body::StartJob(mut sj) = start_body(ids, None) else {
+        unreachable!()
+    };
+    edit(&mut sj);
+    pb::agent_command::Body::StartJob(sj)
+}
+
+/// A started attempt with the given abort grace.
+async fn start_with_grace(
+    session: &mut TestSession,
+    seq: u64,
+    grace: Duration,
+) -> (AllocationId, AttemptId, JobId) {
+    let ids = (AllocationId::new(), AttemptId::new(), JobId::new());
+    let body = start_body_with(ids, |sj| sj.abort_grace_us = grace.as_micros() as u64);
+    let reports = session
+        .handle_command_settled(command(1, 1, seq, body))
+        .await
+        .unwrap();
+    assert!(super::is_running_report(&reports));
+    ids
+}
+
+/// Two running attempts, `a` with a 10 s grace and `b` with none (so `b`'s
+/// operator `T_notice` is 10 s after `a`'s), under an operator plan with
+/// deadline `now + 300 s` and a 120 s notice window; `a` is notified at its
+/// `T_notice` and `b` is not.
+struct Notified {
+    _dir: tempfile::TempDir,
+    session: TestSession,
+    exec: FakeExecutor,
+    a: AllocationId,
+    b: AllocationId,
+    now: Timestamp,
+    d: Timestamp,
+    /// `a`'s `T_notice`, the instant the scenario's clock stands at.
+    t: Timestamp,
+}
+
+async fn a_notified_and_b_waiting() -> Notified {
+    let (dir, mut session, exec) = registered().await;
+    let (a, _, _) = start_with_grace(&mut session, 2, GRACE).await;
+    let (b, _, _) = start_with_grace(&mut session, 3, Duration::ZERO).await;
+    let now = Timestamp::now();
+    let d = now + secs(300);
+    let reports = session
+        .on_drain(drain_cmd(Some(d), secs(120)), now)
+        .await
+        .unwrap();
+    assert!(reports.is_empty(), "nothing is due yet");
+    let t = op_stop(d, GRACE) - secs(120);
+    assert_eq!(session.next_notice_at(), Some(t));
+    let reports = session.begin_due_notices(t).await.unwrap();
+    assert_eq!(
+        notice_reports(&reports),
+        vec![(a, PreemptReason::Drain, secs(120), Duration::ZERO)]
+    );
+    assert!(!session.state().notice_intents.contains_key(&b));
+    Notified {
+        _dir: dir,
+        session,
+        exec,
+        a,
+        b,
+        now,
+        d,
+        t,
+    }
+}
+
+#[tokio::test]
+async fn an_operator_plan_notifies_at_t_notice_with_reason_drain() {
+    let (_dir, mut session, exec) = registered().await;
+    let (a, _, _) = start_noticed(&mut session, 2).await;
+    let now = Timestamp::now();
+    let d = now + secs(300);
+    // A 30 s window is half the declared 60 s notice.
+    let reports = session
+        .on_drain(drain_cmd(Some(d), secs(30)), now)
+        .await
+        .unwrap();
+    assert!(reports.is_empty());
+    assert!(session.state().notice_intents.is_empty());
+    assert!(exec.signals_delivered(a).is_empty());
+    let t_notice = t_stop(d) - secs(30);
+    assert_eq!(session.next_notice_at(), Some(t_notice));
+    assert!(session
+        .begin_due_notices(t_notice - secs(1))
+        .await
+        .unwrap()
+        .is_empty());
+
+    let reports = session.begin_due_notices(t_notice).await.unwrap();
+    // declared notice (60 s) − (stop − now) (30 s) = 30 s.
+    assert_eq!(
+        notice_reports(&reports),
+        vec![(a, PreemptReason::Drain, secs(30), secs(30))]
+    );
+    assert_eq!(exec.signals_delivered(a), vec![NoticeSignal::Sigusr1]);
+    assert_eq!(session.state().notice_intents[&a], PreemptReason::Drain);
+    let mark = session.state().marks[&a];
+    assert_eq!(mark.stop_at, t_stop(d));
+    assert_eq!(mark.shortfall, secs(30));
+    assert_eq!(mark.notified_at, t_notice);
+    assert_eq!(session.next_notice_at(), None);
+    assert_eq!(session.next_stop_at(), Some(t_stop(d)));
+}
+
+#[tokio::test]
+async fn an_earlier_replacement_leaves_a_notified_mark_and_notifies_the_rest_by_the_new_deadline() {
+    let Notified {
+        mut session,
+        exec,
+        a,
+        b,
+        now,
+        d,
+        t,
+        ..
+    } = a_notified_and_b_waiting().await;
+    let mark = session.state().marks[&a];
+
+    // 100 s earlier: `b`'s T_notice (now + 50 s) is long past, so it is
+    // notified at once, against its new stop (now + 170 s); `a` is untouched.
+    let d2 = d - secs(100);
+    let reports = session
+        .on_drain(drain_cmd(Some(d2), secs(120)), t)
+        .await
+        .unwrap();
+    assert_eq!(session.drain_target(), Some(d2));
+    let b_stop = op_stop(d2, Duration::ZERO);
+    assert_eq!(b_stop, now + secs(170));
+    assert_eq!(
+        notice_reports(&reports),
+        vec![(b, PreemptReason::Drain, b_stop.duration_since(t), secs(30))]
+    );
+    assert_eq!(session.state().marks[&a], mark, "a keeps its mark");
+    assert_eq!(exec.signals_delivered(a).len(), 1);
+    assert_eq!(session.state().marks[&b].stop_at, b_stop);
+    assert_eq!(session.next_stop_at(), Some(b_stop.min(mark.stop_at)));
+}
+
+#[tokio::test]
+async fn a_later_replacement_leaves_a_notified_mark_and_moves_the_rest() {
+    let Notified {
+        mut session,
+        exec,
+        a,
+        b,
+        d,
+        t,
+        ..
+    } = a_notified_and_b_waiting().await;
+    let mark = session.state().marks[&a];
+
+    let d2 = d + secs(100);
+    let reports = session
+        .on_drain(drain_cmd(Some(d2), secs(120)), t)
+        .await
+        .unwrap();
+    assert!(reports.is_empty());
+    assert_eq!(session.state().marks[&a], mark, "a keeps its mark");
+    assert_eq!(session.next_stop_at(), Some(mark.stop_at));
+    assert_eq!(exec.signals_delivered(a).len(), 1);
+    // `b` follows the new deadline: notified 10 s after `a` would have been
+    // under it.
+    let b_notice = op_stop(d2, Duration::ZERO) - secs(120);
+    assert_eq!(session.next_notice_at(), Some(b_notice));
+    assert!(session
+        .begin_due_notices(b_notice - secs(1))
+        .await
+        .unwrap()
+        .is_empty());
+    let reports = session.begin_due_notices(b_notice).await.unwrap();
+    assert_eq!(
+        notice_reports(&reports),
+        vec![(b, PreemptReason::Drain, secs(120), Duration::ZERO)]
+    );
+    assert_eq!(
+        session.state().marks[&b].stop_at,
+        op_stop(d2, Duration::ZERO)
+    );
+}
+
+#[tokio::test]
+async fn a_withdrawal_keeps_a_notified_stop_and_still_stops_it_as_drain() {
+    let Notified {
+        mut session,
+        exec,
+        a,
+        b,
+        d,
+        t,
+        ..
+    } = a_notified_and_b_waiting().await;
+    let mark = session.state().marks[&a];
+
+    let reports = session
+        .on_drain(drain_cmd(None, Duration::ZERO), t)
+        .await
+        .unwrap();
+    assert!(reports.is_empty());
+    assert_eq!(session.drain_target(), None);
+    assert!(session.active_plan().is_empty());
+    assert_eq!(session.state().marks[&a], mark);
+    // The un-notified attempt is released.
+    assert_eq!(session.next_notice_at(), None);
+    assert!(!session.state().notice_intents.contains_key(&b));
+
+    // `a` still stops at its issued stop time, and resolves as a drain.
+    let stop_at = op_stop(d, GRACE);
+    assert_eq!(mark.stop_at, stop_at);
+    assert_eq!(session.next_stop_at(), Some(stop_at));
+    assert!(session
+        .begin_due_stops(stop_at - secs(1))
+        .unwrap()
+        .is_empty());
+    let reports = run_due_stops(&mut session, &exec, stop_at).await;
+    assert_eq!(terminal_outcome(&reports), Some(DRAINED));
+    assert_eq!(
+        session.state().tombstones[&a],
+        crate::journal::TombstoneReason::Preempt {
+            reason: PreemptReason::Drain
+        }
+    );
+    assert!(exec.is_running(b), "the released attempt keeps running");
+}
+
+#[tokio::test]
+async fn an_earlier_interruption_replaces_an_operator_mark_and_a_later_one_does_not() {
+    let Notified {
+        mut session,
+        a,
+        now,
+        d,
+        t,
+        ..
+    } = a_notified_and_b_waiting().await;
+    let first = session.state().marks[&a];
+    assert_eq!(first.stop_at, now + secs(260));
+
+    // Interruption at now + 400 s: its T_stop (now + 360 s) is later.
+    let later = session.on_interruption(now + secs(400), t).await.unwrap();
+    assert!(notice_reports(&later).iter().all(|n| n.0 != a));
+    assert_eq!(session.state().marks[&a], first, "mark unchanged");
+
+    // Interruption at now + 200 s: T_stop = now + 160 s, 20 s after the
+    // notice at now + 140 s — 40 s short of the declared 60 s.
+    let reports = session.on_interruption(now + secs(200), t).await.unwrap();
+    let mark = session.state().marks[&a];
+    assert_eq!(mark.stop_at, now + secs(160));
+    assert_eq!(mark.shortfall, secs(40));
+    assert_eq!(mark.notified_at, first.notified_at);
+    let for_a: Vec<_> = notice_reports(&reports)
+        .into_iter()
+        .filter(|n| n.0 == a)
+        .collect();
+    assert_eq!(
+        for_a,
+        vec![(a, PreemptReason::Drain, secs(20), secs(40))],
+        "re-reported under the original notice reason"
+    );
+    assert_eq!(session.state().notice_intents[&a], PreemptReason::Drain);
+    assert_eq!(session.drain_target(), Some(d), "the operator target stays");
+}
+
+/// ADR 0044 §3's table: an interruption notifies an attempt not yet notified
+/// at once, with the *provider's* stop — even when the operator's plan would
+/// stop it earlier, as long as the operator's notice time is still ahead —
+/// and that stop is kept through the operator plan's own notice time.
+#[tokio::test]
+async fn an_interruption_before_the_operator_notice_time_keeps_the_providers_stop() {
+    let (_dir, mut session, exec) = registered().await;
+    let (a, _, _) = start_noticed(&mut session, 2).await;
+    let now = Timestamp::now();
+    let d = now + secs(300);
+    session
+        .on_drain(drain_cmd(Some(d), secs(30)), now)
+        .await
+        .unwrap();
+    let operator_notice = op_stop(d, GRACE) - secs(30);
+    assert!(now < operator_notice);
+
+    let provider = now + secs(500);
+    let reports = session.on_interruption(provider, now).await.unwrap();
+    assert_eq!(
+        notice_reports(&reports),
+        vec![(
+            a,
+            PreemptReason::Interruption,
+            t_stop(provider).duration_since(now),
+            Duration::ZERO
+        )]
+    );
+    assert_eq!(session.state().marks[&a].stop_at, t_stop(provider));
+    assert_eq!(session.state().notice_intents[&a], INTERRUPTED);
+
+    // The operator's notice time comes and goes: the issued stop stands.
+    assert!(session
+        .begin_due_notices(operator_notice)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(session.state().marks[&a].stop_at, t_stop(provider));
+    assert_eq!(exec.signals_delivered(a).len(), 1);
+}
+
+/// Once the operator's notice time has passed, an attempt not yet notified
+/// (both components landing in one tick, or on recovery) was due under the
+/// operator plan anyway: it gets the earlier of the two stops, reason
+/// `Interruption`.
+#[tokio::test]
+async fn an_interruption_after_the_operator_notice_time_takes_the_earlier_stop() {
+    let (_dir, mut session, exec) = registered().await;
+    let (a, _, _) = start_noticed(&mut session, 2).await;
+    let now = Timestamp::now();
+    let d = now + secs(300);
+    session
+        .on_drain(drain_cmd(Some(d), secs(30)), now)
+        .await
+        .unwrap();
+    let operator_notice = op_stop(d, GRACE) - secs(30);
+
+    // No notice pass ran in between: the interruption is the first to act.
+    let reports = session
+        .on_interruption(now + secs(500), operator_notice)
+        .await
+        .unwrap();
+    assert_eq!(
+        notice_reports(&reports),
+        vec![(
+            a,
+            PreemptReason::Interruption,
+            t_stop(d).duration_since(operator_notice),
+            Duration::from_secs(30)
+        )]
+    );
+    assert_eq!(session.state().marks[&a].stop_at, t_stop(d));
+    assert_eq!(exec.signals_delivered(a).len(), 1);
+    assert_eq!(session.state().notice_intents[&a], INTERRUPTED);
+}
+
+// ---- a drain plan reaching a start in flight (ADR 0044 §5) ----
+
+/// Queue an unbounded start whose pull is held by the fake's gate, with the
+/// fake's clock pinned to now.
+async fn start_held_at_the_pull(
+    session: &mut TestSession,
+    exec: &FakeExecutor,
+) -> (
+    AllocationId,
+    crate::executor::StartSpec,
+    crate::executor::PullGate,
+) {
+    exec.set_now(Timestamp::now());
+    let gate = exec.gate_pulls();
+    let ids = (AllocationId::new(), AttemptId::new(), JobId::new());
+    let queued = session
+        .handle_command(command(1, 1, 2, start_body(ids, None)))
+        .await
+        .unwrap();
+    assert!(queued.is_empty(), "the start is queued, not awaited");
+    let [spec] = &session.take_pending_starts()[..] else {
+        panic!("exactly one start is queued");
+    };
+    (ids.0, spec.clone(), gate)
+}
+
+/// A deadline drain landing while a start (accepted before it, with no
+/// launch bound of its own) is still pulling: once the plan's `T_stop`
+/// passes the pull is abandoned and nothing launches; the attempt resolves
+/// `Preempted { Drain }`, runtime 0.
+#[tokio::test(start_paused = true)]
+async fn a_drain_landing_mid_pull_refuses_the_launch_at_its_stop() {
+    let (_dir, mut session, exec) = registered().await;
+    let (a, spec, _gate) = start_held_at_the_pull(&mut session, &exec).await;
+    let now = exec.now();
+    // T_stop = D − 30 s − 10 s = now + 5 s; its notice time is long past.
+    let d = now + secs(45);
+
+    let began = tokio::time::Instant::now();
+    let (result, drained) = tokio::join!(exec.start(spec), async {
+        session.on_drain(drain_cmd(Some(d), secs(120)), now).await
+    });
+    assert!(
+        drained.unwrap().is_empty(),
+        "nothing to signal: there is no container yet"
+    );
+    assert_eq!(
+        began.elapsed(),
+        std::time::Duration::from_secs(5),
+        "the pull is abandoned at the plan's stop"
+    );
+    let reports = session.finish_start(a, result, d).await.unwrap();
+    assert_eq!(terminal_outcome(&reports), Some(DRAINED));
+    assert_eq!(super::reported_runtime_us(&reports), Some(0));
+    assert_eq!(exec.start_count(a), 0, "no container was launched");
+    assert_eq!(
+        session.state().tombstones.get(&a),
+        Some(&crate::journal::TombstoneReason::Preempt {
+            reason: PreemptReason::Drain
+        })
+    );
+    assert!(session.outstanding_live_work().is_empty());
+}
+
+/// The same for an interruption landing mid-pull.
+#[tokio::test(start_paused = true)]
+async fn an_interruption_landing_mid_pull_refuses_the_launch_at_its_stop() {
+    let (_dir, mut session, exec) = registered().await;
+    let (a, spec, _gate) = start_held_at_the_pull(&mut session, &exec).await;
+    let now = exec.now();
+    let d = now + secs(45);
+
+    let (result, interrupted) = tokio::join!(exec.start(spec), async {
+        session.on_interruption(d, now).await
+    });
+    assert!(interrupted.unwrap().is_empty());
+    let reports = session.finish_start(a, result, d).await.unwrap();
+    assert_eq!(terminal_outcome(&reports), Some(PREEMPTED));
+    assert_eq!(exec.start_count(a), 0, "no container was launched");
+}
+
+/// A pull that lands inside the plan's stop starts normally — then is
+/// notified under the plan, as any start in flight is.
+#[tokio::test(start_paused = true)]
+async fn a_pull_landing_before_the_plans_stop_starts_and_is_notified() {
+    let (_dir, mut session, exec) = registered().await;
+    let (a, spec, gate) = start_held_at_the_pull(&mut session, &exec).await;
+    let now = exec.now();
+    let d = now + secs(45);
+
+    let open = async {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        gate.open();
+    };
+    let (result, drained, ()) = tokio::join!(
+        exec.start(spec),
+        async { session.on_drain(drain_cmd(Some(d), secs(120)), now).await },
+        open
+    );
+    drained.unwrap();
+    result.expect("the start lands inside the bound");
+    let reports = session.finish_start(a, Ok(()), now).await.unwrap();
+    assert!(super::is_running_report(&reports[..1]));
+    assert_eq!(
+        notice_reports(&reports)
+            .into_iter()
+            .map(|(alloc, reason, ..)| (alloc, reason))
+            .collect::<Vec<_>>(),
+        vec![(a, PreemptReason::Drain)]
+    );
+    assert_eq!(exec.start_count(a), 1);
+}
+
+/// A start in flight has had no notice, so a drain withdrawn before its
+/// stop hands the bound back: the pull that lands after the former `T_stop`
+/// launches normally, with no tombstone and nothing to notify.
+#[tokio::test(start_paused = true)]
+async fn a_drain_withdrawn_mid_pull_lets_the_start_launch_after_the_former_stop() {
+    let (_dir, mut session, exec) = registered().await;
+    let (a, spec, gate) = start_held_at_the_pull(&mut session, &exec).await;
+    let now = exec.now();
+    let bound = spec.launch_bound.clone();
+
+    let drive = async {
+        session
+            .on_drain(drain_cmd(Some(now + secs(45)), secs(30)), now)
+            .await
+            .unwrap();
+        assert_eq!(bound.current(), Some(now + secs(5)), "bounded at T_stop");
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        session
+            .on_drain(drain_cmd(None, secs(30)), now)
+            .await
+            .unwrap();
+        assert_eq!(bound.current(), None, "the withdrawal hands the bound back");
+        tokio::time::sleep(std::time::Duration::from_secs(9)).await;
+        gate.open();
+    };
+    let (result, ()) = tokio::join!(exec.start(spec), drive);
+    result.expect("the start launches after the former T_stop");
+    let reports = session
+        .finish_start(a, Ok(()), now + secs(10))
+        .await
+        .unwrap();
+    assert!(super::is_running_report(&reports));
+    assert!(notice_reports(&reports).is_empty(), "no plan, no notice");
+    assert_eq!(exec.start_count(a), 1);
+    assert!(!session.state().tombstones.contains_key(&a));
+}
+
+/// A replacement with a later deadline moves a start in flight's bound to the
+/// new `T_stop`; a pull landing between the two stops launches.
+#[tokio::test(start_paused = true)]
+async fn a_later_replacement_mid_pull_moves_the_bound_to_the_new_stop() {
+    let (_dir, mut session, exec) = registered().await;
+    let (a, spec, gate) = start_held_at_the_pull(&mut session, &exec).await;
+    let now = exec.now();
+    let bound = spec.launch_bound.clone();
+
+    let drive = async {
+        session
+            .on_drain(drain_cmd(Some(now + secs(45)), secs(30)), now)
+            .await
+            .unwrap();
+        assert_eq!(bound.current(), Some(now + secs(5)));
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        session
+            .on_drain(drain_cmd(Some(now + secs(145)), secs(30)), now)
+            .await
+            .unwrap();
+        assert_eq!(
+            bound.current(),
+            Some(op_stop(now + secs(145), GRACE)),
+            "the new T_stop"
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(49)).await;
+        gate.open();
+    };
+    let (result, ()) = tokio::join!(exec.start(spec), drive);
+    result.expect("the pull lands before the new T_stop");
+    // Its operator notice time (T_stop − 30 s = now + 75 s) is still ahead.
+    let reports = session
+        .finish_start(a, Ok(()), now + secs(50))
+        .await
+        .unwrap();
+    assert!(super::is_running_report(&reports));
+    assert!(notice_reports(&reports).is_empty());
+    assert_eq!(session.next_notice_at(), Some(now + secs(75)));
+    assert_eq!(exec.start_count(a), 1);
+}
+
+/// After an operator withdrawal, an interruption still bounds a start in
+/// flight by its own stop.
+#[tokio::test(start_paused = true)]
+async fn an_interruption_after_an_operator_withdrawal_still_bounds_the_start() {
+    let (_dir, mut session, exec) = registered().await;
+    let (a, spec, _gate) = start_held_at_the_pull(&mut session, &exec).await;
+    let now = exec.now();
+    let bound = spec.launch_bound.clone();
+
+    let drive = async {
+        session
+            .on_drain(drain_cmd(Some(now + secs(45)), secs(30)), now)
+            .await
+            .unwrap();
+        session
+            .on_drain(drain_cmd(None, secs(30)), now)
+            .await
+            .unwrap();
+        assert_eq!(bound.current(), None);
+        session.on_interruption(now + secs(47), now).await.unwrap();
+        assert_eq!(bound.current(), Some(t_stop(now + secs(47))));
+    };
+    let began = tokio::time::Instant::now();
+    let (result, ()) = tokio::join!(exec.start(spec), drive);
+    assert_eq!(began.elapsed(), std::time::Duration::from_secs(7));
+    let reports = session
+        .finish_start(a, result, now + secs(7))
+        .await
+        .unwrap();
+    assert_eq!(terminal_outcome(&reports), Some(PREEMPTED));
+    assert_eq!(exec.start_count(a), 0);
+}
+
+/// A drain backfill's own `latest_start` still answers `Revoked` when it is
+/// the bound that passes, even under a plan whose stop is later.
+#[tokio::test(start_paused = true)]
+async fn a_backfill_bound_earlier_than_the_plans_stop_still_answers_revoked() {
+    let (_dir, mut session, exec) = registered().await;
+    exec.set_now(Timestamp::now());
+    let now = exec.now();
+    let _gate = exec.gate_pulls();
+    let ids = (AllocationId::new(), AttemptId::new(), JobId::new());
+    let body = start_body_with(ids, |sj| {
+        sj.latest_start_us = Some((now + secs(2)).as_micros());
+    });
+    session
+        .handle_command(command(1, 1, 2, body))
+        .await
+        .unwrap();
+    let [spec] = &session.take_pending_starts()[..] else {
+        panic!("exactly one start is queued");
+    };
+    let (result, drained) = tokio::join!(exec.start(spec.clone()), async {
+        session
+            .on_drain(drain_cmd(Some(now + secs(45)), secs(120)), now)
+            .await
+    });
+    drained.unwrap();
+    let reports = session.finish_start(ids.0, result, now).await.unwrap();
+    assert_eq!(terminal_outcome(&reports), Some(AttemptOutcome::Revoked));
+    assert!(!session.state().tombstones.contains_key(&ids.0));
+}
+
+#[tokio::test]
+async fn a_drain_arriving_after_t_notice_notifies_at_once_with_a_shortfall() {
+    let (_dir, mut session, exec) = registered().await;
+    let (a, _, _) = start_noticed(&mut session, 2).await;
+    let now = Timestamp::now();
+    // T_stop = now + 30 s, T_notice (120 s window) long past.
+    let d = now + secs(70);
+    let reports = session
+        .on_drain(drain_cmd(Some(d), secs(120)), now)
+        .await
+        .unwrap();
+    assert_eq!(
+        notice_reports(&reports),
+        vec![(a, PreemptReason::Drain, secs(30), secs(30))]
+    );
+    assert_eq!(exec.signals_delivered(a), vec![NoticeSignal::Sigusr1]);
+    assert_eq!(session.state().marks[&a].shortfall, secs(30));
+    assert_eq!(session.state().marks[&a].stop_at, t_stop(d));
+}
+
+#[tokio::test]
+async fn a_repeated_identical_drain_journals_and_reports_nothing() {
+    let (dir, mut session, exec) = registered().await;
+    let (a, _, _) = start_noticed(&mut session, 2).await;
+    let now = Timestamp::now();
+    let d = now + secs(70);
+    let first = session
+        .on_drain(drain_cmd(Some(d), secs(120)), now)
+        .await
+        .unwrap();
+    assert_eq!(first.len(), 1);
+    let journal_len = || std::fs::metadata(dir.path().join("journal")).unwrap().len();
+    let before = (journal_len(), session.state().clone());
+
+    for _ in 0..2 {
+        let again = session
+            .on_drain(drain_cmd(Some(d), secs(120)), now + secs(1))
+            .await
+            .unwrap();
+        assert!(again.is_empty());
+    }
+    // The same command through the wire path.
+    let via_command = session
+        .handle_command_settled(command(
+            1,
+            1,
+            9,
+            pb::agent_command::Body::Drain(drain_cmd(Some(d), secs(120))),
+        ))
+        .await
+        .unwrap();
+    assert!(via_command.is_empty());
+    assert_eq!((journal_len(), session.state().clone()), before);
+    assert_eq!(exec.signals_delivered(a).len(), 1);
+
+    // A withdrawal of nothing is a no-op too.
+    let (dir2, mut idle, _) = registered().await;
+    let len = std::fs::metadata(dir2.path().join("journal"))
+        .unwrap()
+        .len();
+    assert!(idle
+        .on_drain(drain_cmd(None, Duration::ZERO), now)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        std::fs::metadata(dir2.path().join("journal"))
+            .unwrap()
+            .len(),
+        len
+    );
+}
+
+#[tokio::test]
+async fn a_start_after_t_notice_is_refused_as_a_drain_and_one_before_it_starts() {
+    let (_dir, mut session, exec) = registered().await;
+    let now = Timestamp::now();
+    // Default StartJob: T_notice = D − 30 s − 10 s − 120 s, i.e. 20 s ago.
+    let d = now + secs(140);
+    session
+        .on_drain(drain_cmd(Some(d), secs(120)), now)
+        .await
+        .unwrap();
+    let late = (AllocationId::new(), AttemptId::new(), JobId::new());
+    let reports = session
+        .handle_command_settled(command(1, 1, 2, start_body(late, None)))
+        .await
+        .unwrap();
+    assert_eq!(terminal_outcome(&reports), Some(DRAINED));
+    let pb::agent_report::Body::AttemptStatus(status) = reports[0].body.clone().unwrap() else {
+        panic!("AttemptStatus");
+    };
+    assert_eq!(status.runtime_us, 0);
+    assert!(session.state().intents.is_empty(), "no intent");
+    assert_eq!(
+        session.state().tombstones[&late.0],
+        crate::journal::TombstoneReason::Preempt {
+            reason: PreemptReason::Drain
+        }
+    );
+    assert_eq!(exec.start_count(late.0), 0, "nothing was started");
+    assert!(session.state().exits.is_empty());
+
+    // A start whose launch bound also passed answers Revoked.
+    let stale = (AllocationId::new(), AttemptId::new(), JobId::new());
+    let body = start_body_with(stale, |sj| {
+        sj.latest_start_us = Some((Timestamp::now() - secs(1)).as_micros());
+    });
+    let reports = session
+        .handle_command_settled(command(1, 1, 3, body))
+        .await
+        .unwrap();
+    assert_eq!(terminal_outcome(&reports), Some(AttemptOutcome::Revoked));
+    assert_eq!(exec.start_count(stale.0), 0);
+
+    // Before its T_notice a start runs normally: a different StartJob under
+    // a shorter window has its notice time still ahead.
+    session
+        .on_drain(drain_cmd(Some(now + secs(1000)), secs(60)), now)
+        .await
+        .unwrap();
+    let ok = (AllocationId::new(), AttemptId::new(), JobId::new());
+    let reports = session
+        .handle_command_settled(command(1, 1, 4, start_body(ok, None)))
+        .await
+        .unwrap();
+    assert!(super::is_running_report(&reports));
+    assert!(exec.is_running(ok.0));
+    assert!(session.state().notice_intents.is_empty());
+}
+
+#[tokio::test]
+async fn the_heartbeat_echoes_the_operator_target_without_announcing_draining() {
+    let (_dir, mut session, _exec) = registered().await;
+    let now = Timestamp::now();
+    let heartbeat = |report: pb::AgentReport| match report.body.unwrap() {
+        pb::agent_report::Body::Heartbeat(hb) => hb,
+        other => panic!("not a heartbeat: {other:?}"),
+    };
+    let hb = heartbeat(session.heartbeat_report().await);
+    assert_eq!(hb.drain_target_us, None);
+
+    let d = now + secs(600);
+    session
+        .on_drain(drain_cmd(Some(d), secs(60)), now)
+        .await
+        .unwrap();
+    let hb = heartbeat(session.heartbeat_report().await);
+    assert_eq!(hb.drain_target_us, Some(d.as_micros()));
+    assert!(!hb.draining, "an operator plan alone does not announce");
+    assert_eq!(hb.interruption_deadline_us, None);
+    assert_eq!(session.plan_announcement(), (None, Some(d)));
+
+    let i = now + secs(300);
+    session.on_interruption(i, now).await.unwrap();
+    let hb = heartbeat(session.heartbeat_report().await);
+    assert!(hb.draining);
+    assert_eq!(hb.interruption_deadline_us, Some(i.as_micros()));
+    assert_eq!(hb.drain_target_us, Some(d.as_micros()));
+
+    // The withdrawal clears the echo.
+    session
+        .on_drain(drain_cmd(None, Duration::ZERO), now)
+        .await
+        .unwrap();
+    let hb = heartbeat(session.heartbeat_report().await);
+    assert_eq!(hb.drain_target_us, None);
+    assert!(hb.draining, "the interruption still announces");
+}
+
+// ---- recovery under an operator plan ----
+
+#[tokio::test]
+async fn recovery_keeps_the_operator_target_and_notifies_what_is_due() {
+    let (dir, mut session, exec) = registered().await;
+    let (a, _, _) = start_noticed(&mut session, 2).await;
+    let now = Timestamp::now();
+    // Journaled, but the agent died before T_notice: nothing was notified.
+    let d = now + secs(300);
+    session
+        .on_drain(drain_cmd(Some(d), secs(30)), now)
+        .await
+        .unwrap();
+    drop(session);
+
+    let mut session = restarted(&dir, &exec);
+    assert_eq!(session.drain_target(), Some(d));
+    assert!(!session.announces_draining());
+    let t_notice = t_stop(d) - secs(30);
+    assert!(session
+        .resume_notices(t_notice - secs(1))
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(session.next_notice_at(), Some(t_notice));
+
+    // The restart came after T_notice: the notice goes out then, with its
+    // shortfall.
+    let reports = session.resume_notices(t_notice + secs(10)).await.unwrap();
+    assert_eq!(
+        notice_reports(&reports),
+        vec![(a, PreemptReason::Drain, secs(20), secs(40))]
+    );
+    assert_eq!(session.state().notice_intents[&a], PreemptReason::Drain);
+    assert_eq!(session.drain_target(), Some(d));
+}
+
+#[tokio::test]
+async fn recovery_never_retires_the_operator_component_even_past_its_deadline() {
+    let (dir, mut session, exec) = registered().await;
+    let (a, _, _) = start_noticed(&mut session, 2).await;
+    let now = Timestamp::now();
+    let d = now + secs(300);
+    session
+        .on_drain(drain_cmd(Some(d), secs(30)), now)
+        .await
+        .unwrap();
+    // An interruption as well, so the plan has both components.
+    session.on_interruption(now + secs(200), now).await.unwrap();
+    assert!(session.state().marks.contains_key(&a));
+    drop(session);
+
+    // Back long after both deadlines.
+    let later = d + secs(600);
+    let mut session = restarted(&dir, &exec);
+    session.resume_notices(later).await.unwrap();
+    let plan = session.active_plan();
+    assert_eq!(plan.interruption, None, "the lapsed interruption retires");
+    assert_eq!(
+        plan.operator.map(|o| (o.deadline, o.notice_window)),
+        Some((d, secs(30))),
+        "the operator component stays"
+    );
+    assert_eq!(session.drain_target(), Some(d));
+    assert!(!session.announces_draining());
+
+    // Both facts are durable.
+    drop(session);
+    let session = restarted(&dir, &exec);
+    assert_eq!(session.active_plan().interruption, None);
+    assert_eq!(session.drain_target(), Some(d));
+}
+
+#[tokio::test]
+async fn recovery_with_only_a_lapsed_operator_plan_keeps_it() {
+    let (dir, mut session, exec) = registered().await;
+    let now = Timestamp::now();
+    session
+        .on_drain(drain_cmd(Some(now + secs(300)), secs(30)), now)
+        .await
+        .unwrap();
+    drop(session);
+
+    let mut session = restarted(&dir, &exec);
+    session.resume_notices(now + secs(100_000)).await.unwrap();
+    assert_eq!(session.drain_target(), Some(now + secs(300)));
+    assert!(!session.active_plan().is_empty());
 }

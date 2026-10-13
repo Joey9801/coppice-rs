@@ -45,17 +45,126 @@ pub struct StartSpec {
     /// Enforced runtime bound; the agent's watchdog kills the container past
     /// it (outcome `RuntimeLimitExceeded`). `None` = unbounded.
     pub max_runtime: Option<Duration>,
-    /// Drain backfill's launch bound (ADR 0044 §5): an executor must refuse
-    /// to start the container after this instant, checking at the last point
-    /// before it starts — after the image pull — with
-    /// [`StartError::LaunchBoundPassed`]. `None` = no bound.
+    /// The launch bound (ADR 0044 §5): an executor must refuse to start the
+    /// container after this instant, checking the bound's *current* value at
+    /// the last point before it starts — after the image pull — with
+    /// [`StartError::LaunchBoundPassed`]. Unbounded by default.
     ///
     /// It also bounds how long [`Executor::start`] may block: an executor
     /// must stop waiting on any open-ended pre-start step (the image pull)
-    /// once this instant passes, clean up, and refuse — a hung pull past the
-    /// bound could only end in a refusal, so the attempt is handed back for
-    /// a free requeue then rather than whenever the pull gives up.
-    pub latest_start: Option<Timestamp>,
+    /// once the bound passes, clean up, and refuse — a hung pull past the
+    /// bound could only end in a refusal. The bound may change while the
+    /// start is in flight (a drain plan arriving, replaced or withdrawn
+    /// mid-pull), so a wait goes through [`LaunchBound::wait`], which
+    /// re-reads it.
+    pub launch_bound: LaunchBound,
+}
+
+/// A start's launch bound, as the executor sees it: the latest instant the
+/// container may start, which the session re-sets — earlier or later —
+/// while the start is in flight (ADR 0044 §5).
+///
+/// Two sources set it: a drain backfill's `StartJob.latest_start`, fixed at
+/// dispatch, and the node's drain plan in force — a container still starting
+/// at its plan `T_stop` must not start at all, since the plan stops what
+/// remains, "including containers still starting". A start in flight has
+/// been given no notice, so a plan withdrawn or replaced by a later one
+/// loosens its bound again.
+#[derive(Debug, Clone)]
+pub struct LaunchBound(tokio::sync::watch::Receiver<Option<Timestamp>>);
+
+/// The session's half of a [`LaunchBound`]: sets it.
+#[derive(Debug)]
+pub struct LaunchBoundSetter(tokio::sync::watch::Sender<Option<Timestamp>>);
+
+impl LaunchBound {
+    /// No bound at all.
+    pub fn none() -> LaunchBound {
+        LaunchBound::fixed(None)
+    }
+
+    /// A bound nothing will change.
+    pub fn fixed(at: Option<Timestamp>) -> LaunchBound {
+        let (_, rx) = tokio::sync::watch::channel(at);
+        LaunchBound(rx)
+    }
+
+    /// A bound starting at `at`, with the setter that changes it.
+    pub fn channel(at: Option<Timestamp>) -> (LaunchBoundSetter, LaunchBound) {
+        let (tx, rx) = tokio::sync::watch::channel(at);
+        (LaunchBoundSetter(tx), LaunchBound(rx))
+    }
+
+    /// The bound as it stands now.
+    pub fn current(&self) -> Option<Timestamp> {
+        *self.0.borrow()
+    }
+
+    /// Whether the bound has passed at `now` (strictly after it).
+    pub fn passed_at(&self, now: Timestamp) -> Option<Timestamp> {
+        self.current().filter(|bound| now > *bound)
+    }
+
+    /// Await `fut`, giving up once the bound passes — re-reading it, and
+    /// recomputing the wait, every time it changes either way — and
+    /// answering `Err(bound)` with the bound that passed. `now` is the executor's wall clock; the wait itself is on
+    /// tokio's timer. Cancel-safe in the same way `fut` is.
+    pub async fn wait<F: std::future::Future>(
+        &self,
+        fut: F,
+        now: impl Fn() -> Timestamp,
+    ) -> Result<F::Output, Timestamp> {
+        let mut rx = self.0.clone();
+        let mut settable = true;
+        tokio::pin!(fut);
+        loop {
+            let bound = *rx.borrow_and_update();
+            let expiry = async {
+                match bound {
+                    Some(at) => tokio::time::sleep(launch_wait_budget(at, now())).await,
+                    None => std::future::pending().await,
+                }
+            };
+            // Biased toward the step: one that finished is handed back, and
+            // the caller's own pre-start check still holds the bound.
+            tokio::select! {
+                biased;
+                out = &mut fut => return Ok(out),
+                _ = expiry => {
+                    // Only the bound still in force refuses: one re-set in
+                    // the same instant (loosened, say) is waited on afresh.
+                    if let Some(at) = bound.filter(|_| *rx.borrow() == bound) {
+                        return Err(at);
+                    }
+                }
+                changed = rx.changed(), if settable => {
+                    // A dropped setter fixes the bound where it stands.
+                    if changed.is_err() {
+                        settable = false;
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl LaunchBoundSetter {
+    /// Set the bound to `at` — earlier, later, or none — waking a wait in
+    /// flight when it changes. Returns whether it changed.
+    pub fn set(&self, at: Option<Timestamp>) -> bool {
+        self.0.send_if_modified(|bound| {
+            if *bound == at {
+                return false;
+            }
+            *bound = at;
+            true
+        })
+    }
+
+    /// The bound as it stands now.
+    pub fn current(&self) -> Option<Timestamp> {
+        *self.0.borrow()
+    }
 }
 
 /// How long a start bounded by `latest_start` may still wait at `now` — zero
@@ -182,10 +291,11 @@ pub enum StartError {
     /// The container could not be started after a successful pull.
     #[error("start failed (user_error={user_error}): {message}")]
     Start { user_error: bool, message: String },
-    /// Drain backfill reached its launch point after its `latest_start`
-    /// (ADR 0044 §5): starting now could overrun the draining node's
-    /// horizon, so the launch is refused at the door.
-    #[error("launch refused: now is past the drain-backfill bound {latest_start}")]
+    /// The start reached its launch point after its [`LaunchBound`] (ADR
+    /// 0044 §5) — a drain backfill's `latest_start`, or the drain plan's
+    /// `T_stop` — so the launch is refused at the door. `latest_start` is the
+    /// bound that passed; the session tells which source set it.
+    #[error("launch refused: now is past the launch bound {latest_start}")]
     LaunchBoundPassed { latest_start: Timestamp },
 }
 
@@ -273,10 +383,11 @@ pub trait Executor: Send + Sync + 'static {
     /// fsynced by the caller (ADR 0009), so a running container always has
     /// durable intent behind it.
     ///
-    /// With a [`StartSpec::latest_start`] the call must not block past that
-    /// instant on an open-ended step such as the image pull: it gives up
-    /// there, undoes whatever it set up (created container, CPU grant, image
-    /// pin), and returns [`StartError::LaunchBoundPassed`].
+    /// With a [`StartSpec::launch_bound`] the call must not block past that
+    /// instant — as it stands, however it changed — on an open-ended step such
+    /// as the image pull: it gives up there, undoes whatever it set up
+    /// (created container, CPU grant, image pin), and returns
+    /// [`StartError::LaunchBoundPassed`].
     ///
     /// Desugared with an explicit `Send` bound: the live loop runs starts on
     /// their own tasks.
@@ -618,8 +729,8 @@ impl FakeExecutor {
     }
 
     /// Hold every subsequent start at its "pull" until the returned gate
-    /// opens. A start with a `latest_start` stops waiting once the bound
-    /// passes — measured from the fake's clock, waited on tokio's — and is
+    /// opens. A start with a launch bound stops waiting once the bound
+    /// (re-read as it changes) passes — measured from the fake's clock, waited on tokio's — and is
     /// refused, as the Docker executor gives up on a pull (ADR 0044 §5).
     pub fn gate_pulls(&self) -> PullGate {
         let (tx, rx) = tokio::sync::watch::channel(false);
@@ -639,14 +750,8 @@ impl Executor for FakeExecutor {
                 // A dropped gate counts as opened.
                 let _ = gate.wait_for(|open| *open).await;
             };
-            match spec.latest_start {
-                None => opened.await,
-                Some(latest_start) => {
-                    let budget = launch_wait_budget(latest_start, self.now());
-                    if tokio::time::timeout(budget, opened).await.is_err() {
-                        return Err(StartError::LaunchBoundPassed { latest_start });
-                    }
-                }
+            if let Err(latest_start) = spec.launch_bound.wait(opened, || self.now()).await {
+                return Err(StartError::LaunchBoundPassed { latest_start });
             }
         }
         let mut inner = self.lock();
@@ -656,10 +761,8 @@ impl Executor for FakeExecutor {
         // The launch-bound check at the fake's "after the pull" point, read
         // against the fake's own clock so a test can stand in for a slow pull
         // with `advance`.
-        if let Some(latest_start) = spec.latest_start {
-            if inner.now > latest_start {
-                return Err(StartError::LaunchBoundPassed { latest_start });
-            }
+        if let Some(latest_start) = spec.launch_bound.passed_at(inner.now) {
+            return Err(StartError::LaunchBoundPassed { latest_start });
         }
         *inner.start_counts.entry(spec.allocation).or_insert(0) += 1;
         let now = inner.now;
@@ -931,6 +1034,59 @@ mod tests {
         );
     }
 
+    /// A launch bound re-set while a wait is in flight is re-read either
+    /// way: tightened, the wait gives up at the new bound; loosened, a wait
+    /// that would have given up keeps going (ADR 0044 §5 — the seam the
+    /// Docker executor's pull wait and its pre-start check both go through).
+    #[tokio::test(start_paused = true)]
+    async fn a_launch_bound_re_set_mid_wait_is_waited_on_afresh() {
+        let epoch = tokio::time::Instant::now();
+        let base = Timestamp::now();
+        let at = move |s: i64| base + Duration::from_secs(s);
+        let clock = move || base + Duration::from_micros(epoch.elapsed().as_micros() as i64);
+
+        // Tightened from 60 s to 5 s at 1 s: gives up at 5 s.
+        let (setter, bound) = LaunchBound::channel(Some(at(60)));
+        let tighten = async {
+            tokio::time::sleep(StdDuration::from_secs(1)).await;
+            assert!(setter.set(Some(at(5))));
+            assert!(!setter.set(Some(at(5))), "the same bound is no change");
+        };
+        let (waited, ()) = tokio::join!(bound.wait(std::future::pending::<()>(), clock), tighten);
+        assert_eq!(waited, Err(at(5)));
+        assert_eq!(epoch.elapsed(), StdDuration::from_secs(5));
+        assert_eq!(bound.current(), Some(at(5)));
+        assert_eq!(bound.passed_at(at(5)), None);
+        assert!(bound.passed_at(at(6)).is_some());
+
+        // Loosened from 10 s to 20 s at 6 s, then lifted at 15 s: the step
+        // that finishes at 30 s is handed back.
+        let (setter, bound) = LaunchBound::channel(Some(at(10)));
+        let step = async {
+            tokio::time::sleep_until(epoch + StdDuration::from_secs(30)).await;
+            "pulled"
+        };
+        let loosen = async {
+            tokio::time::sleep_until(epoch + StdDuration::from_secs(6)).await;
+            assert!(setter.set(Some(at(20))));
+            tokio::time::sleep_until(epoch + StdDuration::from_secs(15)).await;
+            assert!(setter.set(None));
+        };
+        let (waited, ()) = tokio::join!(bound.wait(step, clock), loosen);
+        assert_eq!(waited, Ok("pulled"));
+        assert_eq!(epoch.elapsed(), StdDuration::from_secs(30));
+
+        // A bound with no setter left is fixed, and an absent one never
+        // expires.
+        let fixed = LaunchBound::fixed(Some(base));
+        assert_eq!(
+            fixed.wait(std::future::ready(7), clock).await,
+            Ok(7),
+            "a ready step wins even past the bound"
+        );
+        assert_eq!(LaunchBound::none().wait(async { 8 }, clock).await, Ok(8));
+    }
+
     #[tokio::test]
     async fn fake_start_stop_truth_wins() {
         let exec = FakeExecutor::new();
@@ -945,7 +1101,7 @@ mod tests {
             env: Default::default(),
             limits: Resources::ZERO,
             max_runtime: None,
-            latest_start: None,
+            launch_bound: LaunchBound::none(),
         })
         .await
         .unwrap();
@@ -981,7 +1137,7 @@ mod tests {
             env: Default::default(),
             limits: Resources::ZERO,
             max_runtime: None,
-            latest_start: None,
+            launch_bound: LaunchBound::none(),
         })
         .await
         .unwrap();

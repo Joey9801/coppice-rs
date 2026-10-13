@@ -20,7 +20,7 @@
 //! survives to the next resync (it is durable in the journal until then).
 
 use coppice_consensus::fs::Fs;
-use coppice_core::attempt::{AttemptOutcome, AttemptState};
+use coppice_core::attempt::{AttemptOutcome, AttemptState, PreemptReason};
 use coppice_core::id::{AllocationId, AttemptId, JobId, NodeId};
 use coppice_core::node::HostFacts;
 use coppice_core::resource::Resources;
@@ -88,14 +88,10 @@ pub struct Session<F: Fs, E: Executor> {
     /// Whether registration completed and the ObservedSet was sent — the gate
     /// before any non-`RegisterAccepted` command is honored (fail closed).
     registered: bool,
-    /// Advisory drain flag (ADR 0013): placement enforcement lives in apply,
-    /// so a StartJob that arrives drained is still executed (committed intent
-    /// predating the drain) — this only records the request.
-    drained: bool,
     /// Our own shutdown announcement (ADR 0041), carried on every `Register`
-    /// and `Heartbeat` from the moment shutdown begins. Distinct from
-    /// [`Session::drained`], which records the coordinator's advisory `Drain`
-    /// command: this one is agent-local intent, so it is **not** cleared by
+    /// and `Heartbeat` from the moment shutdown begins. Distinct from the
+    /// operator's deadline drain the coordinator's `Drain` command carries
+    /// (the journaled plan): this one is agent-local intent, so it is **not** cleared by
     /// [`Session::reset_session`] — a drain that begins while the stream is
     /// down lands as soon as the agent registers again.
     draining: bool,
@@ -131,6 +127,10 @@ pub struct Session<F: Fs, E: Executor> {
     health: Option<crate::health::AgentHealth>,
     /// Starts handed to the live loop and not yet finished.
     starting: std::collections::BTreeSet<AllocationId>,
+    /// The launch bound of each start in flight, re-set whenever the drain
+    /// plan changes (ADR 0044 §5): a container still starting at its plan
+    /// `T_stop` never starts.
+    launch_bounds: std::collections::BTreeMap<AllocationId, notice::StartBound>,
     pending_starts: Vec<StartSpec>,
     /// Stops handed to the live loop and not yet finished, so a stop is never
     /// spawned twice. Not durable: a restart finds the journaled tombstone and
@@ -146,7 +146,7 @@ pub struct Session<F: Fs, E: Executor> {
     /// Whether an interruption source is configured; gates the sizing warning.
     interruption_source: bool,
     /// The `(notice, abort_grace)` pairs already warned about.
-    sizing_warned: std::collections::BTreeSet<(Duration, Duration)>,
+    sizing_warned: std::collections::BTreeSet<(Duration, Duration, Duration)>,
 }
 
 impl<F: Fs, E: Executor> Session<F, E> {
@@ -170,7 +170,6 @@ impl<F: Fs, E: Executor> Session<F, E> {
             epoch,
             last_seq: None,
             registered: false,
-            drained: false,
             draining: false,
             armed_watchdogs: Vec::new(),
             pending_reaps: Vec::new(),
@@ -180,6 +179,7 @@ impl<F: Fs, E: Executor> Session<F, E> {
             preemptible_only: false,
             health: None,
             starting: Default::default(),
+            launch_bounds: Default::default(),
             pending_starts: Vec::new(),
             stopping: Default::default(),
             pending_stops: Vec::new(),
@@ -267,9 +267,6 @@ impl<F: Fs, E: Executor> Session<F, E> {
     }
     pub fn is_registered(&self) -> bool {
         self.registered
-    }
-    pub fn is_drained(&self) -> bool {
-        self.drained
     }
     /// Announce (or retract) this agent's own shutdown on every subsequent
     /// report (ADR 0041). The shutdown path sets it and then heartbeats
@@ -540,11 +537,8 @@ impl<F: Fs, E: Executor> Session<F, E> {
             Body::StartJob(sj) => self.start_job(sj).await,
             Body::StopJob(sp) => self.stop_job(sp).await,
             Body::PreemptJob(pj) => self.preempt_job(pj, Timestamp::now()).await,
-            Body::Drain(_) => {
-                self.drained = true;
-                tracing::info!(node = %self.node, "drain requested (advisory; enforcement is in apply)");
-                Ok(Vec::new())
-            }
+            // The operator's deadline drain, or its withdrawal (ADR 0044 §5).
+            Body::Drain(d) => self.on_drain(d, Timestamp::now()).await,
             Body::PrepareCache(pc) => {
                 // Forwarded to the cache manager as an advisory warm pull (ADR
                 // 0010, §7): still freely ignorable — dropped under high disk
@@ -645,8 +639,41 @@ impl<F: Fs, E: Executor> Session<F, E> {
             },
         };
 
-        if self.drained {
-            tracing::info!(node = %self.node, %alloc, "starting committed StartJob while drained (intent predates the drain)");
+        let abort_grace = runtime_bound(sj.abort_grace_us);
+        let cleanup_margin = runtime_bound(sj.drain_cleanup_margin_us);
+        // Clock read at the edge (workspace convention), once for both of the
+        // door's checks.
+        let now = Timestamp::now();
+        let launch_bound_passed = latest_start.is_some_and(|latest| now > latest);
+        // Under the operator's deadline drain, admission closed at this
+        // attempt's T_notice (ADR 0044 §5): a start reaching the agent from
+        // then on is refused at the door, resolving as the drain would have
+        // stopped it — `Preempted { Drain }`, runtime 0, a free retry. The
+        // tombstone makes a re-delivered StartJob answer the same. A launch
+        // bound already passed answers `Revoked` first, below.
+        if !launch_bound_passed {
+            if let Some(notice_at) = self.operator_notice_at(abort_grace, cleanup_margin) {
+                if now >= notice_at {
+                    let tombstone = TombstoneReason::Preempt {
+                        reason: PreemptReason::Drain,
+                    };
+                    self.journal.journal_tombstone(alloc, tombstone)?;
+                    self.state.tombstones.insert(alloc, tombstone);
+                    tracing::info!(
+                        node = %self.node,
+                        %alloc,
+                        %notice_at,
+                        "refusing a StartJob that arrived after the deadline drain's notice time"
+                    );
+                    return Ok(vec![self.terminal_status(
+                        alloc,
+                        attempt,
+                        job,
+                        tombstone.outcome(),
+                        Duration::ZERO,
+                    )]);
+                }
+            }
         }
 
         // Already validated by `resumption_env` above, which drops a StartJob
@@ -667,7 +694,8 @@ impl<F: Fs, E: Executor> Session<F, E> {
             max_runtime: sj.max_runtime_us.map(runtime_bound),
             notice_signal,
             notice: runtime_bound(sj.notice_us),
-            abort_grace: runtime_bound(sj.abort_grace_us),
+            abort_grace,
+            cleanup_margin,
         };
         self.journal.journal_intent(&intent)?;
         self.state.intents.insert(alloc, intent);
@@ -687,7 +715,7 @@ impl<F: Fs, E: Executor> Session<F, E> {
                 .and_then(|r| r.try_into().ok())
                 .unwrap_or(Resources::ZERO),
             max_runtime,
-            latest_start,
+            launch_bound: self.open_launch_bound(&intent, latest_start, now),
         };
         // The intent is durable; the start itself (an image pull can take
         // minutes) runs on the loop's own task, and its result comes back
@@ -697,12 +725,9 @@ impl<F: Fs, E: Executor> Session<F, E> {
         // without pulling. Otherwise the executor contract bounds the start:
         // it stops waiting on the pull once `latest_start` passes and checks
         // again just before the container starts.
-        if let Some(latest_start) = latest_start {
-            let now = Timestamp::now();
-            if now > latest_start {
-                let refused = Err(crate::executor::StartError::LaunchBoundPassed { latest_start });
-                return self.finish_start(alloc, refused, now).await;
-            }
+        if let (true, Some(latest_start)) = (launch_bound_passed, latest_start) {
+            let refused = Err(crate::executor::StartError::LaunchBoundPassed { latest_start });
+            return self.finish_start(alloc, refused, now).await;
         }
         self.pending_starts.push(spec);
         Ok(Vec::new())
@@ -721,6 +746,7 @@ impl<F: Fs, E: Executor> Session<F, E> {
         result: Result<(), crate::executor::StartError>,
         now: Timestamp,
     ) -> std::io::Result<Vec<pb::AgentReport>> {
+        let bound = self.launch_bounds.remove(&alloc);
         if !self.starting.remove(&alloc) {
             return Ok(Vec::new());
         }
@@ -743,16 +769,27 @@ impl<F: Fs, E: Executor> Session<F, E> {
                 let mut reports = vec![self.running_status(alloc, attempt, job)];
                 if self.state.tombstones.contains_key(&alloc) {
                     self.queue_stop(alloc, intent.abort_grace);
-                } else if self.state.plan.is_some() {
+                } else if !self.state.plan.is_empty() {
                     reports.extend(self.notify_under_plan(alloc, now).await?);
                 }
                 Ok(reports)
             }
             Err(e) => {
-                // A refused launch (drain backfill past its bound) takes this
-                // path too: journaled and reported terminal `Revoked`, runtime
-                // zero, exactly like any start that never ran.
-                let outcome = e.outcome();
+                // A refused launch takes this path too, journaled and reported
+                // with runtime zero like any start that never ran: `Revoked`
+                // past a drain backfill's own bound, or — past the bound the
+                // drain plan set — the plan's `Preempted { reason }`, its
+                // tombstone journaled first so the stop path and a
+                // re-delivered StartJob both read it that way (ADR 0044 §5).
+                let outcome = match bound.and_then(|b| b.plan_refusal(&e)) {
+                    Some(reason) => {
+                        let tombstone = TombstoneReason::Preempt { reason };
+                        self.journal.journal_tombstone(alloc, tombstone)?;
+                        self.state.tombstones.insert(alloc, tombstone);
+                        tombstone.outcome()
+                    }
+                    None => e.outcome(),
+                };
                 tracing::warn!(node = %self.node, %alloc, error = %e, "container start failed");
                 self.record_exit(alloc, attempt, job, outcome.clone(), Duration::ZERO)?;
                 Ok(vec![self.terminal_status(
@@ -965,7 +1002,9 @@ impl<F: Fs, E: Executor> Session<F, E> {
                 detected_capacity: self.detected_capacity.as_ref().map(Into::into),
                 // Registration rewrites the replicated flag, so a session that
                 // is not draining clears a stale announcement here (ADR 0041).
-                // An active interruption plan is a drain too (ADR 0044 §5).
+                // An interruption is a drain too (ADR 0044 §5); an operator
+                // deadline plan alone is not — admission stays the
+                // coordinator's to close, at T_notice.
                 draining: self.announces_draining(),
                 // Spot-only (ADR 0044 §4); registration rewrites the
                 // replicated flag, so a config change takes effect on restart.
@@ -1045,6 +1084,9 @@ impl<F: Fs, E: Executor> Session<F, E> {
             used,
             draining: self.announces_draining(),
             interruption_deadline_us: self.interruption_deadline().map(Timestamp::as_micros),
+            // The operator deadline this agent accepted (ADR 0044 §5): the
+            // echo the leader reconciles the node's drain record against.
+            drain_target_us: self.drain_target().map(Timestamp::as_micros),
         }))
     }
 
@@ -1362,7 +1404,11 @@ pub(crate) fn classify_stop(
 }
 
 mod notice;
-pub use notice::{StopRequest, DRAIN_CLEANUP_MARGIN};
+pub use notice::StopRequest;
+
+/// The drain plan as `Register`/`Heartbeat` announce it: the interruption
+/// deadline and the operator target (ADR 0044 §5).
+pub type PlanAnnouncement = (Option<Timestamp>, Option<Timestamp>);
 
 #[cfg(test)]
 mod tests;
