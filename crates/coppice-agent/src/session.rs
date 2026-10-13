@@ -539,6 +539,7 @@ impl<F: Fs, E: Executor> Session<F, E> {
         match body {
             Body::StartJob(sj) => self.start_job(sj).await,
             Body::StopJob(sp) => self.stop_job(sp).await,
+            Body::PreemptJob(pj) => self.preempt_job(pj, Timestamp::now()).await,
             Body::Drain(_) => {
                 self.drained = true;
                 tracing::info!(node = %self.node, "drain requested (advisory; enforcement is in apply)");

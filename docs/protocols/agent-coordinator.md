@@ -182,9 +182,24 @@ filesystem seam with the storage engine's crash-safety discipline) holds:
 
 ### Platform terminations (ADR 0044 §3, §5)
 
-The agent terminates attempts on the platform's behalf without a
-coordinator command. In this slice only an **external interruption** starts
-one (a spot reclaim, read from the configured `[preemption]
+Two things start a platform termination. The coordinator's
+**`PreemptJob { allocation, notice_us, reason }`** asks for one
+attempt: the scheduler chose it as a victim (`Priority` or `Relocation`,
+with the job it makes room for — ADR 0044 §4). The agent runs the steps
+below for it with `stop = delivery + notice_us`, the job's declared notice
+(never later than an active plan's `T_stop`). The command is re-sent on
+every session open and leadership change while the coordinator's record is
+unacknowledged, so it is idempotent on the journaled notice intent: an
+attempt already notified — by an earlier `PreemptJob`, a plan or an
+interruption — keeps its one stop time and its mark is simply re-reported;
+one already ended or being aborted is unaffected; an intent left without a
+mark by a crash is signalled again with a fresh countdown of the declared
+notice. The command carries no grace: the stop path runs with the
+`abort_grace_us` journaled from the attempt's `StartJob`, like every other
+platform stop.
+
+Otherwise the agent terminates attempts without a coordinator command. Only
+an **external interruption** starts that (a spot reclaim, read from the configured `[preemption]
 interruption_source`): it becomes the node's **drain plan** with the
 provider's reclaim time as its deadline `D`, journaled before anything else.
 From then on every `Register` and `Heartbeat` carries `draining = true` and
@@ -291,7 +306,10 @@ whose live attempt (`Dispatching | Running`, the job's current one) has a
 pending `abort_requested`: the abort's `StopJob` is routed once when it
 applies and is dropped if the node had no session then, so every
 ObservedSet re-derives it from replicated state (a `Dispatching`
-attempt is still adopted alongside). Reports carrying a stale
+attempt is still adopted alongside). A running container whose `Running`
+attempt carries an unacknowledged `Priority`/`Relocation` termination
+record gets its `PreemptJob` re-sent the same way (never for an unresolved
+allocation, whose stop or start is still in flight). Reports carrying a stale
 `node_epoch` are demoted to exactly that stop-only reconciliation input —
 they never become attempt-progress commands. The same diff runs
 continuously against heartbeat running-sets, with one asymmetry: an

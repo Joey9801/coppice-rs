@@ -201,13 +201,18 @@ followers, which is what lets followers serve reads and event streams.
    applies** does it send `StartJob` — the commit-before-send ordering of
    [command-catalog.md](command-catalog.md#dispatchattempt). A crash in the
    window between commit and send reconciles as *lost*, never as an untracked
-   container. On a `StopRequested` event it routes a `StopJob`. After any
-   event gap it resyncs by scanning the latest view for `Ready` attempts and
-   pending aborts; at-least-once delivery plus idempotent commands make the
-   rescan safe. The live `StopJob` is dropped when the node has no session, so
-   the ingestion ObservedSet diff re-derives pending-abort stops on every
-   session open, using the same predicate as the resync scan
-   (`dispatch::attempt_has_pending_abort`).
+   container. On a `StopRequested` event it routes a `StopJob`, and on a
+   `PreemptRequested` event a `PreemptJob` built from the event (the victim's
+   declared notice; the stop path's grace is the `abort_grace` the agent
+   journaled from `StartJob`) — ADR 0044 §4. After any
+   event gap it resyncs by scanning the latest view for `Ready` attempts,
+   pending aborts and pending preemptions; at-least-once delivery plus
+   idempotent commands make the rescan safe. The live `StopJob` and
+   `PreemptJob` are dropped when the node has no session, so the ingestion
+   ObservedSet diff re-derives both on every session open, using the same
+   predicates as the resync scan (`dispatch::attempt_has_pending_abort`,
+   `dispatch::attempt_has_pending_preempt`: a `Running` current attempt with
+   an unacknowledged `Priority`/`Relocation` record).
 
 10. **Scheduler driver** (leader-only). A loop of: take `views.latest()`, run
    the CPU-heavy `Scheduler::schedule` pass in `spawn_blocking` (the trait

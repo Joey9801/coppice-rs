@@ -253,6 +253,73 @@ impl<F: Fs, E: Executor> Session<F, E> {
         )
     }
 
+    // ---- PreemptJob (ADR 0044 §3, §4) ----
+
+    /// The coordinator's scheduler preemption of a running attempt.
+    ///
+    /// Idempotent on the journaled notice intent, because the coordinator
+    /// re-sends it until the mark is acknowledged: an attempt already
+    /// notified — by an earlier `PreemptJob`, or by a drain plan or
+    /// interruption — keeps its one stop time and only has its mark
+    /// re-reported (ADR 0044 §3's precedence table: "no effect, one record
+    /// per attempt"). One already ended, or already being stopped by an
+    /// abort, is past warning. Otherwise: intent → signal → mark → report,
+    /// with stop = delivery + the declared notice — never later than an
+    /// active plan's stop, since an interruption may shorten any window.
+    pub(super) async fn preempt_job(
+        &mut self,
+        pj: pb::PreemptJob,
+        now: Timestamp,
+    ) -> io::Result<Vec<pb::AgentReport>> {
+        let Some(alloc) = pj.allocation.and_then(|a| AllocationId::try_from(a).ok()) else {
+            tracing::warn!(node = %self.node, "dropping malformed PreemptJob (missing allocation)");
+            return Ok(Vec::new());
+        };
+        let Some(reason) = pj.reason.and_then(|r| PreemptReason::try_from(r).ok()) else {
+            tracing::warn!(node = %self.node, %alloc, "dropping malformed PreemptJob (missing reason)");
+            return Ok(Vec::new());
+        };
+        let Some(intent) = self.state.intents.get(&alloc).copied() else {
+            tracing::info!(node = %self.node, %alloc, "PreemptJob for an allocation this agent never started; ignoring");
+            return Ok(Vec::new());
+        };
+        if self.state.exits.contains_key(&alloc) || self.state.tombstones.contains_key(&alloc) {
+            return Ok(Vec::new());
+        }
+        // The coordinator preempts only attempts it has seen running, so a
+        // start still in flight here means this agent restarted since; the
+        // next session open re-derives the command once it runs.
+        if self.starting.contains(&alloc) {
+            tracing::debug!(node = %self.node, %alloc, "PreemptJob for a start still in flight; ignoring");
+            return Ok(Vec::new());
+        }
+        let notice = Duration::from_micros(i64::try_from(pj.notice_us).unwrap_or(i64::MAX));
+        let mut stop_at = now.saturating_add(notice);
+        if let Some(plan) = self.state.plan {
+            stop_at = stop_at.min(plan_stop_at(&plan, intent.abort_grace));
+        }
+        match (
+            self.state.notice_intents.get(&alloc).copied(),
+            self.state.marks.contains_key(&alloc),
+        ) {
+            // Already notified: one stop time per attempt.
+            (Some(_), true) => Ok(self.notice_report(alloc, now).into_iter().collect()),
+            // An intent whose signal may never have gone out (a mark that
+            // failed to journal): signal again, under the intent's reason.
+            (Some(journaled), false) => self.signal_and_mark(alloc, journaled, stop_at, now).await,
+            (None, _) => {
+                tracing::info!(
+                    node = %self.node,
+                    %alloc,
+                    ?reason,
+                    %notice,
+                    "scheduler preemption: notifying the attempt"
+                );
+                self.notify(alloc, reason, stop_at, now).await
+            }
+        }
+    }
+
     // ---- recovery (ADR 0044 §3, "Recovery of an intent …") ----
 
     /// Re-establish every notice from the recovered journal, once, before the
@@ -260,8 +327,9 @@ impl<F: Fs, E: Executor> Session<F, E> {
     /// must not wait for it.
     ///
     /// Under a plan, [`Session::notify_under_plan`] repairs whichever step a
-    /// crash interrupted. With no plan, an intent without a mark (only slice
-    /// 3's `PreemptJob` can leave one) gets a fresh countdown. A plan whose
+    /// crash interrupted. With no plan, an intent without a mark (only a
+    /// `PreemptJob` can leave one) gets a fresh countdown of the declared
+    /// notice. A plan whose
     /// deadline has passed means the host survived the reclaim: its stops all
     /// fire at once, then the plan is retired so the node is not draining
     /// forever.

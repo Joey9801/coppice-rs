@@ -4,9 +4,10 @@
 //! `DispatchAttempt`, and only after that commits does it send `StartJob` —
 //! the commit-before-send ordering of
 //! `docs/architecture/command-catalog.md#dispatchattempt`. On a
-//! `StopRequested` event it routes a `StopJob`. On gaining leadership (after
+//! `StopRequested` event it routes a `StopJob`, and on a `PreemptRequested`
+//! event a `PreemptJob` (ADR 0044 §4). On gaining leadership (after
 //! subscribing) and after any event gap it resyncs by scanning a *strong*
-//! view for `Ready` attempts and pending aborts — events emitted under a
+//! view for `Ready` attempts, pending aborts and pending preemptions — events emitted under a
 //! previous leader may predate this task's subscription
 //! (`docs/architecture/coordinator-runtime.md`, "Leader transitions").
 //!
@@ -24,11 +25,11 @@ use std::sync::Arc;
 use tokio::sync::watch;
 
 use coppice_consensus::{Applied, Consensus, ConsensusStatus, StateViews};
-use coppice_core::attempt::{AttemptOutcome, AttemptState};
+use coppice_core::attempt::{AttemptOutcome, AttemptState, PreemptReason};
 use coppice_core::id::{AllocationId, AttemptId, NodeId};
 use coppice_core::time::{Duration, Timestamp};
 use coppice_proto::pb::agent::v1::{
-    agent_command, AgentCommand, RegisterAccepted, StartJob, StopJob,
+    agent_command, AgentCommand, PreemptJob, RegisterAccepted, StartJob, StopJob,
 };
 use coppice_state::command::DispatchAttempt;
 use coppice_state::{AllocationRecord, AttemptRecord, Command, Event, JobRecord, StateMachine};
@@ -122,6 +123,19 @@ async fn handle_event<C: Consensus>(
         } => {
             route_stop(router, views, *node, *allocation).await;
         }
+        Event::PreemptRequested {
+            node,
+            allocation,
+            reason,
+            notice,
+            ..
+        } => {
+            // Built from the event alone: the published view routinely lags
+            // the event stream, and the termination record this answers may
+            // not be in it yet.
+            let command = preempt_job_command(*allocation, *notice, *reason);
+            route(router, *node, *allocation, command).await;
+        }
         _ => {}
     }
 }
@@ -176,6 +190,19 @@ async fn resync<C: Consensus>(consensus: &Arc<C>, views: &StateViews, router: &R
     for (node, allocation) in pending_aborts {
         route_stop(router, views, node, allocation).await;
     }
+
+    let pending_preempts: Vec<(NodeId, AllocationId, AgentCommand)> = view
+        .state()
+        .attempts
+        .values()
+        .filter_map(|record| {
+            pending_preempt_command(view.state(), record)
+                .map(|command| (record.attempt.node, record.attempt.allocation, command))
+        })
+        .collect();
+    for (node, allocation, command) in pending_preempts {
+        route(router, node, allocation, command).await;
+    }
 }
 
 /// Whether `record` is a live attempt whose agent must be told to stop it.
@@ -186,8 +213,8 @@ async fn resync<C: Consensus>(consensus: &Arc<C>, views: &StateViews, router: &R
 /// carries a pending `abort_requested`. `StopJob` is only routed live once
 /// (`Event::StopRequested`), and the gateway drops commands for a node with no
 /// session, so the rule is re-evaluated by [`resync`] (leadership gain, event
-/// gap) and by the ingestion `ObservedSet` diff (every session open). Future
-/// re-derived commands (preempt, drain) belong beside it.
+/// gap) and by the ingestion `ObservedSet` diff (every session open), beside
+/// [`attempt_has_pending_preempt`].
 pub(crate) fn attempt_has_pending_abort(
     state: &coppice_state::StateMachine,
     record: &AttemptRecord,
@@ -198,6 +225,49 @@ pub(crate) fn attempt_has_pending_abort(
     ) && state.jobs.get(&record.attempt.job).is_some_and(|job| {
         job.spec.abort_requested.is_some() && job.current_attempt() == Some(record.attempt.id)
     })
+}
+
+/// Whether `record` is a running attempt whose agent must still be told to
+/// terminate it for a scheduler preemption (ADR 0044 §3, §4): it is its
+/// job's current `Running` attempt and carries a `Priority` or `Relocation`
+/// record that no reported mark has acknowledged yet. `PreemptJob` is routed
+/// live once (`Event::PreemptRequested`) and dropped for a node with no
+/// session, so this is re-evaluated wherever [`attempt_has_pending_abort`] is.
+/// The agent is idempotent on its journaled notice intent, so a re-send to
+/// an agent that did act only re-reports the mark.
+pub(crate) fn attempt_has_pending_preempt(
+    state: &coppice_state::StateMachine,
+    record: &AttemptRecord,
+) -> bool {
+    record.attempt.state == AttemptState::Running
+        && record
+            .preemption
+            .is_some_and(|p| p.acknowledged.is_none() && p.reason.for_job().is_some())
+        && state
+            .jobs
+            .get(&record.attempt.job)
+            .is_some_and(|job| job.current_attempt() == Some(record.attempt.id))
+}
+
+/// The `PreemptJob` a pending preemption still owes its agent, re-derived
+/// from state: the victim job's declared notice.
+pub(crate) fn pending_preempt_command(
+    state: &StateMachine,
+    record: &AttemptRecord,
+) -> Option<AgentCommand> {
+    if !attempt_has_pending_preempt(state, record) {
+        return None;
+    }
+    let reason = record.preemption?.reason;
+    let notice = state
+        .jobs
+        .get(&record.attempt.job)
+        .map(|job| state.declared_notice(&job.spec))?;
+    Some(preempt_job_command(
+        record.attempt.allocation,
+        notice,
+        reason,
+    ))
 }
 
 /// Propose `DispatchAttempt`; only then route `StartJob` to the attempt's node.
@@ -285,6 +355,17 @@ async fn dispatch_ready_attempt<C: Consensus>(
         Err(e) => {
             tracing::error!(?attempt, error = %e, "dispatch: fatal propose error");
         }
+    }
+}
+
+async fn route(
+    router: &RouterHandle,
+    node: NodeId,
+    allocation: AllocationId,
+    command: AgentCommand,
+) {
+    if router.send(RouteCommand { node, command }).await.is_err() {
+        tracing::warn!(?allocation, "dispatch: router channel closed");
     }
 }
 
@@ -439,6 +520,25 @@ pub(crate) fn stop_job_command(allocation: AllocationId, grace: Duration) -> Age
         body: Some(agent_command::Body::StopJob(StopJob {
             allocation: Some(allocation.into()),
             grace_us: grace.as_micros(),
+        })),
+    }
+}
+
+/// Build the header-less `PreemptJob` command for a victim allocation (ADR
+/// 0044 §3): `notice` is the victim job's declared notice. The stop path's
+/// grace is not carried: the agent uses the `abort_grace` journaled from the
+/// attempt's `StartJob`, as it does for every platform stop.
+pub(crate) fn preempt_job_command(
+    allocation: AllocationId,
+    notice: Duration,
+    reason: PreemptReason,
+) -> AgentCommand {
+    AgentCommand {
+        header: None,
+        body: Some(agent_command::Body::PreemptJob(PreemptJob {
+            allocation: Some(allocation.into()),
+            notice_us: u64::try_from(notice.as_micros()).unwrap_or(0),
+            reason: Some(reason.into()),
         })),
     }
 }

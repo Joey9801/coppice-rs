@@ -36,11 +36,12 @@ use crate::leadership;
 use crate::liveness::NodeLiveness;
 use crate::tasks::agent_gateway::{InboundReport, RouteCommand, RouterHandle};
 use crate::tasks::dispatch::{
-    attempt_has_pending_abort, register_accepted_command, stop_job_command,
+    attempt_has_pending_abort, pending_preempt_command, register_accepted_command, stop_job_command,
 };
 use crate::usage::NodeUsage;
 
 use coppice_proto::pb::agent::v1::agent_report::Body;
+use coppice_proto::pb::agent::v1::AgentCommand;
 
 /// The verdict of normalizing one agent report.
 struct Normalized {
@@ -50,6 +51,9 @@ struct Normalized {
     /// (command-catalog.md: a running container with no replicated intent has
     /// nothing in state to mutate).
     stops: Vec<AllocationId>,
+    /// `PreemptJob`s re-derived from state for this node (ADR 0044 §4), routed
+    /// directly like the stops: the termination record is already replicated.
+    preempts: Vec<AgentCommand>,
     /// The report was a `Register`: send `RegisterAccepted` once the
     /// `RegisterNode` apply bumps the epoch (ADR 0009 step 2).
     register: bool,
@@ -62,6 +66,7 @@ impl Normalized {
         Normalized {
             commands: Vec::new(),
             stops: Vec::new(),
+            preempts: Vec::new(),
             register: false,
             liveness: true,
         }
@@ -206,6 +211,11 @@ async fn ingest<C: Consensus>(
             if router.send(RouteCommand { node, command }).await.is_err() {
                 tracing::warn!(?allocation, "ingestion: router closed routing StopJob");
             }
+        }
+    }
+    for command in normalized.preempts {
+        if router.send(RouteCommand { node, command }).await.is_err() {
+            tracing::warn!(%node, "ingestion: router closed routing PreemptJob");
         }
     }
 
@@ -773,11 +783,12 @@ fn observed_set_diff(
                     att.attempt.id,
                     att.attempt.state.clone(),
                     attempt_has_pending_abort(view.state(), att),
+                    pending_preempt_command(view.state(), att),
                     agent_may_report_revoked(att),
                 )
             });
 
-        let Some((attempt_id, attempt_state, abort_pending, revoked_ok)) = live else {
+        let Some((attempt_id, attempt_state, abort_pending, preempt, revoked_ok)) = live else {
             // No live intent: a running container is orphaned → stop; an
             // exited one is already settled → ignore.
             if obs.running {
@@ -798,6 +809,16 @@ fn observed_set_diff(
         let unresolved = !obs.running && obs.outcome.is_none();
         if (obs.running || unresolved) && abort_pending {
             out.stops.push(alloc_id);
+        }
+        // A pending scheduler preemption (ADR 0044 §4) is re-derived the same
+        // way, but only for a container the agent reports running: an
+        // unresolved one is a start or stop still in flight, and the start
+        // cannot be (the coordinator saw it running) while a stop in flight
+        // ends it anyway. An agent that already acted re-reports its mark.
+        if obs.running {
+            if let Some(command) = preempt {
+                out.preempts.push(command);
+            }
         }
 
         if stale {
@@ -1711,6 +1732,67 @@ mod tests {
             allocations: vec![observed(alloc, att, running, outcome.as_ref(), 0)],
         });
         normalize(&view_of(sm), &report(node, epoch, set), now())
+    }
+
+    /// `abort_fixture`'s running attempt, made a scheduler victim (ADR 0044
+    /// §4) with the record acknowledged or not.
+    fn preempt_fixture(
+        acknowledged: bool,
+    ) -> (StateMachine, NodeId, AttemptId, AllocationId, JobId) {
+        use coppice_core::attempt::{Acknowledged, Preemption};
+        let (mut sm, node, att, alloc) = abort_fixture(AttemptState::Running, false);
+        let for_job = JobId::new();
+        let record = sm.attempts.get_mut(&att).unwrap();
+        record.preemption = Some(Preemption {
+            reason: PreemptReason::Priority { for_job },
+            requested_at: now(),
+            acknowledged: acknowledged.then(|| Acknowledged {
+                notified_at: now(),
+                deadline: now() + Duration::from_secs(60),
+                notice_shortfall: Duration::ZERO,
+            }),
+        });
+        (sm, node, att, alloc, for_job)
+    }
+
+    /// `PreemptJob` is routed once, at `PreemptRequested`, and dropped for a
+    /// node with no session; the reconnect ObservedSet re-derives it while
+    /// the record is unacknowledged.
+    #[test]
+    fn observed_set_resends_a_pending_preempt_job() {
+        let (sm, node, att, alloc, for_job) = preempt_fixture(false);
+        let out = abort_diff(sm, node, att, alloc, true, 5);
+        assert!(out.stops.is_empty());
+        let [command] = out.preempts.as_slice() else {
+            panic!("expected one PreemptJob, got {:?}", out.preempts);
+        };
+        let Some(coppice_proto::pb::agent::v1::agent_command::Body::PreemptJob(pj)) = &command.body
+        else {
+            panic!("expected PreemptJob, got {command:?}");
+        };
+        assert_eq!(
+            AllocationId::try_from(pj.allocation.clone().unwrap()).unwrap(),
+            alloc
+        );
+        assert_eq!(
+            PreemptReason::try_from(pj.reason.clone().unwrap()).unwrap(),
+            PreemptReason::Priority { for_job }
+        );
+    }
+
+    #[test]
+    fn observed_set_no_preempt_job_once_acknowledged_or_not_running() {
+        let (sm, node, att, alloc, _) = preempt_fixture(true);
+        let out = abort_diff(sm, node, att, alloc, true, 5);
+        assert!(out.preempts.is_empty(), "the mark already landed");
+
+        // Unresolved (a stop in flight): left alone.
+        let (sm, node, att, alloc, _) = preempt_fixture(false);
+        let set = Body::ObservedSet(ObservedSet {
+            allocations: vec![observed(alloc, att, false, None, 0)],
+        });
+        let out = normalize(&view_of(sm), &report(node, 5, set), now());
+        assert!(out.preempts.is_empty());
     }
 
     /// The StopJob for a pending abort is dropped when the node has no

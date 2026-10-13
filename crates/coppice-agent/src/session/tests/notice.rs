@@ -956,3 +956,199 @@ async fn a_reconnect_while_a_stop_holds_an_exit_reports_it_unresolved() {
         Some(pbcore::AttemptOutcome::from(&PREEMPTED))
     );
 }
+
+// ---- PreemptJob: the scheduler's preemption (ADR 0044 §3, §4) ----
+
+fn priority_for(job: JobId) -> PreemptReason {
+    PreemptReason::Priority { for_job: job }
+}
+
+fn preempt_body(alloc: AllocationId, reason: PreemptReason) -> pb::agent_command::Body {
+    pb::agent_command::Body::PreemptJob(pb::PreemptJob {
+        allocation: Some(alloc.into()),
+        notice_us: NOTICE.as_micros() as u64,
+        reason: Some(reason.into()),
+    })
+}
+
+/// Every `attempt_notice` in `reports`, as `(allocation, reason)`.
+fn notice_reasons(reports: &[pb::AgentReport]) -> Vec<(AllocationId, PreemptReason)> {
+    reports
+        .iter()
+        .filter_map(|r| match r.body.as_ref()? {
+            pb::agent_report::Body::AttemptNotice(n) => Some((
+                n.allocation.clone().unwrap().try_into().unwrap(),
+                PreemptReason::try_from(n.reason.clone().unwrap()).unwrap(),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn preempt_job_notifies_then_stops_the_attempt_preempted_for_priority() {
+    let (_dir, mut session, exec) = registered().await;
+    let (a, _, _) = start_noticed(&mut session, 2).await;
+    let reason = priority_for(JobId::new());
+
+    let before = Timestamp::now();
+    let reports = session
+        .handle_command_settled(command(1, 1, 3, preempt_body(a, reason)))
+        .await
+        .unwrap();
+    let after = Timestamp::now();
+
+    // Intent journaled, signal delivered, mark journaled, notice reported.
+    assert_eq!(notice_reasons(&reports), vec![(a, reason)]);
+    assert_eq!(exec.signals_delivered(a), vec![NoticeSignal::Sigusr1]);
+    assert_eq!(session.state().notice_intents[&a], reason);
+    let mark = session.state().marks[&a];
+    assert!(mark.stop_at >= before + NOTICE && mark.stop_at <= after + NOTICE);
+    assert_eq!(mark.shortfall, Duration::ZERO);
+
+    // Still running through the window; stopped and classified at its end.
+    assert!(exec.is_running(a));
+    assert_eq!(session.next_stop_at(), Some(mark.stop_at));
+    let reports = run_due_stops(&mut session, &exec, mark.stop_at).await;
+    assert_eq!(
+        terminal_outcome(&reports),
+        Some(AttemptOutcome::Preempted { reason })
+    );
+    assert_eq!(
+        session.state().tombstones[&a],
+        crate::journal::TombstoneReason::Preempt { reason }
+    );
+}
+
+#[tokio::test]
+async fn a_repeated_preempt_job_keeps_the_one_stop_time_and_re_reports_the_mark() {
+    let (_dir, mut session, exec) = registered().await;
+    let (a, _, _) = start_noticed(&mut session, 2).await;
+    let reason = priority_for(JobId::new());
+    session
+        .handle_command_settled(command(1, 1, 3, preempt_body(a, reason)))
+        .await
+        .unwrap();
+    let mark = session.state().marks[&a];
+
+    // The coordinator's re-send (a fresh sequence number, after a reconnect
+    // or a leadership change): no second signal, no new stop time, and the
+    // mark is reported again so an acknowledgement lost in transit lands.
+    let reports = session
+        .handle_command_settled(command(1, 1, 4, preempt_body(a, reason)))
+        .await
+        .unwrap();
+    assert_eq!(notice_reasons(&reports), vec![(a, reason)]);
+    assert_eq!(exec.signals_delivered(a).len(), 1);
+    assert_eq!(session.state().marks[&a], mark);
+
+    // A duplicate sequence number is not acted on at all.
+    let reports = session
+        .handle_command_settled(command(1, 1, 4, preempt_body(a, reason)))
+        .await
+        .unwrap();
+    assert!(reports.is_empty());
+}
+
+#[tokio::test]
+async fn preempt_job_for_an_attempt_already_under_an_interruption_has_no_effect() {
+    let (_dir, mut session, exec) = registered().await;
+    let (a, _, _) = start_noticed(&mut session, 2).await;
+    let now = Timestamp::now();
+    session
+        .on_interruption(now + Duration::from_secs(120), now)
+        .await
+        .unwrap();
+    let mark = session.state().marks[&a];
+
+    let reports = session
+        .handle_command_settled(command(
+            1,
+            1,
+            3,
+            preempt_body(a, priority_for(JobId::new())),
+        ))
+        .await
+        .unwrap();
+    // One record per attempt: the interruption's notice stands, reason and
+    // stop alike.
+    assert_eq!(notice_reasons(&reports), vec![(a, INTERRUPTED)]);
+    assert_eq!(exec.signals_delivered(a).len(), 1);
+    assert_eq!(session.state().notice_intents[&a], INTERRUPTED);
+    assert_eq!(session.state().marks[&a], mark);
+}
+
+#[tokio::test]
+async fn preempt_job_for_an_ended_or_aborting_attempt_does_nothing() {
+    let (_dir, mut session, exec) = registered().await;
+    let (a, _, _) = start_noticed(&mut session, 2).await;
+    let (b, _, _) = start_noticed(&mut session, 3).await;
+    let reason = priority_for(JobId::new());
+
+    // `a` already exited on its own.
+    exec.finish(a, exit(0, ExitCause::Natural, &exec));
+    session
+        .handle_observed_exit(a, exit(0, ExitCause::Natural, &exec))
+        .await
+        .unwrap();
+    // `b` is being aborted.
+    session
+        .handle_command_settled(command(1, 1, 4, super::stop_job(b)))
+        .await
+        .unwrap();
+
+    for (seq, alloc) in [(5, a), (6, b)] {
+        let reports = session
+            .handle_command_settled(command(1, 1, seq, preempt_body(alloc, reason)))
+            .await
+            .unwrap();
+        assert!(notice_reasons(&reports).is_empty());
+        assert!(exec.signals_delivered(alloc).is_empty());
+        assert!(!session.state().notice_intents.contains_key(&alloc));
+    }
+}
+
+#[tokio::test]
+async fn a_workload_exiting_non_zero_on_a_priority_notice_is_preempted_for_priority() {
+    let (_dir, mut session, exec) = registered().await;
+    let (a, _, _) = start_noticed(&mut session, 2).await;
+    exec.exit_on_signal(a, NoticeSignal::Sigusr1, 75);
+    let reason = priority_for(JobId::new());
+    session
+        .handle_command_settled(command(1, 1, 3, preempt_body(a, reason)))
+        .await
+        .unwrap();
+    assert!(!exec.is_running(a), "it trapped the signal and exited");
+    let reports = session
+        .handle_observed_exit(a, exit(75, ExitCause::Natural, &exec))
+        .await
+        .unwrap();
+    assert_eq!(
+        terminal_outcome(&reports),
+        Some(AttemptOutcome::Preempted { reason })
+    );
+}
+
+#[tokio::test]
+async fn recovery_of_a_preempt_job_intent_without_a_mark_counts_down_afresh() {
+    let (dir, mut session, exec) = registered().await;
+    let (a, _, _) = start_noticed(&mut session, 2).await;
+    let reason = priority_for(JobId::new());
+    // The crash lands between the intent and the signal.
+    session.journal.journal_notice_intent(a, reason).unwrap();
+    drop(session);
+
+    let mut session = restarted(&dir, &exec);
+    let now = Timestamp::now();
+    let reports = session.resume_notices(now).await.unwrap();
+    assert_eq!(notice_reasons(&reports), vec![(a, reason)]);
+    assert_eq!(exec.signals_delivered(a), vec![NoticeSignal::Sigusr1]);
+    let mark = session.state().marks[&a];
+    assert_eq!(mark.stop_at, now + NOTICE);
+    assert_eq!(mark.shortfall, Duration::ZERO);
+    let reports = run_due_stops(&mut session, &exec, mark.stop_at).await;
+    assert_eq!(
+        terminal_outcome(&reports),
+        Some(AttemptOutcome::Preempted { reason })
+    );
+}
