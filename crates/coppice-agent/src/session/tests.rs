@@ -177,23 +177,31 @@ async fn command_before_registration_is_dropped() {
     assert!(session.state().intents.is_empty());
 }
 
+/// A deadline drain far enough out to be inert.
+fn drain_body() -> pb::Drain {
+    pb::Drain {
+        deadline_us: Some((Timestamp::now() + Duration::from_secs(3600)).as_micros()),
+        notice_window_us: Duration::from_secs(60).as_micros() as u64,
+    }
+}
+
 #[tokio::test]
 async fn fencing_rejects_lower_term_and_epoch() {
     let (_dir, mut session, _exec) = session();
     register(&mut session, 5, 3, 1).await;
 
-    // Lower term → rejected: drain flag stays false.
+    // Lower term → rejected: no drain target is set.
     session
         .handle_command_settled(command(
             4,
             3,
             2,
-            pb::agent_command::Body::Drain(pb::Drain {}),
+            pb::agent_command::Body::Drain(drain_body()),
         ))
         .await
         .unwrap();
     assert!(
-        !session.is_drained(),
+        session.drain_target().is_none(),
         "a lower-term command must be rejected"
     );
 
@@ -203,12 +211,12 @@ async fn fencing_rejects_lower_term_and_epoch() {
             5,
             2,
             2,
-            pb::agent_command::Body::Drain(pb::Drain {}),
+            pb::agent_command::Body::Drain(drain_body()),
         ))
         .await
         .unwrap();
     assert!(
-        !session.is_drained(),
+        session.drain_target().is_none(),
         "a lower-epoch command must be rejected"
     );
 
@@ -218,11 +226,14 @@ async fn fencing_rejects_lower_term_and_epoch() {
             5,
             3,
             2,
-            pb::agent_command::Body::Drain(pb::Drain {}),
+            pb::agent_command::Body::Drain(drain_body()),
         ))
         .await
         .unwrap();
-    assert!(session.is_drained(), "an in-band command must be accepted");
+    assert!(
+        session.drain_target().is_some(),
+        "an in-band command must be accepted"
+    );
 }
 
 #[tokio::test]

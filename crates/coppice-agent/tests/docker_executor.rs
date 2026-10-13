@@ -351,7 +351,7 @@ mod harness {
             env: Default::default(),
             limits,
             max_runtime: None,
-            latest_start: None,
+            launch_bound: coppice_agent::executor::LaunchBound::none(),
         }
     }
 

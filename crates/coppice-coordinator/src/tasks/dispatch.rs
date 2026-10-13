@@ -29,7 +29,7 @@ use coppice_core::attempt::{AttemptOutcome, AttemptState, PreemptReason};
 use coppice_core::id::{AllocationId, AttemptId, NodeId};
 use coppice_core::time::{Duration, Timestamp};
 use coppice_proto::pb::agent::v1::{
-    agent_command, AgentCommand, PreemptJob, RegisterAccepted, StartJob, StopJob,
+    agent_command, AgentCommand, Drain, PreemptJob, RegisterAccepted, StartJob, StopJob,
 };
 use coppice_state::command::DispatchAttempt;
 use coppice_state::{AllocationRecord, AttemptRecord, Command, Event, JobRecord, StateMachine};
@@ -214,7 +214,8 @@ async fn resync<C: Consensus>(consensus: &Arc<C>, views: &StateViews, router: &R
 /// (`Event::StopRequested`), and the gateway drops commands for a node with no
 /// session, so the rule is re-evaluated by [`resync`] (leadership gain, event
 /// gap) and by the ingestion `ObservedSet` diff (every session open), beside
-/// [`attempt_has_pending_preempt`].
+/// [`attempt_has_pending_preempt`]. The deadline drain's rule,
+/// [`drain_command_for`], sits beside them.
 pub(crate) fn attempt_has_pending_abort(
     state: &coppice_state::StateMachine,
     record: &AttemptRecord,
@@ -268,6 +269,41 @@ pub(crate) fn pending_preempt_command(
         notice,
         reason,
     ))
+}
+
+/// The `Drain` command the agent on `node` must be sent, given the operator
+/// deadline it last echoed (`Heartbeat.drain_target_us`), or `None` when it
+/// already holds what the record says (ADR 0044 §5, "Durability").
+///
+/// The "what should this agent have been told" rule for deadline drains, in
+/// the same pure form as [`attempt_has_pending_abort`]: the node's drain
+/// record is the source of intent. A deadline the echo does not match sends
+/// `Drain { deadline_us }`; no deadline on the record (no drain, a regular
+/// drain, or no node record at all) while the echo reports one sends the
+/// withdrawal, `deadline_us` unset. A regular drain on its own sends nothing.
+/// Re-sent on every mismatching heartbeat — the agent treats a target it
+/// already holds as a no-op — so a command lost to a disconnect or a
+/// leadership change is healed by the next leader to see the mismatch.
+pub(crate) fn drain_command_for(
+    state: &StateMachine,
+    node: NodeId,
+    echo: Option<Timestamp>,
+) -> Option<AgentCommand> {
+    let target = state
+        .nodes
+        .get(&node)
+        .and_then(|record| record.node.drain)
+        .and_then(|drain| drain.deadline);
+    if target == echo {
+        return None;
+    }
+    Some(AgentCommand {
+        header: None,
+        body: Some(agent_command::Body::Drain(Drain {
+            deadline_us: target.map(Timestamp::as_micros),
+            notice_window_us: state.policy.preemption_notice_cap.as_micros().max(0) as u64,
+        })),
+    })
 }
 
 /// Propose `DispatchAttempt`; only then route `StartJob` to the attempt's node.
@@ -434,6 +470,10 @@ pub(crate) fn start_job_command(
             // runs a platform termination's stop path without asking us.
             abort_grace_us: state.policy.abort_grace.as_micros().max(0) as u64,
             latest_start_us: latest_start(state, job, attempt).map(|t| t.as_micros()),
+            // The policy's margin as of this dispatch (ADR 0044 §5): with
+            // `abort_grace`, it fixes this attempt's T_stop under any drain
+            // plan the agent runs.
+            drain_cleanup_margin_us: state.policy.drain_cleanup_margin.as_micros().max(0) as u64,
         })),
     }
 }
@@ -798,9 +838,69 @@ mod tests {
             state.policy.abort_grace.as_micros() as u64
         );
         assert_eq!(
+            sj.drain_cleanup_margin_us,
+            state.policy.drain_cleanup_margin.as_micros() as u64,
+            "the policy's margin rides every dispatch (ADR 0044 §5)"
+        );
+        assert_eq!(
             sj.notice_signal,
             coppice_proto::pb::core::v1::NoticeSignal::Sigusr1 as i32
         );
+    }
+
+    /// ADR 0044 §5, "Durability": the record is the intent and the echo is
+    /// what the agent holds; only a mismatch is a command, and a regular
+    /// drain is never one.
+    #[test]
+    fn drain_command_for_reconciles_the_record_against_the_echo() {
+        let node = NodeId::new();
+        let deadline = Timestamp::UNIX_EPOCH + Duration::from_hours(2);
+        let other = deadline + Duration::from_mins(10);
+        let mut state = StateMachine::default();
+        state
+            .nodes
+            .insert(node, crate::test_support::node_record(node, 1, true));
+        let drain_of = |cmd: Option<AgentCommand>| match cmd.and_then(|c| c.body) {
+            Some(agent_command::Body::Drain(d)) => Some(d),
+            None => None,
+            other => panic!("expected a Drain, got {other:?}"),
+        };
+
+        // No drain, nothing echoed: nothing to say.
+        assert_eq!(drain_command_for(&state, node, None), None);
+        // A regular drain sends nothing either.
+        state.nodes.get_mut(&node).unwrap().node.drain = Some(coppice_core::node::Drain {
+            requested_at: Timestamp::UNIX_EPOCH,
+            deadline: None,
+        });
+        assert_eq!(drain_command_for(&state, node, None), None);
+        // ...but a stale echo of an earlier deadline is withdrawn.
+        let withdrawal = drain_of(drain_command_for(&state, node, Some(deadline))).unwrap();
+        assert_eq!(withdrawal.deadline_us, None);
+
+        // A deadline drain: sent until echoed, with the policy's cap as the
+        // common window.
+        state.nodes.get_mut(&node).unwrap().node.drain = Some(coppice_core::node::Drain {
+            requested_at: Timestamp::UNIX_EPOCH,
+            deadline: Some(deadline),
+        });
+        for echo in [None, Some(other)] {
+            let sent = drain_of(drain_command_for(&state, node, echo)).unwrap();
+            assert_eq!(sent.deadline_us, Some(deadline.as_micros()));
+            assert_eq!(
+                sent.notice_window_us,
+                state.policy.preemption_notice_cap.as_micros() as u64
+            );
+        }
+        assert_eq!(drain_command_for(&state, node, Some(deadline)), None);
+
+        // A node the record no longer holds is treated as undrained.
+        let gone = NodeId::new();
+        assert_eq!(drain_command_for(&state, gone, None), None);
+        assert!(drain_of(drain_command_for(&state, gone, Some(deadline)))
+            .unwrap()
+            .deadline_us
+            .is_none());
     }
 
     #[test]

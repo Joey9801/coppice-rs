@@ -29,8 +29,8 @@ use super::{
     LABEL_IMAGE_BYTES, LABEL_IMAGE_DIGEST, LABEL_JOB, LABEL_NODE,
 };
 use crate::executor::{
-    launch_wait_budget, ContainerState, ExecutorError, ObservedContainer, SignalOutcome,
-    StartError, StartSpec, StopOutcome,
+    ContainerState, ExecutorError, ObservedContainer, SignalOutcome, StartError, StartSpec,
+    StopOutcome,
 };
 use crate::pressure::DiskPressure;
 use crate::telemetry::FilesystemSink;
@@ -84,9 +84,10 @@ impl Drop for PinGuard<'_> {
 }
 
 /// Start a container for `spec` (docker-executor.md §3: Resolving → Pulling →
-/// Creating → Starting). A drain backfill (ADR 0044 §5) is refused once past
-/// its `latest_start`: the pull is abandoned at the bound, and the bound is
-/// checked again just before Starting. Idempotent per allocation (§5): a
+/// Creating → Starting). A start is refused once past its launch bound (ADR
+/// 0044 §5: a drain backfill's `latest_start`, or a drain plan's `T_stop`,
+/// which may change mid-pull): the pull is abandoned at the bound, and the
+/// bound is checked again just before Starting. Idempotent per allocation (§5): a
 /// duplicate delivery racing an in-flight start returns `Ok(())`, and the
 /// deterministic name plus adopt-on-conflict is the real backstop.
 /// `max_runtime` is the session watchdog's concern and is ignored here.
@@ -141,16 +142,13 @@ async fn start_inner(inner: &Inner, spec: &StartSpec) -> Result<(), StartError> 
     //    re-pinned from its label — is not this call's to hand back.) No
     //    container or CPU grant exists yet.
     let fetch = inner.cache.fetch(&spec.image, Some(spec.allocation));
-    let cache::FetchedImage { inspect, digest } = match spec.latest_start {
-        None => fetch.await?,
-        Some(latest_start) => {
-            let budget = launch_wait_budget(latest_start, Timestamp::now());
-            match tokio::time::timeout(budget, fetch).await {
-                Ok(fetched) => fetched?,
-                Err(_) => return Err(StartError::LaunchBoundPassed { latest_start }),
-            }
-        }
-    };
+    //    The bound may change while the pull runs (a drain plan landing,
+    //    replaced or withdrawn mid-pull); `LaunchBound::wait` re-reads it.
+    let cache::FetchedImage { inspect, digest } =
+        match spec.launch_bound.wait(fetch, Timestamp::now).await {
+            Ok(fetched) => fetched?,
+            Err(latest_start) => return Err(StartError::LaunchBoundPassed { latest_start }),
+        };
     // The pin is placed; every failure path below must release it (the guard's
     // Drop). A running/exited container re-pins itself from its label; a failed
     // start must not leak a pin that no container will ever release (§7).
@@ -257,18 +255,17 @@ async fn start_inner(inner: &Inner, spec: &StartSpec) -> Result<(), StartError> 
     }
 
     // 6. Launch bound (ADR 0044 §5): drain backfill may not start after its
-    //    `latest_start`. Checked again here, after the pull and the create —
+    //    `latest_start`, nor anything after its drain plan's `T_stop` — the
+    //    bound's current value, however it changed. Checked again here, after the pull and the create —
     //    the last point before the container actually starts — so a pull
     //    that finished just inside the bound, plus the create, cannot carry
     //    it past the draining node's horizon. Refused like a failed start:
     //    remove the created container and release the grant (the pin guard
     //    hands the image pin back).
-    if let Some(latest_start) = spec.latest_start {
-        if Timestamp::now() > latest_start {
-            remove_best_effort(inner, &name, false).await;
-            rollback_cpu(inner, spec.allocation, cpu.as_ref()).await;
-            return Err(StartError::LaunchBoundPassed { latest_start });
-        }
+    if let Some(latest_start) = spec.launch_bound.passed_at(Timestamp::now()) {
+        remove_best_effort(inner, &name, false).await;
+        rollback_cpu(inner, spec.allocation, cpu.as_ref()).await;
+        return Err(StartError::LaunchBoundPassed { latest_start });
     }
 
     // 7. Start. 304 (already started) is `Ok` — bollard maps NOT_MODIFIED to

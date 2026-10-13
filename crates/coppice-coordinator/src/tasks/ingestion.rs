@@ -36,7 +36,8 @@ use crate::leadership;
 use crate::liveness::NodeLiveness;
 use crate::tasks::agent_gateway::{InboundReport, RouteCommand, RouterHandle};
 use crate::tasks::dispatch::{
-    attempt_has_pending_abort, pending_preempt_command, register_accepted_command, stop_job_command,
+    attempt_has_pending_abort, drain_command_for, pending_preempt_command,
+    register_accepted_command, stop_job_command,
 };
 use crate::usage::NodeUsage;
 
@@ -54,6 +55,9 @@ struct Normalized {
     /// `PreemptJob`s re-derived from state for this node (ADR 0044 §4), routed
     /// directly like the stops: the termination record is already replicated.
     preempts: Vec<AgentCommand>,
+    /// Other agent commands to route directly to this node, never log
+    /// commands: the deadline drain's reconciliation (ADR 0044 §5).
+    agent_commands: Vec<AgentCommand>,
     /// The report was a `Register`: send `RegisterAccepted` once the
     /// `RegisterNode` apply bumps the epoch (ADR 0009 step 2).
     register: bool,
@@ -67,6 +71,7 @@ impl Normalized {
             commands: Vec::new(),
             stops: Vec::new(),
             preempts: Vec::new(),
+            agent_commands: Vec::new(),
             register: false,
             liveness: true,
         }
@@ -216,6 +221,13 @@ async fn ingest<C: Consensus>(
     for command in normalized.preempts {
         if router.send(RouteCommand { node, command }).await.is_err() {
             tracing::warn!(%node, "ingestion: router closed routing PreemptJob");
+        }
+    }
+
+    // Route the re-derived agent commands the same way (ADR 0044 §5).
+    for command in normalized.agent_commands {
+        if router.send(RouteCommand { node, command }).await.is_err() {
+            tracing::warn!(%node, "ingestion: router closed routing an agent command");
         }
     }
 
@@ -672,6 +684,14 @@ fn heartbeat_diff(
         }));
     }
 
+    // The operator's deadline drain (ADR 0044 §5, "Durability"): reconcile
+    // the replicated record against the agent's echo of the target it last
+    // accepted, and re-send the `Drain` (or its withdrawal) on any mismatch.
+    // The rule itself lives beside the abort rule in dispatch.
+    let echo = reported_instant(hb.drain_target_us);
+    out.agent_commands
+        .extend(drain_command_for(view.state(), node, echo));
+
     let running: BTreeSet<AllocationId> = hb
         .running
         .iter()
@@ -993,6 +1013,7 @@ mod tests {
             used: None,
             draining: false,
             interruption_deadline_us: None,
+            drain_target_us: None,
         })
     }
 
@@ -1005,6 +1026,7 @@ mod tests {
             used: None,
             draining,
             interruption_deadline_us: None,
+            drain_target_us: None,
         })
     }
 
@@ -1017,6 +1039,7 @@ mod tests {
             used: Some(coppice_proto::convert::node_usage_to_pb(used, sampled_at)),
             draining: false,
             interruption_deadline_us: None,
+            drain_target_us: None,
         })
     }
 
@@ -2246,10 +2269,23 @@ mod tests {
     /// passes it through like `Aborted` (only `Revoked` is filtered).
     #[test]
     fn a_reported_preempted_outcome_passes_through() {
-        let (view, node, alloc, attempt) = notice_fixture(AttemptState::Running, None);
-        let outcome = AttemptOutcome::Preempted {
-            reason: PreemptReason::Interruption,
-        };
+        // From Running, and from Dispatching: a start the agent refused under
+        // its drain plan never ran (ADR 0044 §5).
+        for (state, reason) in [
+            (AttemptState::Running, PreemptReason::Interruption),
+            (AttemptState::Dispatching, PreemptReason::Drain),
+            (AttemptState::Dispatching, PreemptReason::Interruption),
+        ] {
+            a_reported_preempted_outcome_passes_through_from(state, reason);
+        }
+    }
+
+    fn a_reported_preempted_outcome_passes_through_from(
+        state: AttemptState,
+        reason: PreemptReason,
+    ) {
+        let (view, node, alloc, attempt) = notice_fixture(state, None);
+        let outcome = AttemptOutcome::Preempted { reason };
         let out = normalize(
             &view,
             &report(
@@ -2292,6 +2328,7 @@ mod tests {
                 used: None,
                 draining: true,
                 interruption_deadline_us: deadline.map(Timestamp::as_micros),
+                drain_target_us: None,
             })
         };
 
@@ -2338,5 +2375,59 @@ mod tests {
             &out.commands[..],
             [Command::RegisterNode(rn)] if rn.interruption_deadline == Some(deadline)
         ));
+    }
+
+    /// ADR 0044 §5, "Durability": every current-epoch heartbeat reconciles
+    /// the node's drain record against the agent's echo; a mismatch routes a
+    /// `Drain` (or its withdrawal) straight to the node, a match routes
+    /// nothing, and neither is ever a log command.
+    #[test]
+    fn a_heartbeat_echo_mismatch_routes_the_drain_and_a_match_routes_nothing() {
+        let node = NodeId::new();
+        let deadline = Timestamp::UNIX_EPOCH + Duration::from_hours(1);
+        let mut sm = StateMachine::default();
+        let mut record = node_record(node, 1, true);
+        record.node.drain = Some(coppice_core::node::Drain {
+            requested_at: Timestamp::UNIX_EPOCH,
+            deadline: Some(deadline),
+        });
+        sm.nodes.insert(node, record);
+        let view = view_of(sm.clone());
+        let echoing = |echo: Option<Timestamp>| {
+            Body::Heartbeat(Heartbeat {
+                drain_target_us: echo.map(Timestamp::as_micros),
+                ..Heartbeat::default()
+            })
+        };
+        let routed = |out: &Normalized| -> Vec<Option<i64>> {
+            out.agent_commands
+                .iter()
+                .map(|c| match &c.body {
+                    Some(coppice_proto::pb::agent::v1::agent_command::Body::Drain(d)) => {
+                        d.deadline_us
+                    }
+                    other => panic!("expected a Drain, got {other:?}"),
+                })
+                .collect()
+        };
+
+        // Not yet echoed: the deadline is (re-)sent.
+        let out = normalize(&view, &report(node, 1, echoing(None)), now());
+        assert_eq!(routed(&out), vec![Some(deadline.as_micros())]);
+        assert!(out.commands.is_empty(), "never a log command");
+        // Echoed: nothing.
+        let out = normalize(&view, &report(node, 1, echoing(Some(deadline))), now());
+        assert!(out.agent_commands.is_empty());
+        // A stale epoch is liveness only.
+        let out = normalize(&view, &report(node, 0, echoing(None)), now());
+        assert!(out.agent_commands.is_empty());
+
+        // Undrained while the agent still holds the target: the withdrawal.
+        sm.nodes.get_mut(&node).unwrap().node.drain = None;
+        let view = view_of(sm);
+        let out = normalize(&view, &report(node, 1, echoing(Some(deadline))), now());
+        assert_eq!(routed(&out), vec![None]);
+        let out = normalize(&view, &report(node, 1, echoing(None)), now());
+        assert!(out.agent_commands.is_empty());
     }
 }

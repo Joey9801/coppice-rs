@@ -72,8 +72,8 @@ const TASK_DRAIN: Duration = Duration::from_secs(10);
 /// stream and waits for the coordinator to end the command stream in reply,
 /// which is this side's only confirmation that the last reports went out.
 const OUTBOUND_FLUSH: Duration = Duration::from_millis(500);
-/// The longest the notice timer sleeps before re-reading the wall clock: stop
-/// times are wall-clock instants, so a long monotonic sleep would miss a
+/// The longest the notice timer sleeps before re-reading the wall clock:
+/// notice and stop times are wall-clock instants, so a long monotonic sleep would miss a
 /// clock step.
 const STOP_TIMER_GRANULARITY: Duration = Duration::from_secs(1);
 
@@ -229,7 +229,7 @@ where
         // notice machinery keeps running under them: a coordinator that takes
         // its time to answer must not hold up a stop.
         let register = session.register_report();
-        let announced = session.active_plan().map(|p| p.deadline);
+        let announced = session.plan_announcement();
         let Some(connected) = with_notices(
             open_stream(endpoint, &tls, register),
             &mut session,
@@ -472,7 +472,7 @@ async fn backoff_sleep<F: Fs, E: Executor + Clone>(
     let sleep = tokio::time::sleep(backoff);
     tokio::pin!(sleep);
     loop {
-        let next_stop = session.next_stop_at();
+        let next_stop = session.next_timer_at();
         tokio::select! {
             _ = &mut sleep => return false,
             _ = flipped(shutdown), if !drain.started => {
@@ -504,7 +504,7 @@ where
 {
     tokio::pin!(fut);
     loop {
-        let next_stop = session.next_stop_at();
+        let next_stop = session.next_timer_at();
         tokio::select! {
             value = &mut fut => return Some(value),
             _ = grace.elapsed() => return None,
@@ -520,8 +520,8 @@ where
 enum BackgroundEvent {
     /// The interruption source published a notice with this deadline.
     Interruption(Timestamp),
-    /// A stop time may have arrived.
-    StopsDue,
+    /// A notice or stop time may have arrived.
+    TimersDue,
     StartDone(AllocationId, Result<(), StartError>),
     StopDone(AllocationId, Result<StopOutcome, ExecutorError>),
 }
@@ -596,7 +596,7 @@ impl<E: Executor + Clone> Background<E> {
                         Some(wait) => tokio::time::sleep(wait).await,
                         None => std::future::pending().await,
                     }
-                } => return BackgroundEvent::StopsDue,
+                } => return BackgroundEvent::TimersDue,
                 Some(joined) = self.starts.join_next_with_id(), if !self.starts.is_empty() => {
                     match joined {
                         Ok((id, (allocation, result))) => {
@@ -676,9 +676,12 @@ where
     let mut stops = Vec::new();
     let reports = match event {
         BackgroundEvent::Interruption(deadline) => session.on_interruption(deadline, now).await?,
-        BackgroundEvent::StopsDue => {
+        BackgroundEvent::TimersDue => {
+            // Notices first: an attempt notified now is stopped later, never
+            // in the same breath.
+            let reports = session.begin_due_notices(now).await?;
             stops = session.begin_due_stops(now)?;
-            Vec::new()
+            reports
         }
         BackgroundEvent::StartDone(allocation, result) => {
             session.finish_start(allocation, result, now).await?
@@ -744,14 +747,15 @@ async fn open_stream(
 }
 
 /// Serve one connected session until it closes or the drain finishes.
-/// `announced` is the drain-plan deadline the queued `Register` carried: if
-/// the plan has changed since (a notice that landed during the dial, or one
-/// mid-session), a heartbeat re-announces it as soon as registration is done.
+/// `announced` is the drain plan the queued `Register` carried: if the plan has
+/// changed since (a notice that landed during the dial, one mid-session, or an
+/// operator deadline accepted), a heartbeat re-announces it as soon as
+/// registration is done.
 #[allow(clippy::too_many_arguments)] // wiring seam: each is a distinct loop input
 async fn serve_once<F, E>(
     session: &mut Session<F, E>,
     connected: Connected,
-    mut announced: Option<Timestamp>,
+    mut announced: super::PlanAnnouncement,
     tls: &TlsStore,
     config: &Config,
     exit_rx: &mut mpsc::Receiver<crate::executor::ExitEvent>,
@@ -841,10 +845,12 @@ where
             drain.announced = true;
             tracing::info!("draining announced to the coordinator; no new placements from here");
         }
-        // An interruption plan that started or changed since the `Register`
-        // went out is announced the same way (ADR 0044 §5): the coordinator
-        // must stop placing here now, not at the next tick.
-        let plan = session.active_plan().map(|p| p.deadline);
+        // An interruption that started or changed since the `Register` went
+        // out is announced the same way (ADR 0044 §5): the coordinator must
+        // stop placing here now, not at the next tick. A changed operator
+        // target is echoed at once too, so the leader's reconciliation stops
+        // re-sending the `Drain` it already delivered.
+        let plan = session.plan_announcement();
         if plan != announced && session.is_registered() {
             let hb = session.heartbeat_report().await;
             send_all(&tx, vec![hb]).await?;
@@ -878,7 +884,7 @@ where
             }
         };
 
-        let next_stop = session.next_stop_at();
+        let next_stop = session.next_timer_at();
         tokio::select! {
             event = background.next(next_stop) => {
                 on_background_event(session, background, event, Some(&tx)).await?;

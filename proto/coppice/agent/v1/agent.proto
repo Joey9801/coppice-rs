@@ -119,6 +119,11 @@ message StartJob {
   // runtime 0 (a free requeue), so a backfill admitted against a draining
   // node's horizon can never overrun it.
   optional int64 latest_start_us = 17;
+  // The replicated policy's `drain_cleanup_margin` at dispatch (ADR 0044
+  // §5): a drain plan stops this attempt at `T_stop = deadline −
+  // drain_cleanup_margin − abort_grace`, computed by the agent per attempt
+  // with the values it was dispatched under.
+  uint64 drain_cleanup_margin_us = 18;
 }
 
 // Stop the work under an allocation (SIGTERM, grace, SIGKILL). Idempotent,
@@ -149,9 +154,25 @@ message PreemptJob {
   coppice.core.v1.PreemptReason reason = 3;
 }
 
-// Ask the node to stop accepting new work. Advisory mirror of the
-// replicated drain flag; placement enforcement lives in apply.
-message Drain {}
+// The operator's deadline drain of this node (ADR 0044 §5), or its
+// withdrawal. Placement enforcement lives in apply; this carries only what
+// the agent must enforce itself: notices at T_notice and stops at T_stop.
+// Re-derived and re-sent by the leader whenever the node's drain record and
+// the agent's `Heartbeat.drain_target_us` echo disagree, so a command lost to
+// a disconnect or a leadership change is healed by the next heartbeat. A
+// regular drain (no deadline) sends nothing.
+//
+// The agent journals the plan before acting on it; a deadline equal to the
+// one it already holds is a no-op. A replacement is a withdrawal followed by
+// a new plan: attempts already notified keep their stops.
+message Drain {
+  // The operator's deadline D, wall-clock µs. Absent = the withdrawal: the
+  // record holds no deadline (undrain, or never drained with one).
+  optional int64 deadline_us = 1;
+  // The policy's `preemption_notice_cap`: the common notice window, so an
+  // attempt is notified at `T_notice = T_stop − notice_window_us`.
+  uint64 notice_window_us = 2;
+}
 
 // Advisory prefetch hint (ADR 0010): agents may ignore it freely, and no
 // scheduling decision depends on it having been honored.
@@ -244,6 +265,10 @@ message Heartbeat {
   bool draining = 5;
   // Same fact as `Register.interruption_deadline_us`, announced mid-session.
   optional int64 interruption_deadline_us = 6;
+  // The operator drain deadline the agent last accepted (ADR 0044 §5): the
+  // echo the leader reconciles against the node's drain record on every
+  // heartbeat. Absent = no operator deadline plan.
+  optional int64 drain_target_us = 7;
 }
 
 // Job-attributable resource usage observed on a node, folded by the agent from
