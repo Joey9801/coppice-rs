@@ -34,8 +34,6 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use coppice_core::allocation::AllocationState;
-use coppice_core::attempt::AttemptState;
 use coppice_core::id::{AllocationId, NodeId};
 use coppice_core::resource::Resources;
 use coppice_core::time::Timestamp;
@@ -188,37 +186,19 @@ pub(crate) fn collect_release_events(
 ) -> BTreeMap<NodeId, Vec<ReleaseEvent>> {
     let mut events: BTreeMap<NodeId, Vec<ReleaseEvent>> = BTreeMap::new();
     for rec in snapshot.allocations.values() {
-        let node = rec.allocation.node;
-        if rec.allocation.state == AllocationState::Released {
-            continue;
-        }
-        let Some(at) = snapshot.attempts.get(&rec.allocation.attempt) else {
+        // The one definition apply's preemption fit check shares
+        // (`StateMachine::guaranteed_release`).
+        let Some(release) = snapshot.guaranteed_release(rec) else {
             continue;
         };
-        if at.attempt.state != AttemptState::Running {
-            continue;
-        }
-        let Some(started) = at.started_at else {
-            continue;
-        };
-        let Some(job) = snapshot.jobs.get(&rec.allocation.job) else {
-            continue;
-        };
-        let runtime_bound = job.spec.max_runtime.map(|runtime| started + runtime);
-        let preemption_bound = at
-            .preemption
-            .and_then(|p| p.acknowledged)
-            .map(|ack| ack.deadline.saturating_add(snapshot.policy.abort_grace));
-        let release = match (runtime_bound, preemption_bound) {
-            (Some(a), Some(b)) => a.min(b),
-            (Some(bound), None) | (None, Some(bound)) => bound,
-            (None, None) => continue,
-        };
-        events.entry(node).or_default().push(ReleaseEvent {
-            at: release,
-            seq: rec.seq,
-            freed: rec.allocation.funded,
-        });
+        events
+            .entry(rec.allocation.node)
+            .or_default()
+            .push(ReleaseEvent {
+                at: release,
+                seq: rec.seq,
+                freed: rec.allocation.funded,
+            });
     }
     events
 }

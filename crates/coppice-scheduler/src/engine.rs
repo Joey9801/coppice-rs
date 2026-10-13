@@ -24,13 +24,17 @@ use coppice_core::job::{Job, JobState};
 use coppice_core::node::Node;
 use coppice_core::resource::Resources;
 use coppice_core::time::{Duration, Timestamp};
-use coppice_state::{Admission, NodeAdmission, StateMachine};
+use coppice_state::{Admission, NodeAdmission, PreemptionLedger, StateMachine};
 
 use crate::projection::{
     collect_release_events, sort_release_events, sweep_projected_ready, ReleaseEvent,
 };
 use crate::score::{self, Rank};
 use crate::{PlacementProposal, ProposedPlacement, Scheduler, SchedulerConfig};
+
+mod preempt;
+
+use preempt::{Beneficiary, Victim};
 
 /// The v1 heuristic scheduler: effective-score ordering (ADR 0021), best-fit
 /// packing, accruing allocations as the license to backfill (ADR 0014).
@@ -178,6 +182,10 @@ struct NodeModel<'a> {
     /// moves, in payload order — they fund behind the surviving queue), so
     /// later candidate sweeps see the whole claim on the node's events.
     pending_accruals: Vec<Resources>,
+    /// Running attempts on this node that could be preemption victims at all
+    /// (ADR 0044 §4); whether a beneficiary outranks one is asked per
+    /// beneficiary.
+    victims: Vec<Victim>,
 }
 
 /// The placement gate a candidate node must pass for one job on every path
@@ -238,6 +246,34 @@ struct Pass<'a> {
     revoked_nodes: BTreeSet<NodeId>,
     revocations: Vec<AllocationId>,
     placements: Vec<ProposedPlacement>,
+    /// The scheduler's own outstanding terminations, read off attempt
+    /// records once per pass (ADR 0044 §4): the per-node guard, the
+    /// beneficiaries still waiting on victims, and the cooldown clock.
+    ledger: PreemptionLedger,
+    /// Nodes this pass already gave an eviction group: one per node.
+    evicted_nodes: BTreeSet<NodeId>,
+    /// Preempting placements still allowed this pass
+    /// (`max_preempting_placements_per_cycle`, counting beneficiaries).
+    preempting_left: usize,
+    /// `SchedulerConfig::preemption_cooldown`.
+    cooldown: Duration,
+    /// `SchedulerConfig::preemption_min_improvement`.
+    preempt_min_improvement: Duration,
+    /// Each quota entity's ADR 0005 penalty product at `now`, computed once
+    /// and shared by every score the pass takes (candidates and victims).
+    penalties: BTreeMap<QuotaEntityId, f64>,
+}
+
+/// The ADR 0005 penalty product for `leaf` at `now`, memoized per pass.
+fn entity_penalty(
+    memo: &mut BTreeMap<QuotaEntityId, f64>,
+    snapshot: &StateMachine,
+    leaf: QuotaEntityId,
+    now: Timestamp,
+) -> f64 {
+    *memo.entry(leaf).or_insert_with(|| {
+        score::penalty_product(&snapshot.quota_entities, leaf, &snapshot.policy, now)
+    })
 }
 
 impl<'a> Pass<'a> {
@@ -262,6 +298,9 @@ impl<'a> Pass<'a> {
             .map(|(id, _)| *id)
             .collect();
         let horizons = snapshot.node_horizons(&drained);
+        let mut penalties: BTreeMap<QuotaEntityId, f64> = BTreeMap::new();
+        let mut victims =
+            preempt::candidate_victims(snapshot, now, horizon, config.w_age, &mut penalties);
 
         let mut nodes: Vec<NodeModel> = Vec::new();
         let mut node_index: BTreeMap<NodeId, usize> = BTreeMap::new();
@@ -313,6 +352,7 @@ impl<'a> Pass<'a> {
                 accruals,
                 events: evs,
                 pending_accruals: Vec::new(),
+                victims: victims.remove(id).unwrap_or_default(),
             });
         }
 
@@ -335,44 +375,46 @@ impl<'a> Pass<'a> {
             revoked_nodes: BTreeSet::new(),
             revocations: Vec::new(),
             placements: Vec::new(),
+            ledger: snapshot.preemption_ledger(),
+            evicted_nodes: BTreeSet::new(),
+            preempting_left: config.max_preempting_placements_per_cycle,
+            cooldown: config.preemption_cooldown,
+            preempt_min_improvement: config.preemption_min_improvement,
+            penalties,
         }
+    }
+
+    /// A job's ADR 0021 effective score at the pass's `now`.
+    fn job_score(&mut self, job: &coppice_state::JobRecord) -> f64 {
+        let penalty = entity_penalty(
+            &mut self.penalties,
+            self.snapshot,
+            job.spec.quota_entity,
+            self.now,
+        );
+        score::effective_score(
+            job.multiplier,
+            penalty,
+            job.submitted_at,
+            self.now,
+            self.horizon,
+            self.w_age,
+        )
     }
 
     /// Score the queued backlog and take the top `max_candidates` by the
     /// ADR 0021 total order (score desc, then FIFO, then `JobId`).
-    fn select_candidates(&self) -> Vec<Rank> {
+    fn select_candidates(&mut self) -> Vec<Rank> {
         if self.max_candidates == 0 {
             return Vec::new();
         }
         let snapshot = self.snapshot;
-        let mut memo: BTreeMap<QuotaEntityId, f64> = BTreeMap::new();
         let mut ranks: Vec<Rank> = Vec::new();
         for (job_id, jr) in &snapshot.jobs {
             if jr.state != JobState::Queued {
                 continue;
             }
-            let leaf = jr.spec.quota_entity;
-            let penalty = match memo.get(&leaf) {
-                Some(v) => *v,
-                None => {
-                    let v = score::penalty_product(
-                        &snapshot.quota_entities,
-                        leaf,
-                        &snapshot.policy,
-                        self.now,
-                    );
-                    memo.insert(leaf, v);
-                    v
-                }
-            };
-            let s = score::effective_score(
-                jr.multiplier,
-                penalty,
-                jr.submitted_at,
-                self.now,
-                self.horizon,
-                self.w_age,
-            );
+            let s = self.job_score(jr);
             ranks.push(Rank {
                 score: s,
                 submitted_at: jr.submitted_at,
@@ -482,16 +524,60 @@ impl<'a> Pass<'a> {
                 });
                 continue;
             }
+            // The per-node guard (ADR 0044 §4): while the source node has
+            // outstanding scheduler terminations — the victims this accrual
+            // is waiting on — the job may move only to a free fit. Recovery
+            // keeps precedence: an accrual on a draining or lost node (which
+            // admits nothing) is re-planned off it as ADR 0041 defines, by an
+            // improvement move; a fresh eviction group stays refused, since
+            // the job is still a beneficiary of its outstanding victims.
+            let source_open = self
+                .node_index
+                .get(&source)
+                .is_some_and(|&i| self.nodes[i].admission == NodeAdmission::Open);
+            if self.ledger.guarded.contains(&source) && source_open {
+                continue;
+            }
             if improvement_scans < self.accrual_limit {
                 improvement_scans += 1;
-                self.try_improve_accrual_bound(
-                    job_id,
-                    alloc,
+                let Some(&source_idx) = self.node_index.get(&source) else {
+                    continue;
+                };
+                let Some(current) = self.accrual_projected_ready(source_idx, alloc) else {
+                    continue;
+                };
+                let target = self.best_improvement_target(
                     source,
                     preemptible,
                     &requested,
                     &required,
+                    current,
                 );
+                // An accruing job is a preemption candidate on the same test
+                // as a queued one, by revoke-and-reseat: its natural bound is
+                // the better of staying and the improvement move.
+                if self.preempting_left > 0 {
+                    let natural = match (current, target.map(|(_, ready)| ready)) {
+                        (Some(a), Some(b)) => Some(a.min(b)),
+                        (bound @ Some(_), None) | (None, bound @ Some(_)) => bound,
+                        (None, None) => None,
+                    };
+                    let score = self.job_score(jr);
+                    let beneficiary = Beneficiary {
+                        job_id,
+                        job: &jr.spec,
+                        score,
+                        preemptible,
+                        required: &required,
+                        reseat: Some((source, alloc)),
+                    };
+                    if self.try_preempt(&beneficiary, natural) {
+                        continue;
+                    }
+                }
+                if let Some((target_idx, _)) = target {
+                    self.try_improve_accrual_bound(job_id, alloc, source, target_idx, &requested);
+                }
             }
         }
     }
@@ -507,21 +593,9 @@ impl<'a> Pass<'a> {
         job_id: JobId,
         alloc: AllocationId,
         source: NodeId,
-        preemptible: bool,
+        target_idx: usize,
         requested: &Resources,
-        required: &BTreeMap<String, String>,
     ) -> bool {
-        let Some(&source_idx) = self.node_index.get(&source) else {
-            return false;
-        };
-        let Some(current) = self.accrual_projected_ready(source_idx, alloc) else {
-            return false;
-        };
-        let Some(target_idx) =
-            self.best_improvement_target(source, preemptible, requested, required, current)
-        else {
-            return false;
-        };
         let target_id = self.nodes[target_idx].node.id;
         let mut revocations = self.revocations.clone();
         revocations.push(alloc);
@@ -582,7 +656,7 @@ impl<'a> Pass<'a> {
         requested: &Resources,
         required: &BTreeMap<String, String>,
         current: Option<Timestamp>,
-    ) -> Option<usize> {
+    ) -> Option<(usize, Timestamp)> {
         let mut best: Option<(Timestamp, f64, usize)> = None;
         for (i, nm) in self.nodes.iter().enumerate() {
             if nm.node.id == source || !node_admits(nm, preemptible) {
@@ -640,7 +714,7 @@ impl<'a> Pass<'a> {
                 best = Some((ready, pledged, i));
             }
         }
-        best.map(|(_, _, i)| i)
+        best.map(|(ready, _, i)| (i, ready))
     }
 
     /// Best open node — other than `source`, accrual-free, and not
@@ -748,7 +822,26 @@ impl<'a> Pass<'a> {
             if self.try_backfill(rank.job, &jr.spec, preemptible, &requested, &required) {
                 continue;
             }
-            self.try_open_accrual(rank.job, &jr.spec, preemptible, &requested, &required);
+            // ADR 0044 §4 in ADR 0027's finite-first order: a finite accrual
+            // within the threshold of what a preemption would manufacture
+            // wins; otherwise preempt; failing that, accrue anyway.
+            let target = self.best_accrual_target(preemptible, &requested, &required);
+            if self.preempting_left > 0 {
+                let beneficiary = Beneficiary {
+                    job_id: rank.job,
+                    job: &jr.spec,
+                    score: rank.score,
+                    preemptible,
+                    required: &required,
+                    reseat: None,
+                };
+                if self.try_preempt(&beneficiary, target.and_then(|(ready, _, _)| ready)) {
+                    continue;
+                }
+            }
+            if let Some((_, _, idx)) = target {
+                self.open_accrual_on(rank.job, idx, &requested);
+            }
         }
     }
 
@@ -912,6 +1005,13 @@ impl<'a> Pass<'a> {
             if nm.accruals.len() > 1 {
                 continue;
             }
+            // A lend revokes and reseats the node's accrual; under the
+            // per-node guard (ADR 0044 §4) that accrual may move only to a
+            // free fit, so a node with outstanding scheduler terminations
+            // lends nothing.
+            if self.ledger.guarded.contains(&nm.node.id) {
+                continue;
+            }
             // One lend per node per pass; keep it off any node the batch has
             // already touched so revocation-before-placement holds.
             if self.placed_nodes.contains(&nm.node.id) || self.revoked_nodes.contains(&nm.node.id) {
@@ -1012,9 +1112,10 @@ impl<'a> Pass<'a> {
         true
     }
 
-    /// Open an accrual for a blocked head-of-order job — the license to
-    /// backfill past it (ADR 0014) — when the accrual guard permits another
-    /// accruing job and some node passes the hard filters.
+    /// The node an accrual for a blocked head-of-order job — the license to
+    /// backfill past it (ADR 0014) — would open on, with the bound it would
+    /// get there and the fraction it could pledge at once; `None` when the
+    /// accrual cap or the hard filters leave nowhere.
     ///
     /// Node choice prefers a finite `projected_ready` (ADR 0027): a node on
     /// which the accrual's bound would be indefinite is never chosen while
@@ -1022,18 +1123,17 @@ impl<'a> Pass<'a> {
     /// earliest bound, ties by largest immediately-pledged fraction;
     /// indefinite candidates rank by pledged fraction alone. Ties to lowest
     /// `NodeId` throughout (iteration is `NodeId`-ascending, keep the first).
-    fn try_open_accrual(
-        &mut self,
-        job_id: JobId,
-        _job: &Job,
+    /// The bound is the job's `natural` for the preemption test (ADR 0044 §4).
+    fn best_accrual_target(
+        &self,
         preemptible: bool,
         requested: &Resources,
         required: &BTreeMap<String, String>,
-    ) -> bool {
+    ) -> Option<(Option<Timestamp>, f64, usize)> {
         // Opening adds one accruing job; if the cluster is already at K, the
-        // guard rejects it. Skip the scan and the simulation.
+        // guard rejects it. Skip the scan.
         if self.base_before >= self.accrual_limit {
-            return false;
+            return None;
         }
         let mut best: Option<(Option<Timestamp>, f64, usize)> = None;
         for (i, nm) in self.nodes.iter().enumerate() {
@@ -1071,9 +1171,12 @@ impl<'a> Pass<'a> {
                 best = Some((ready, pledged, i));
             }
         }
-        let Some((_, _, idx)) = best else {
-            return false;
-        };
+        best
+    }
+
+    /// Open the accrual on node `idx` (from [`Pass::best_accrual_target`]),
+    /// when the exact simulator says apply would accept it.
+    fn open_accrual_on(&mut self, job_id: JobId, idx: usize, requested: &Resources) -> bool {
         let node_id = self.nodes[idx].node.id;
         let mut placements = self.placements.clone();
         placements.push(ProposedPlacement {

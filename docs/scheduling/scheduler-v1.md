@@ -237,10 +237,57 @@ moving an accrual sweep any eligible node, not only current accrual hosts
 (ADR 0027). Accruals the batch itself places on a node are carried as
 pending claims so later candidate sweeps on that node see the whole queue.
 
+## Priority preemption
+
+[ADR 0044 §4](../decisions/0044-job-preemption-and-spot-capacity.md)'s
+`try_preempt` step (`engine/preempt.rs`) sits in ADR 0027's finite-first
+order between the two halves of the accrual trigger above: a candidate with
+no free fit, no drain backfill and no lend compares `natural` — the
+`projected_ready` of the accrual the trigger would open (indefinite when it
+would open none) — with the bound a preemption would manufacture,
+`now + max(victim notice) + abort_grace`. It preempts when `natural` is
+indefinite, or later than that bound by at least
+`preemption_min_improvement`; otherwise, or when no node offers a group,
+the accrual opens as before.
+
+`Pass::new` builds the per-node set of potential victims in one allocation
+scan: `Active` allocations whose attempt is its job's current `Running`
+one, recorded `effective_preemptible`, with no termination record, on a job
+not being aborted. For one beneficiary a victim must also pass the **class
+rule** (`victim.priority < J.priority`) and the **score rule** (its ADR 0021
+effective score, with this pass's `w_age` and `now`, below `J`'s). On each
+open node that admits `J` (spot-only gate included) and passes the limits
+below, eligible victims are ordered by class, then score, then work at risk
+(`(now − started_at) × rate`), and the pass takes the smallest prefix that,
+with the node's simulated free capacity and its other guaranteed releases
+at or before the bound, fits `J`; a node where even every eligible victim
+is not enough is skipped. Among nodes, the earliest bound wins, then the
+least total work at risk, then the lowest `NodeId`.
+
+`J` is proposed **accruing** on that node with the victims as the
+placement's `preemptions`, gated on the batch simulator like any accrual
+(so it needs room under the cap K, and the node must hold no other
+accrual). Limits, all scheduler-side and read off attempt records through a
+pass-scoped `PreemptionLedger`:
+
+- at most `max_preempting_placements_per_cycle` preempting placements per
+  pass, and one eviction group per node per pass;
+- the **per-node guard**: a node with a live attempt carrying a `Priority`
+  or `Relocation` record hosts no new group, lends nothing, and its accruing
+  job is re-planned only to a free fit while the node is open (a draining or
+  lost node's accrual is re-planned off it as usual); a job still waiting on its own
+  victims starts no second group anywhere;
+- the **cooldown**: a node whose latest scheduler-initiated `requested_at`
+  is younger than `preemption_cooldown` hosts no victims.
+
+An existing accrual is a candidate on the same test, by revoke-and-reseat
+(next section), with `natural` the better of its current bound and its best
+improvement move.
+
 ## Re-planning existing accruals
 
 Before the seating loop, the pass looks at every existing accruing job
-(distinct, in `seq` order) and re-plans it in two tiers:
+(distinct, in `seq` order) and re-plans it in up to three tiers:
 
 1. **Reseat-elsewhere (immediate fit).** If its full `requested` now fits
    within some *other* open, accrual-free node's free capacity
@@ -261,6 +308,15 @@ Before the seating loop, the pass looks at every existing accruing job
    nothing and is unconstrained. The move's batch shape is a lend's
    revoke-then-reseat, so it is gated on the exact batch simulator the same
    way.
+
+Between the two, an accrual whose node is not guarded may be reseated by
+**preemption** (previous section) when its natural bound — the better of
+staying and the improvement move — is indefinite or worse than the
+manufactured bound by `preemption_min_improvement`. An accrual on a guarded
+node (its victims still outstanding) takes only tier 1 while that node is
+open; once it drains or is declared lost, recovery keeps precedence and the
+accrual takes the ordinary tiers again — but never a new eviction group,
+since its own victims are still outstanding.
 
 Both tiers obey the same anti-churn rule as everything else: a revocation
 is only planned when it enables a concrete, strictly better reseat in the
