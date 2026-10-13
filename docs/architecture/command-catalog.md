@@ -420,10 +420,10 @@ reachable through the API.
 | | |
 | --- | --- |
 | Proposer | Ingestion, from the terminal `AttemptStatus` report (natural exit, OOM, `max_runtime` kill, abort completion, pull/start failure) |
-| Payload | `attempt: AttemptId`, `outcome: AttemptOutcome` (the full ADR 0013 taxonomy except `Revoked`, which only `CommitPlacements` may produce), `actual_runtime_us: uint64` (normalizer-computed), `observed_at_us` |
-| Validation | Attempt exists and is non-terminal; outcome ≠ `Revoked` |
+| Payload | `attempt: AttemptId`, `outcome: AttemptOutcome` (the full ADR 0013 taxonomy; `Revoked` only for a drain-backfill launch the agent refused at the door — ADR 0044 §5 — otherwise only `CommitPlacements` produces it), `actual_runtime_us: uint64` (normalizer-computed), `observed_at_us` |
+| Validation | Attempt exists and is non-terminal; outcome `Revoked` only when the attempt carries a `drain_cutoff` and never started (`started_at` absent) — a drain backfill whose launch the agent refused past its `latest_start`; it then resolves like any revocation, a free requeue |
 | Apply effects | Attempt → `Terminal(outcome)` (legal from any non-terminal state — early endings arrive without prior started/exited commands); allocations `Released` + pledge pass; quota true-up (actual cost 0 if the attempt never reached `Running`, else from recorded rate × `ceil(actual_runtime_s)` × recorded multiplier; refund is the recorded `refund_fraction_milli` of the unused portion, or the full unused portion whenever the attempt never reached `Running` or `outcome`'s `OutcomeClass` is `Platform` — ADR 0029); job resolution per the rules above (retry / terminal / abort-wins / truth-wins), moving `Attempting(id)` directly to a terminal state or back to `Queued`. |
-| Rejections | `UnknownAttempt`, `StaleAttemptState`, `InvalidCommand` (outcome `Revoked`) |
+| Rejections | `UnknownAttempt`, `StaleAttemptState`, `InvalidCommand` (outcome `Revoked` other than a refused backfill launch) |
 
 #### `RecordAttemptNotified`
 
@@ -736,7 +736,7 @@ key* never appears in any of these payloads or in replicated state (ADR 0037
 | `UnknownEnrollToken` | Revocation of a token not in state |
 | `UnknownStagedRoot` | A `RecordCaCertificate` named a staged root serial that no certificate of its bundle carries at a non-zero position (ADR 0037 §4 — a staged root is never the active signing root) |
 | `StagedRootMismatch` | A staged-custody command named a root this cluster does not currently stage — a stale ack from before a resumed rotation replaced the pending root |
-| `InvalidCommand` | Shape violation (e.g. outcome `Revoked` outside `CommitPlacements`, empty CA bundle, empty token hash) |
+| `InvalidCommand` | Shape violation (e.g. outcome `Revoked` outside `CommitPlacements` and a refused drain-backfill launch, empty CA bundle, empty token hash) |
 | `InvalidBatch[(index, reason)]` | All-or-nothing batch rejection with per-item diagnostics |
 
 Rejections are terminal for the command, invisible in state (beyond the

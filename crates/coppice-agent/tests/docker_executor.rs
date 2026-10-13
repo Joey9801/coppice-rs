@@ -351,6 +351,7 @@ mod harness {
             env: Default::default(),
             limits,
             max_runtime: None,
+            latest_start: None,
         }
     }
 

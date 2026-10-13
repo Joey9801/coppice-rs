@@ -496,6 +496,19 @@ fn notice_command(attempt: AttemptId, notice: Notice, now: Timestamp) -> Command
     })
 }
 
+/// Whether an agent may report `Revoked` for this attempt: only for a launch
+/// it refused at the door — a drain backfill past its launch bound (ADR 0044
+/// §5), which never started. Every other `Revoked` is `CommitPlacements`'
+/// outcome alone (command-catalog.md), and apply's `RecordAttemptOutcome`
+/// rejects it. Shared by the `AttemptStatus` and ObservedSet paths, so a
+/// refusal that only reaches the coordinator through a reconnect resolves
+/// the same way as one reported live.
+fn agent_may_report_revoked(record: &coppice_state::AttemptRecord) -> bool {
+    record.drain_cutoff.is_some()
+        && record.started_at.is_none()
+        && phase_rank(&record.attempt.state) < phase_rank(&AttemptState::Running)
+}
+
 /// Linear rank of an attempt phase, for the monotonic dedupe checks.
 fn phase_rank(state: &AttemptState) -> u8 {
     match state {
@@ -589,8 +602,9 @@ fn attempt_status_diff(
             if record.attempt.state.is_terminal() {
                 return; // already terminal (dedupe)
             }
-            if matches!(outcome, AttemptOutcome::Revoked) {
-                // Only CommitPlacements may produce Revoked (command-catalog.md).
+            // A Revoked other than a refused backfill launch is dropped, as
+            // apply would reject it.
+            if matches!(outcome, AttemptOutcome::Revoked) && !agent_may_report_revoked(record) {
                 tracing::warn!(?attempt_id, "ingestion: agent reported Revoked, dropping");
                 return;
             }
@@ -759,10 +773,11 @@ fn observed_set_diff(
                     att.attempt.id,
                     att.attempt.state.clone(),
                     attempt_has_pending_abort(view.state(), att),
+                    agent_may_report_revoked(att),
                 )
             });
 
-        let Some((attempt_id, attempt_state, abort_pending)) = live else {
+        let Some((attempt_id, attempt_state, abort_pending, revoked_ok)) = live else {
             // No live intent: a running container is orphaned → stop; an
             // exited one is already settled → ignore.
             if obs.running {
@@ -832,11 +847,14 @@ fn observed_set_diff(
             );
         } else {
             // Observed exit: record the outcome (attempt is non-terminal here).
+            // A journaled launch refusal whose terminal status never landed
+            // keeps its Revoked (a free requeue); any other Revoked becomes
+            // AgentError.
             let outcome = obs
                 .outcome
                 .clone()
                 .and_then(|o| AttemptOutcome::try_from(o).ok())
-                .filter(|o| !matches!(o, AttemptOutcome::Revoked))
+                .filter(|o| revoked_ok || !matches!(o, AttemptOutcome::Revoked))
                 .unwrap_or_else(|| {
                     tracing::warn!(
                         ?attempt_id,
@@ -1249,6 +1267,55 @@ mod tests {
         assert!(out.commands.is_empty());
     }
 
+    /// ADR 0044 §5: a drain backfill whose launch the agent refused at the
+    /// door (never started) reports Revoked, and that one is accepted. A
+    /// backfill that did start, or an ordinary attempt, still drops it.
+    #[test]
+    fn attempt_status_revoked_is_accepted_only_for_a_refused_backfill_launch() {
+        let node = NodeId::new();
+        let revoked = |state: AttemptState,
+                       started: Option<Timestamp>,
+                       cutoff: Option<Timestamp>| {
+            let attempt = AttemptId::new();
+            let mut sm = StateMachine::default();
+            sm.nodes.insert(node, node_record(node, 5, true));
+            let mut record = attempt_record(
+                attempt,
+                JobId::new(),
+                AllocationId::new(),
+                node,
+                state,
+                started,
+            );
+            record.drain_cutoff = cutoff;
+            sm.attempts.insert(attempt, record);
+            normalize(
+                &view_of(sm),
+                &report(
+                    node,
+                    5,
+                    attempt_status(attempt, &AttemptState::Terminal(AttemptOutcome::Revoked), 0),
+                ),
+                now(),
+            )
+            .commands
+        };
+        let cutoff = Some(now());
+        let accepted = revoked(AttemptState::Dispatching, None, cutoff);
+        assert!(
+            matches!(
+                accepted.as_slice(),
+                [Command::RecordAttemptOutcome(RecordAttemptOutcome {
+                    outcome: AttemptOutcome::Revoked,
+                    ..
+                })]
+            ),
+            "{accepted:?}"
+        );
+        assert!(revoked(AttemptState::Running, Some(now()), cutoff).is_empty());
+        assert!(revoked(AttemptState::Dispatching, None, None).is_empty());
+    }
+
     #[test]
     fn heartbeat_diff_adopts_stops_and_loses() {
         let node = NodeId::new();
@@ -1489,6 +1556,69 @@ mod tests {
             out.commands.is_empty(),
             "no outcome, adoption or loss for unresolved work: {:?}",
             out.commands
+        );
+    }
+
+    /// ADR 0044 §5: an agent that journaled a refused backfill launch and lost
+    /// its session before the terminal status committed reports the refusal
+    /// in the reconnect's ObservedSet. That Revoked is kept (a free requeue),
+    /// under the same rule as the live `AttemptStatus`; any other observed
+    /// Revoked still becomes AgentError.
+    #[test]
+    fn observed_set_keeps_revoked_only_for_a_refused_backfill_launch() {
+        let node = NodeId::new();
+        let job = JobId::new();
+        let observed_outcome =
+            |state: AttemptState, started: Option<Timestamp>, cutoff: Option<Timestamp>| {
+                let (attempt, alloc) = (AttemptId::new(), AllocationId::new());
+                let mut sm = StateMachine::default();
+                sm.nodes.insert(node, node_record(node, 5, true));
+                let mut record = attempt_record(attempt, job, alloc, node, state, started);
+                record.drain_cutoff = cutoff;
+                sm.attempts.insert(attempt, record);
+                sm.allocations.insert(
+                    alloc,
+                    allocation_record(
+                        alloc,
+                        job,
+                        attempt,
+                        node,
+                        requested(),
+                        AllocationState::Active,
+                    ),
+                );
+                let set = Body::ObservedSet(ObservedSet {
+                    allocations: vec![observed(
+                        alloc,
+                        attempt,
+                        false,
+                        Some(&AttemptOutcome::Revoked),
+                        0,
+                    )],
+                });
+                normalize(&view_of(sm), &report(node, 5, set), now())
+                    .commands
+                    .into_iter()
+                    .find_map(|c| match c {
+                        Command::RecordAttemptOutcome(o) if o.attempt == attempt => Some(o.outcome),
+                        _ => None,
+                    })
+            };
+        let cutoff = Some(now());
+        assert_eq!(
+            observed_outcome(AttemptState::Dispatching, None, cutoff),
+            Some(AttemptOutcome::Revoked),
+            "a refused backfill launch keeps its Revoked"
+        );
+        assert_eq!(
+            observed_outcome(AttemptState::Running, Some(now()), cutoff),
+            Some(AttemptOutcome::AgentError),
+            "a backfill that started cannot be revoked by its agent"
+        );
+        assert_eq!(
+            observed_outcome(AttemptState::Dispatching, None, None),
+            Some(AttemptOutcome::AgentError),
+            "an ordinary attempt cannot be revoked by its agent"
         );
     }
 

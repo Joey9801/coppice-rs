@@ -66,6 +66,16 @@ Decided in [ADR 0009](../decisions/0009-fencing-and-reconciliation.md):
   `JobRecord.attempts`, so a lost node's attempt still counts), the
   attempt's recorded effective preemptibility, and the job's notice
   contract. The agent injects it as the reserved `COPPICE_*` env block.
+- A drain-backfill `StartJob` also carries `latest_start_us`
+  ([ADR 0044](../decisions/0044-job-preemption-and-spot-capacity.md) §5):
+  the attempt's recorded `drain_cutoff − max_runtime − abort_grace`, so the
+  job cannot outlive the draining node's horizon. The agent refuses a
+  launch past it — on arrival, by abandoning an image pull still running
+  at the bound, and again at the launch point after the pull — journaling
+  and reporting the attempt terminal `Revoked` with runtime 0. The
+  coordinator accepts that `Revoked` — from the terminal status or from a
+  reconnect's ObservedSet — only for a drain backfill that never started,
+  and requeues it free of retry budget.
 - Agents journal `(allocation_id, attempt_id, job_id, epoch)` durably before
   starting a container, and label containers with allocation/attempt IDs. On
   restart the agent rebuilds its actual set from journal + runtime, registers

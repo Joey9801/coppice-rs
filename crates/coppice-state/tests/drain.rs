@@ -297,3 +297,46 @@ fn an_undrained_node_takes_ordinary_placements_without_a_cutoff() {
     place(&mut sm, 2, 1_000, at(60)).unwrap();
     assert_eq!(sm.attempts[&aid(22)].drain_cutoff, None);
 }
+
+/// A backfill launch the agent refused at the door reports `Revoked`
+/// (ADR 0044 §5): accepted only for a drain backfill that never started, and
+/// resolved like any revocation — requeued free of retry budget.
+#[test]
+fn a_refused_backfill_launch_resolves_revoked_as_a_free_requeue() {
+    let mut sm = drained_with_anchor(Some(3_600));
+    submit(&mut sm, 2, 2_000, Some(1_800));
+    place(&mut sm, 2, 2_000, at(60)).unwrap();
+    apply_ok(&mut sm, dispatch_cmd(aid(22), at(60)));
+
+    // The anchor is ordinary work: an agent-reported Revoked is refused.
+    assert!(matches!(
+        sm.apply(&outcome_cmd(aid(11), AttemptOutcome::Revoked, 0, at(61))),
+        Err(RejectionReason::InvalidCommand(_))
+    ));
+
+    apply_ok(
+        &mut sm,
+        outcome_cmd(aid(22), AttemptOutcome::Revoked, 0, at(61)),
+    );
+    assert_eq!(
+        sm.attempts[&aid(22)].attempt.state,
+        AttemptState::Terminal(AttemptOutcome::Revoked)
+    );
+    let job = &sm.jobs[&jid(2)];
+    assert_eq!(job.state, coppice_core::job::JobState::Queued);
+    assert_eq!(job.retries_used, 0, "a revocation is free");
+}
+
+/// Once a backfill has started, Revoked is no longer a door refusal.
+#[test]
+fn a_started_backfill_cannot_report_revoked() {
+    let mut sm = drained_with_anchor(Some(3_600));
+    submit(&mut sm, 2, 2_000, Some(1_800));
+    place(&mut sm, 2, 2_000, at(60)).unwrap();
+    apply_ok(&mut sm, dispatch_cmd(aid(22), at(60)));
+    apply_ok(&mut sm, started_cmd(aid(22), at(61)));
+    assert!(matches!(
+        sm.apply(&outcome_cmd(aid(22), AttemptOutcome::Revoked, 0, at(62))),
+        Err(RejectionReason::InvalidCommand(_))
+    ));
+}

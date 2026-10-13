@@ -29,8 +29,8 @@ use super::{
     LABEL_IMAGE_BYTES, LABEL_IMAGE_DIGEST, LABEL_JOB, LABEL_NODE,
 };
 use crate::executor::{
-    ContainerState, ExecutorError, ObservedContainer, SignalOutcome, StartError, StartSpec,
-    StopOutcome,
+    launch_wait_budget, ContainerState, ExecutorError, ObservedContainer, SignalOutcome,
+    StartError, StartSpec, StopOutcome,
 };
 use crate::pressure::DiskPressure;
 use crate::telemetry::FilesystemSink;
@@ -84,10 +84,12 @@ impl Drop for PinGuard<'_> {
 }
 
 /// Start a container for `spec` (docker-executor.md §3: Resolving → Pulling →
-/// Creating → Starting). Idempotent per allocation (§5): a duplicate delivery
-/// racing an in-flight start returns `Ok(())`, and the deterministic name plus
-/// adopt-on-conflict is the real backstop. `max_runtime` is the session
-/// watchdog's concern and is ignored here.
+/// Creating → Starting). A drain backfill (ADR 0044 §5) is refused once past
+/// its `latest_start`: the pull is abandoned at the bound, and the bound is
+/// checked again just before Starting. Idempotent per allocation (§5): a
+/// duplicate delivery racing an in-flight start returns `Ok(())`, and the
+/// deterministic name plus adopt-on-conflict is the real backstop.
+/// `max_runtime` is the session watchdog's concern and is ignored here.
 pub(crate) async fn start(inner: &Inner, spec: StartSpec) -> Result<(), StartError> {
     // 1. Pressure gate (§9): refuse new starts under Critical host disk pressure
     //    rather than wedging the node.
@@ -124,10 +126,31 @@ async fn start_inner(inner: &Inner, spec: &StartSpec) -> Result<(), StartError> 
     //    the allocation makes `fetch` place the pin itself, under the digest's
     //    image lock — the only ordering that excludes a concurrent eviction
     //    (which cannot rely on a daemon 409: no container exists yet).
-    let cache::FetchedImage { inspect, digest } = inner
-        .cache
-        .fetch(&spec.image, Some(spec.allocation))
-        .await?;
+    //
+    //    A drain backfill (ADR 0044 §5) waits on the fetch no later than its
+    //    `latest_start`: past it the launch can only be refused, so a hung
+    //    pull must not keep the attempt from requeueing. Dropping the fetch
+    //    mid-way is cancel-safe: the pull's HTTP
+    //    stream closes (dockerd abandons the pull and keeps or discards the
+    //    layers it has — no image is tagged, and this cache records nothing
+    //    for it), the pull permit and the singleflight slot are RAII-released
+    //    (a follower, if any, finds no result and pulls itself), and the pin
+    //    is placed with no await between it and `fetch`'s return, so a
+    //    cancelled fetch has placed none. (Nothing is released here on
+    //    purpose: a pin this allocation already holds — a survivor container
+    //    re-pinned from its label — is not this call's to hand back.) No
+    //    container or CPU grant exists yet.
+    let fetch = inner.cache.fetch(&spec.image, Some(spec.allocation));
+    let cache::FetchedImage { inspect, digest } = match spec.latest_start {
+        None => fetch.await?,
+        Some(latest_start) => {
+            let budget = launch_wait_budget(latest_start, Timestamp::now());
+            match tokio::time::timeout(budget, fetch).await {
+                Ok(fetched) => fetched?,
+                Err(_) => return Err(StartError::LaunchBoundPassed { latest_start }),
+            }
+        }
+    };
     // The pin is placed; every failure path below must release it (the guard's
     // Drop). A running/exited container re-pins itself from its label; a failed
     // start must not leak a pin that no container will ever release (§7).
@@ -233,7 +256,22 @@ async fn start_inner(inner: &Inner, spec: &StartSpec) -> Result<(), StartError> 
         }
     }
 
-    // 6. Start. 304 (already started) is `Ok` — bollard maps NOT_MODIFIED to
+    // 6. Launch bound (ADR 0044 §5): drain backfill may not start after its
+    //    `latest_start`. Checked again here, after the pull and the create —
+    //    the last point before the container actually starts — so a pull
+    //    that finished just inside the bound, plus the create, cannot carry
+    //    it past the draining node's horizon. Refused like a failed start:
+    //    remove the created container and release the grant (the pin guard
+    //    hands the image pin back).
+    if let Some(latest_start) = spec.latest_start {
+        if Timestamp::now() > latest_start {
+            remove_best_effort(inner, &name, false).await;
+            rollback_cpu(inner, spec.allocation, cpu.as_ref()).await;
+            return Err(StartError::LaunchBoundPassed { latest_start });
+        }
+    }
+
+    // 7. Start. 304 (already started) is `Ok` — bollard maps NOT_MODIFIED to
     //    success. On failure, best-effort remove the created container (observe
     //    would eventually clear it as debris anyway), then classify.
     if let Err(err) = inner.docker.start_container(&name, START_OPTS).await {
@@ -242,7 +280,7 @@ async fn start_inner(inner: &Inner, spec: &StartSpec) -> Result<(), StartError> 
         return Err(classify::classify_start_error(&err));
     }
 
-    // 7. Success: record running, push the gauge. The running container holds
+    // 8. Success: record running, push the gauge. The running container holds
     //    the image pin until reap, so commit the guard (do not release). The
     //    starting-guard clears `starting`.
     {

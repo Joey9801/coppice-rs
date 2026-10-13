@@ -512,6 +512,195 @@ async fn start_failure_is_classified_and_journaled() {
     );
 }
 
+/// A drain-backfill `StartJob` with a launch bound (ADR 0044 §5).
+fn start_job_bounded(
+    alloc: AllocationId,
+    attempt: AttemptId,
+    job: JobId,
+    latest_start: Timestamp,
+) -> pb::agent_command::Body {
+    let pb::agent_command::Body::StartJob(mut sj) =
+        start_job(alloc, attempt, job, Some(60_000_000))
+    else {
+        unreachable!()
+    };
+    sj.latest_start_us = Some(latest_start.as_micros());
+    pb::agent_command::Body::StartJob(sj)
+}
+
+fn reported_runtime_us(reports: &[pb::AgentReport]) -> Option<u64> {
+    match reports.first()?.body.as_ref()? {
+        pb::agent_report::Body::AttemptStatus(status) => Some(status.runtime_us),
+        _ => None,
+    }
+}
+
+/// ADR 0044 §5: a drain backfill whose `StartJob` arrives past its launch
+/// bound is refused without starting anything, reported terminal `Revoked`
+/// with runtime 0, and the refusal is journaled so a restart or a
+/// re-delivered `StartJob` reports the same outcome.
+#[tokio::test]
+async fn a_launch_past_its_bound_is_refused_and_journaled_revoked() {
+    let (dir, mut session, exec) = session();
+    register(&mut session, 1, 1, 1).await;
+    let (alloc, attempt, job) = (AllocationId::new(), AttemptId::new(), JobId::new());
+    let past = Timestamp::now().saturating_sub(Duration::from_secs(1));
+
+    let reports = session
+        .handle_command(command(
+            1,
+            1,
+            2,
+            start_job_bounded(alloc, attempt, job, past),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(terminal_outcome(&reports), Some(AttemptOutcome::Revoked));
+    assert_eq!(reported_runtime_us(&reports), Some(0));
+    assert_eq!(exec.start_count(alloc), 0, "nothing was started");
+
+    // Re-delivery reports the journaled refusal, never a launch.
+    let again = session
+        .handle_command(command(
+            1,
+            1,
+            3,
+            start_job_bounded(alloc, attempt, job, past),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(terminal_outcome(&again), Some(AttemptOutcome::Revoked));
+    assert_eq!(exec.start_count(alloc), 0);
+
+    drop(session);
+    let (_journal, state) = Journal::open(RealFs::new(dir.path())).unwrap();
+    assert_eq!(
+        state
+            .exits
+            .get(&alloc)
+            .map(|e| (e.outcome.clone(), e.runtime)),
+        Some((AttemptOutcome::Revoked, Duration::ZERO)),
+        "the refusal survives a restart"
+    );
+}
+
+/// The bound is checked again at the launch point itself, after the pull: a
+/// `StartJob` that arrived in time but whose pull ran past the bound is
+/// refused too. The fake's clock stands in for the slow pull.
+#[tokio::test]
+async fn a_launch_whose_pull_overran_its_bound_is_refused() {
+    let (_dir, mut session, exec) = session();
+    register(&mut session, 1, 1, 1).await;
+    let (alloc, attempt, job) = (AllocationId::new(), AttemptId::new(), JobId::new());
+    let bound = Timestamp::now().saturating_add(Duration::from_secs(3_600));
+    exec.set_now(bound.saturating_add(Duration::from_secs(1)));
+
+    let reports = session
+        .handle_command_settled(command(
+            1,
+            1,
+            2,
+            start_job_bounded(alloc, attempt, job, bound),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(terminal_outcome(&reports), Some(AttemptOutcome::Revoked));
+    assert_eq!(exec.start_count(alloc), 0);
+}
+
+/// Within its bound, a drain backfill starts like any other job.
+#[tokio::test]
+async fn a_launch_within_its_bound_starts() {
+    let (_dir, mut session, exec) = session();
+    register(&mut session, 1, 1, 1).await;
+    let (alloc, attempt, job) = (AllocationId::new(), AttemptId::new(), JobId::new());
+    let bound = Timestamp::now().saturating_add(Duration::from_secs(3_600));
+    exec.set_now(Timestamp::now());
+
+    let reports = session
+        .handle_command_settled(command(
+            1,
+            1,
+            2,
+            start_job_bounded(alloc, attempt, job, bound),
+        ))
+        .await
+        .unwrap();
+    assert!(is_running_report(&reports), "{reports:?}");
+    assert_eq!(exec.start_count(alloc), 1);
+}
+
+/// A hung pull does not leave a backfill parked in `starting` past its
+/// `latest_start` (ADR 0044 §5): the executor gives up on the pull at the
+/// bound and the launch is refused, so the attempt requeues promptly. The
+/// session itself is never held — the start runs off its loop — so this is
+/// about the attempt, not the watchdogs.
+#[tokio::test(start_paused = true)]
+async fn a_hung_pull_is_abandoned_at_the_launch_bound() {
+    let (_dir, mut session, exec) = session();
+    register(&mut session, 1, 1, 1).await;
+
+    // The backfill: bound 1 s out, its pull hung for good.
+    let (alloc, attempt, job) = (AllocationId::new(), AttemptId::new(), JobId::new());
+    exec.set_now(Timestamp::now());
+    let bound = exec.now().saturating_add(Duration::from_secs(1));
+    let _gate = exec.gate_pulls();
+    let queued = session
+        .handle_command(command(
+            1,
+            1,
+            2,
+            start_job_bounded(alloc, attempt, job, bound),
+        ))
+        .await
+        .unwrap();
+    assert!(queued.is_empty(), "the start is queued, not awaited");
+
+    // Run the queued start as the loop's task would.
+    let [spec] = &session.take_pending_starts()[..] else {
+        panic!("exactly one start is queued");
+    };
+    let began = tokio::time::Instant::now();
+    let result = exec.start(spec.clone()).await;
+    assert_eq!(
+        began.elapsed(),
+        std::time::Duration::from_secs(1),
+        "the pull is abandoned exactly at the bound"
+    );
+    let reports = session
+        .finish_start(alloc, result, Timestamp::now())
+        .await
+        .unwrap();
+    assert_eq!(terminal_outcome(&reports), Some(AttemptOutcome::Revoked));
+    assert_eq!(reported_runtime_us(&reports), Some(0));
+    assert_eq!(exec.start_count(alloc), 0, "nothing was started");
+}
+
+/// A gated pull that opens inside the bound proceeds to an ordinary start.
+#[tokio::test(start_paused = true)]
+async fn a_slow_pull_that_lands_inside_the_bound_starts() {
+    let (_dir, mut session, exec) = session();
+    register(&mut session, 1, 1, 1).await;
+    let (alloc, attempt, job) = (AllocationId::new(), AttemptId::new(), JobId::new());
+    exec.set_now(Timestamp::now());
+    let bound = exec.now().saturating_add(Duration::from_secs(10));
+    let gate = exec.gate_pulls();
+    let start = session.handle_command_settled(command(
+        1,
+        1,
+        2,
+        start_job_bounded(alloc, attempt, job, bound),
+    ));
+    let open = async {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        gate.open();
+    };
+    let (reports, ()) = tokio::join!(start, open);
+    let reports = reports.unwrap();
+    assert!(is_running_report(&reports), "{reports:?}");
+    assert_eq!(exec.start_count(alloc), 1);
+}
+
 #[tokio::test]
 async fn observed_exit_classifies_oom_and_nonzero() {
     let (_dir, mut session, _exec) = session();

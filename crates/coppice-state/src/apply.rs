@@ -889,12 +889,21 @@ impl StateMachine {
             Some(a) if a.attempt.state.is_terminal() => {
                 return Err(RejectionReason::StaleAttemptState(c.attempt));
             }
+            // Revoked comes from CommitPlacements, and from an agent only as
+            // a launch refused at the door: drain backfill that reached its
+            // launch point past its bound (ADR 0044 §5), which never started.
+            // It then resolves like any revocation — a free requeue.
+            Some(a)
+                if c.outcome == AttemptOutcome::Revoked
+                    && !(a.drain_cutoff.is_some() && a.started_at.is_none()) =>
+            {
+                return Err(RejectionReason::InvalidCommand(
+                    "outcome Revoked is only produced by CommitPlacements or a refused \
+                     drain-backfill launch"
+                        .into(),
+                ));
+            }
             Some(_) => {}
-        }
-        if c.outcome == AttemptOutcome::Revoked {
-            return Err(RejectionReason::InvalidCommand(
-                "outcome Revoked is only produced by CommitPlacements".into(),
-            ));
         }
         let mut events = Vec::new();
         self.terminate_attempt(

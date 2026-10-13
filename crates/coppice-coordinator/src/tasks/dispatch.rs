@@ -352,8 +352,27 @@ pub(crate) fn start_job_command(
             // The policy's grace as of this dispatch (ADR 0044 §3): the agent
             // runs a platform termination's stop path without asking us.
             abort_grace_us: state.policy.abort_grace.as_micros().max(0) as u64,
+            latest_start_us: latest_start(state, job, attempt).map(|t| t.as_micros()),
         })),
     }
+}
+
+/// Drain backfill's launch bound (ADR 0044 §5): `cutoff − max_runtime −
+/// abort_grace`, with the policy's current `abort_grace` at dispatch. `None`
+/// for an ordinary placement. A backfill always has `max_runtime` (admission
+/// requires it); one without would have no bound to protect, so it gets none.
+fn latest_start(
+    state: &StateMachine,
+    job: &JobRecord,
+    attempt: &AttemptRecord,
+) -> Option<Timestamp> {
+    let cutoff = attempt.drain_cutoff?;
+    let runtime = job.spec.max_runtime?;
+    Some(
+        cutoff
+            .saturating_sub(runtime)
+            .saturating_sub(state.policy.abort_grace),
+    )
 }
 
 /// The resumption identity of ADR 0044 §2: where an attempt sits in its
@@ -557,6 +576,50 @@ mod tests {
             panic!("expected StartJob");
         };
         assert_eq!(sj.max_runtime_us, None);
+        assert_eq!(sj.latest_start_us, None);
+    }
+
+    /// ADR 0044 §5: drain backfill carries `cutoff − max_runtime −
+    /// abort_grace` as its launch bound; an ordinary placement carries none.
+    #[test]
+    fn start_job_command_carries_the_drain_backfill_launch_bound() {
+        let job_id = JobId::new();
+        let attempt_id = AttemptId::new();
+        let alloc_id = AllocationId::new();
+        let node = NodeId::new();
+        let job = job_record(job_id, "img", requested(), Some(Duration::from_secs(600)));
+        let mut attempt = attempt_record(
+            attempt_id,
+            job_id,
+            alloc_id,
+            node,
+            AttemptState::Ready,
+            None,
+        );
+        let allocation = allocation_record(
+            alloc_id,
+            job_id,
+            attempt_id,
+            node,
+            requested(),
+            AllocationState::Funded,
+        );
+        let state = StateMachine::default();
+        let start = |attempt: &AttemptRecord| {
+            let command = start_job_command(&state, &job, attempt, &allocation);
+            let agent_command::Body::StartJob(sj) = command.body.expect("body") else {
+                panic!("expected StartJob");
+            };
+            sj.latest_start_us
+        };
+        assert_eq!(start(&attempt), None);
+
+        let cutoff = Timestamp::from_micros(10_000_000_000).unwrap();
+        attempt.drain_cutoff = Some(cutoff);
+        let expected = cutoff
+            .saturating_sub(Duration::from_secs(600))
+            .saturating_sub(state.policy.abort_grace);
+        assert_eq!(start(&attempt), Some(expected.as_micros()));
     }
 
     /// ADR 0044 §2: the index counts every attempt; the previous pair
