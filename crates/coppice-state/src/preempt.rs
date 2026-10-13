@@ -129,7 +129,11 @@ pub enum PreemptionRefusal {
     NotPreemptible,
     #[error("its node is draining")]
     NodeDraining,
-    #[error("the beneficiary does not outrank it (class rule) and relocation does not apply")]
+    #[error(
+        "the beneficiary does not outrank it (class rule) and relocation does not apply \
+         (a non-preemptible beneficiary on a persistent node, with spot capacity free for \
+         the victim)"
+    )]
     NotOutranked,
     #[error(
         "the node already has outstanding scheduler terminations, or the beneficiary \
@@ -155,6 +159,9 @@ pub(crate) struct PreemptCheck {
     /// Nodes an earlier placement of the batch already evicts on: one
     /// eviction group per node at a time.
     groups: BTreeSet<NodeId>,
+    /// Spot capacity the batch's earlier relocations already counted on, per
+    /// `preemptible_only` node, so two victims never share one free slot.
+    spot_reserved: BTreeMap<NodeId, Resources>,
 }
 
 impl PreemptCheck {
@@ -188,6 +195,7 @@ impl PreemptCheck {
             node_allocs,
             victims: BTreeSet::new(),
             groups: BTreeSet::new(),
+            spot_reserved: BTreeMap::new(),
         })
     }
 }
@@ -204,6 +212,7 @@ impl StateMachine {
         &self,
         p: &Placement,
         revoked: &BTreeSet<AllocationId>,
+        used: &BTreeMap<NodeId, Resources>,
         check: &mut PreemptCheck,
     ) -> Result<Vec<(AllocationId, PreemptReason)>, RejectionReason> {
         let Some(&first) = p.preemptions.first() else {
@@ -233,6 +242,9 @@ impl StateMachine {
             return refuse(first, PreemptionRefusal::Guarded);
         }
 
+        // Relocation (ADR 0044 §4) is only ever for a job that cannot itself
+        // go to spot capacity, and only off a persistent node.
+        let relocating = !node.node.preemptible_only && !self.effective_preemptible(&job.spec);
         let mut out = Vec::with_capacity(p.preemptions.len());
         let mut max_notice = Duration::ZERO;
         for &victim in &p.preemptions {
@@ -266,9 +278,14 @@ impl StateMachine {
                 return refuse(victim, PreemptionRefusal::NotPreemptible);
             }
             // The class rule: a chain of priority preemptions is strictly
-            // increasing in class.
+            // increasing in class. Failing it, the relocation condition:
+            // some spot node has free capacity for the victim right now.
             let reason = if victim_job.spec.priority < job.spec.priority {
                 PreemptReason::Priority { for_job: p.job }
+            } else if relocating
+                && self.reserve_spot_capacity(victim_job, alloc, used, &mut check.spot_reserved)
+            {
+                PreemptReason::Relocation { for_job: p.job }
             } else {
                 return refuse(victim, PreemptionRefusal::NotOutranked);
             };
@@ -304,5 +321,39 @@ impl StateMachine {
             return refuse(first, PreemptionRefusal::DoesNotFit);
         }
         Ok(out)
+    }
+
+    /// The relocation condition (ADR 0044 §4) for one victim: the first
+    /// `preemptible_only` node, in `NodeId` order, that is not draining,
+    /// would take the victim's job as a fresh placement, and has free
+    /// capacity for it before the batch less what earlier relocations in the
+    /// batch counted on. That capacity is a precondition, not a hold: it is
+    /// counted once per batch so two victims never rely on one slot, and the
+    /// requeued victim is placed later by the ordinary rules. The scheduler's
+    /// pass asks the same first-fit question.
+    fn reserve_spot_capacity(
+        &self,
+        victim_job: &crate::JobRecord,
+        alloc: &AllocationRecord,
+        used: &BTreeMap<NodeId, Resources>,
+        reserved: &mut BTreeMap<NodeId, Resources>,
+    ) -> bool {
+        if !self.effective_preemptible(&victim_job.spec) {
+            return false;
+        }
+        let requested = alloc.allocation.requested;
+        let spot = self.nodes.iter().find(|(id, rec)| {
+            let taken = reserved.get(*id).copied().unwrap_or(Resources::ZERO);
+            rec.node.preemptible_only
+                && !rec.is_draining()
+                && requested.fits_within(&rec.node.capacity)
+                && requested.fits_within(&self.free_capacity(id, Some(used)).saturating_sub(&taken))
+        });
+        let Some((id, _)) = spot else {
+            return false;
+        };
+        let taken = reserved.entry(*id).or_insert(Resources::ZERO);
+        *taken = taken.saturating_add(&requested);
+        true
     }
 }

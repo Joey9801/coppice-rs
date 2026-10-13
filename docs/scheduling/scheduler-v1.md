@@ -280,6 +280,21 @@ pass-scoped `PreemptionLedger`:
 - the **cooldown**: a node whose latest scheduler-initiated `requested_at`
   is younger than `preemption_cooldown` hosts no victims.
 
+**Relocation** is the one exception to both rules: for a beneficiary that
+is not effectively preemptible, a victim on a persistent node is eligible
+whatever its class and score if it is effectively preemptible now and a
+`preemptible_only` node has room for it. A relocated victim the class rule
+does not cover is recorded `Relocation`, and apply checks its room: the
+first open spot node in `NodeId` order whose free capacity before the
+batch, less what the batch's earlier `Relocation` victims counted on, holds
+it. The pass replays that tally exactly to pick the same node. One the
+class rule covers (it failed only the score rule) is recorded `Priority`,
+and apply counts nothing for it — but the pass still reserves its room in a
+second, stricter tally of *every* relocation, which all relocated victims
+must also fit, together with the node's simulated free capacity, so no two
+victims ever rely on one slot. The spot capacity is a precondition, not a
+hold: the victim requeues and is placed by the ordinary rules. Relocation counts against every limit below.
+
 An existing accrual is a candidate on the same test, by revoke-and-reseat
 (next section), with `natural` the better of its current bound and its best
 improvement move.

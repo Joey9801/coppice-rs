@@ -441,7 +441,7 @@ impl StateMachine {
                 )
                 .and_then(|cutoff| match preempt.as_mut() {
                     Some(check) => self
-                        .validate_preemptions(p, &revoked, check)
+                        .validate_preemptions(p, &revoked, &used, check)
                         .map(|group| (cutoff, group)),
                     None => Ok((cutoff, Vec::new())),
                 });
@@ -2299,7 +2299,7 @@ impl StateMachine {
     /// allocation scan rather than one per item, which at target scale was the
     /// difference between milliseconds and tens of seconds (KOI-5). Callers
     /// outside a batch pass `None` and take the direct scan.
-    fn free_capacity(
+    pub(crate) fn free_capacity(
         &self,
         node: &NodeId,
         used: Option<&BTreeMap<NodeId, Resources>>,
