@@ -922,19 +922,43 @@ describe('preemption fields (ADR 0044)', () => {
       ...extra,
     })
     const requested = '2026-10-12T10:00:00Z'
+    const regularDrain = {
+      requested_at: requested,
+      horizon: null,
+      complete: false,
+      deadline: null,
+      notice_at: null,
+      empty_by: null,
+      max_notice_shortfall_seconds: null,
+    }
     fetchMock.mockResolvedValueOnce(
       jsonResponse({
         nodes: [
           node('1', {}),
           node('2', {
-            drain: { requested_at: requested, horizon: '2026-10-12T12:00:00Z', complete: false },
+            drain: {
+              ...regularDrain,
+              requested_at: requested,
+              horizon: '2026-10-12T12:00:00Z',
+              empty_by: '2026-10-12T12:00:00Z',
+            },
           }),
-          node('3', { drain: { requested_at: requested, horizon: null, complete: false } }),
+          node('3', { drain: { ...regularDrain, requested_at: requested } }),
           node('4', {
             agent_draining: true,
-            drain: { requested_at: requested, horizon: null, complete: true },
+            drain: { ...regularDrain, requested_at: requested, complete: true },
           }),
           node('5', { agent_draining: true }),
+          node('6', {
+            drain: {
+              ...regularDrain,
+              horizon: '2026-10-12T18:00:00Z',
+              deadline: '2026-10-12T11:00:00Z',
+              notice_at: '2026-10-12T10:50:00Z',
+              empty_by: '2026-10-12T11:02:00Z',
+              max_notice_shortfall_seconds: 120,
+            },
+          }),
         ],
       }),
     )
@@ -944,15 +968,29 @@ describe('preemption fields (ADR 0044)', () => {
       requestedAt: new Date(requested),
       horizon: new Date('2026-10-12T12:00:00Z'),
       complete: false,
+      deadline: null,
+      noticeAt: null,
+      emptyBy: new Date('2026-10-12T12:00:00Z'),
+      maxNoticeShortfallSeconds: null,
     })
     expect(nodes[2]!.drain).toEqual({
       requestedAt: new Date(requested),
       horizon: null,
       complete: false,
+      deadline: null,
+      noticeAt: null,
+      emptyBy: null,
+      maxNoticeShortfallSeconds: null,
     })
     expect(nodes[3]).toMatchObject({ agentDraining: true })
     expect(nodes[3]!.drain).toMatchObject({ horizon: null, complete: true })
     expect(nodes[4]).toMatchObject({ drain: null, agentDraining: true })
+    expect(nodes[5]!.drain).toMatchObject({
+      deadline: new Date('2026-10-12T11:00:00Z'),
+      noticeAt: new Date('2026-10-12T10:50:00Z'),
+      emptyBy: new Date('2026-10-12T11:02:00Z'),
+      maxNoticeShortfallSeconds: 120,
+    })
   })
 
   it('sends the entity preemption switch only when set', async () => {

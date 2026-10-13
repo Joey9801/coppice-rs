@@ -14,6 +14,7 @@ import { useNode, useNodeLogs, useNodeUtilization } from '@/api/queries'
 import {
   formatBytes,
   formatCpu,
+  formatDuration,
   formatPercent,
   formatRelativeTime,
   formatTimestamp,
@@ -234,9 +235,18 @@ function NodeDetailBody({ detail, nodeId }: { detail: NodeDetail; nodeId: string
 
 function drainBannerText(drain: NodeDrain): string {
   if (drain.complete) return 'drain complete, the node holds no live work'
-  if (drain.horizon === null)
+  if (drain.deadline !== null) {
+    const notice =
+      drain.noticeAt === null ? '' : `, preemption notices ${formatRelativeTime(drain.noticeAt)}`
+    const empty =
+      drain.emptyBy === null
+        ? 'emptying time is unbounded'
+        : `empty ${formatTimeUntil(drain.emptyBy)}`
+    return `deadline ${formatRelativeTime(drain.deadline)}${notice}; ${empty}. Live attempts are preempted with notice; only backfill that finishes before the notices is admitted`
+  }
+  if (drain.emptyBy === null)
     return 'emptying time is unbounded, so nothing new is admitted until the live work ends'
-  return `empty ${formatTimeUntil(drain.horizon)}; until then only backfill that finishes by then is admitted`
+  return `empty ${formatTimeUntil(drain.emptyBy)}; until then only backfill that finishes by then is admitted`
 }
 
 /**
@@ -251,10 +261,23 @@ function DrainFacts({ summary }: { summary: NodeSummary }) {
       {drain !== null ? (
         <>
           <HostFact label="Requested at" value={formatTimestamp(drain.requestedAt)} />
+          <HostFact label="Kind" value={drain.deadline === null ? 'regular' : 'deadline'} />
+          {drain.deadline !== null ? (
+            <HostFact label="Deadline" value={formatTimestamp(drain.deadline)} />
+          ) : null}
+          {drain.noticeAt !== null ? (
+            <HostFact label="Notices at" value={formatTimestamp(drain.noticeAt)} />
+          ) : null}
           <HostFact
-            label="Horizon"
-            value={drain.horizon === null ? 'unbounded' : formatTimestamp(drain.horizon)}
+            label="Effective empty time"
+            value={drain.emptyBy === null ? 'unbounded' : formatTimestamp(drain.emptyBy)}
           />
+          {drain.maxNoticeShortfallSeconds !== null ? (
+            <HostFact
+              label="Max notice shortfall"
+              value={formatDuration(drain.maxNoticeShortfallSeconds)}
+            />
+          ) : null}
           <HostFact
             label="Complete"
             value={drain.complete ? 'yes — node holds no live work' : 'no'}

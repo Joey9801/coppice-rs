@@ -1217,6 +1217,10 @@ interface WireNodeDrain {
   requested_at: string
   horizon: string | null
   complete: boolean
+  deadline: string | null
+  notice_at: string | null
+  empty_by: string | null
+  max_notice_shortfall_seconds: number | null
 }
 
 function mapNodeDrain(d: WireNodeDrain): NodeDrain {
@@ -1224,6 +1228,10 @@ function mapNodeDrain(d: WireNodeDrain): NodeDrain {
     requestedAt: toDate(d.requested_at),
     horizon: toDateOrNull(d.horizon),
     complete: d.complete,
+    deadline: toDateOrNull(d.deadline),
+    noticeAt: toDateOrNull(d.notice_at),
+    emptyBy: toDateOrNull(d.empty_by),
+    maxNoticeShortfallSeconds: d.max_notice_shortfall_seconds,
   }
 }
 
