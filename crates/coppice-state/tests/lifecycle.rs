@@ -971,7 +971,8 @@ fn node_lost_fails_attempts_and_fences() {
     assert_eq!(
         sm.nodes[&nid(1)].node.drain,
         Some(Drain {
-            requested_at: ts(TS_US + 60_000_000)
+            requested_at: ts(TS_US + 60_000_000),
+            deadline: None,
         }),
         "a lost node is drained, stamped at the declaration"
     );
@@ -992,6 +993,7 @@ fn reregistration_bumps_epoch_and_preserves_drain() {
             node: nid(1),
             drain: Some(Drain {
                 requested_at: base_ts(),
+                deadline: None,
             }),
             updated_at: base_ts(),
             actor: None,
@@ -1010,7 +1012,8 @@ fn reregistration_bumps_epoch_and_preserves_drain() {
     assert_eq!(
         sm.nodes[&nid(1)].node.drain,
         Some(Drain {
-            requested_at: base_ts()
+            requested_at: base_ts(),
+            deadline: None,
         }),
         "an agent restart must not undo a drain"
     );
@@ -1025,6 +1028,7 @@ fn set_node_drain_keeps_the_original_drain_and_undrain_clears_it() {
     let mut sm = setup();
     let first = Drain {
         requested_at: base_ts(),
+        deadline: None,
     };
     apply_ok(&mut sm, drain_cmd_at(nid(1), base_ts()));
     apply_ok(&mut sm, drain_cmd_at(nid(1), ts(TS_US + 5_000_000)));
@@ -1336,6 +1340,7 @@ fn drained_node_rejects_placements_but_keeps_funding() {
             node: nid(1),
             drain: Some(Drain {
                 requested_at: base_ts(),
+                deadline: None,
             }),
             updated_at: base_ts(),
             actor: None,

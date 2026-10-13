@@ -49,12 +49,16 @@ message Node {
   Drain drain = 9;
 }
 
-// An operator's regular drain of one node (ADR 0044 §5): existing work
-// finishes naturally, and only bounded backfill guaranteed gone by the node's
-// horizon is admitted.
+// An operator's drain of one node (ADR 0044 §5). A regular drain (no
+// deadline): existing work finishes naturally, and only bounded backfill
+// guaranteed gone by the node's horizon is admitted. A deadline drain: the
+// node must be empty by `deadline_us`; backfill is admitted up to T_notice,
+// and what still runs then is notified and stopped at T_stop.
 message Drain {
   // When the drain was first requested; a repeated drain keeps this stamp.
   int64 requested_at_us = 1;
+  // The deadline D, µs. Absent for a regular drain.
+  optional int64 deadline_us = 2;
 }
 
 // Static description of the machine an agent runs on, collected once at

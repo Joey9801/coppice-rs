@@ -32,6 +32,7 @@ terminal = "72h"  # a terminal job before it leaves replicated state (ADR 0012)
 preemptible_multiplier = 0.75 # charge discount for an effectively preemptible job (≤ 1.0)
 notice_floor = "60s"          # shortest notice a job may declare, and the default notice
 notice_cap = "5m"             # longest notice a job may declare
+drain_cleanup_margin = "30s"  # a deadline drain's margin for exits to be reported
 
 [[priority_multiplier]]
 # The whole table is seeded in one shot, and only while the replicated table is

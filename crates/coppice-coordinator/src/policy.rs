@@ -103,7 +103,7 @@ pub struct FormationPolicy {
     #[serde(default)]
     pub retention: Option<RetentionSpec>,
     /// The preemption pricing and notice bounds, as the `[preemption]` table
-    /// (ADR 0044 §6). Absent = leave all three at their booted defaults.
+    /// (ADR 0044 §6). Absent = leave all four at their booted defaults.
     #[serde(default)]
     pub preemption: Option<PreemptionPolicySpec>,
 }
@@ -115,6 +115,7 @@ pub struct FormationPolicy {
 /// preemptible_multiplier = 0.75  # PolicyConfig::preemptible_multiplier, ≤ 1.0
 /// notice_floor = "60s"          # PolicyConfig::preemption_notice_floor
 /// notice_cap = "5m"             # PolicyConfig::preemption_notice_cap
+/// drain_cleanup_margin = "30s"  # PolicyConfig::drain_cleanup_margin (§5)
 /// ```
 ///
 /// Every field is optional; an omitted one leaves its booted default. Like
@@ -137,6 +138,10 @@ pub struct PreemptionPolicySpec {
     /// The longest notice a job may declare. Default 5 min.
     #[serde(default, with = "humantime_serde::option")]
     pub notice_cap: Option<std::time::Duration>,
+    /// A deadline drain's cleanup margin (ADR 0044 §5): `T_stop = deadline −
+    /// drain_cleanup_margin − abort_grace`. Default 30 s.
+    #[serde(default, with = "humantime_serde::option")]
+    pub drain_cleanup_margin: Option<std::time::Duration>,
 }
 
 impl PreemptionPolicySpec {
@@ -797,6 +802,13 @@ impl FormationPolicy {
                 cap != booted.preemption_notice_cap
                     && state.policy.preemption_notice_cap == booted.preemption_notice_cap
             });
+        let seeds_cleanup_margin = preemption
+            .drain_cleanup_margin
+            .map(Duration::from)
+            .is_some_and(|margin| {
+                margin != booted.drain_cleanup_margin
+                    && state.policy.drain_cleanup_margin == booted.drain_cleanup_margin
+            });
         if seeds_multipliers
             || seeds_weights
             || seeds_node_retention
@@ -804,6 +816,7 @@ impl FormationPolicy {
             || seeds_preemptible_multiplier
             || seeds_notice_floor
             || seeds_notice_cap
+            || seeds_cleanup_margin
         {
             let mut policy = state.policy.clone();
             if seeds_multipliers {
@@ -826,6 +839,9 @@ impl FormationPolicy {
             }
             if let (true, Some(cap)) = (seeds_notice_cap, preemption.notice_cap) {
                 policy.preemption_notice_cap = Duration::from(cap);
+            }
+            if let (true, Some(margin)) = (seeds_cleanup_margin, preemption.drain_cleanup_margin) {
+                policy.drain_cleanup_margin = Duration::from(margin);
             }
             // A lone bound may cross the other's current value; apply would
             // refuse the whole command, so name the document instead.
@@ -1165,6 +1181,10 @@ quota = 1000000000000
             preemption.notice_cap.map(Duration::from),
             Some(booted.preemption_notice_cap)
         );
+        assert_eq!(
+            preemption.drain_cleanup_margin.map(Duration::from),
+            Some(booted.drain_cleanup_margin)
+        );
         // Both launch roles are seeded, each under the label that makes
         // re-applying the policy a no-op (ADR 0037 §5).
         let labels: Vec<&str> = policy
@@ -1287,11 +1307,11 @@ quota = 1000000000000
             .is_empty());
     }
 
-    /// The `[preemption]` table (ADR 0044 §6) seeds its three knobs under
+    /// The `[preemption]` table (ADR 0044 §6) seeds its four knobs under
     /// the `[retention]` rule, and refuses a document apply would refuse.
     #[test]
     fn preemption_knobs_seed_only_from_the_booted_default() {
-        let doc = b"[preemption]\npreemptible_multiplier = 0.25\nnotice_floor = \"30s\"\nnotice_cap = \"2m\"\n";
+        let doc = b"[preemption]\npreemptible_multiplier = 0.25\nnotice_floor = \"30s\"\nnotice_cap = \"2m\"\ndrain_cleanup_margin = \"10s\"\n";
         let policy = FormationPolicy::parse_toml(doc).expect("[preemption] parses");
         let now = Timestamp::now();
         let fresh = StateMachine::default();
@@ -1303,6 +1323,7 @@ quota = 1000000000000
                 );
                 assert_eq!(up.policy.preemption_notice_floor, Duration::from_secs(30));
                 assert_eq!(up.policy.preemption_notice_cap, Duration::from_mins(2));
+                assert_eq!(up.policy.drain_cleanup_margin, Duration::from_secs(10));
                 assert_eq!(up.policy.node_retention, fresh.policy.node_retention);
             }
             other => panic!("expected one UpdatePolicy, got {other:?}"),
@@ -1324,6 +1345,7 @@ quota = 1000000000000
         applied.policy.preemptible_multiplier = PriorityMultiplier(1 << 30);
         applied.policy.preemption_notice_floor = Duration::from_secs(30);
         applied.policy.preemption_notice_cap = Duration::from_mins(2);
+        applied.policy.drain_cleanup_margin = Duration::from_secs(10);
         assert!(policy
             .commands(&applied, now, CHEAP_KDF)
             .expect("valid")

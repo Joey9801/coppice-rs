@@ -293,12 +293,14 @@ impl<'a> Pass<'a> {
         // Events for every node, not only accrual hosts: candidate bounds for
         // opening or moving an accrual sweep any eligible node (ADR 0027).
         let mut events = collect_release_events(snapshot);
-        // The horizon of every drained node its agent has not announced
+        // The horizon of every regularly drained node its agent has not announced
         // leaving, in one allocation scan: a pass-scoped memo (ADR 0044 §5).
         let drained: BTreeSet<NodeId> = snapshot
             .nodes
             .iter()
-            .filter(|(_, rec)| rec.node.drain.is_some() && !rec.draining)
+            .filter(|(_, rec)| {
+                rec.node.drain.is_some_and(|d| d.deadline.is_none()) && !rec.draining
+            })
             .map(|(id, _)| *id)
             .collect();
         let horizons = snapshot.node_horizons(&drained);
@@ -310,7 +312,7 @@ impl<'a> Pass<'a> {
         let mut node_index: BTreeMap<NodeId, usize> = BTreeMap::new();
         for (id, rec) in &snapshot.nodes {
             let hosts_accrual = accrual_nodes.contains(id);
-            let admission = rec.admission(|| {
+            let admission = rec.admission(&snapshot.policy, || {
                 horizons
                     .get(id)
                     .copied()

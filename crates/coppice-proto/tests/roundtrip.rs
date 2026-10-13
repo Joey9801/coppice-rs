@@ -271,7 +271,19 @@ fn every_command() -> Vec<Command> {
         }),
         Command::SetNodeDrain(SetNodeDrain {
             node,
-            drain: Some(Drain { requested_at: ts() }),
+            drain: Some(Drain {
+                requested_at: ts(),
+                deadline: None,
+            }),
+            updated_at: ts(),
+            actor: Some(open_posture_actor()),
+        }),
+        Command::SetNodeDrain(SetNodeDrain {
+            node,
+            drain: Some(Drain {
+                requested_at: ts(),
+                deadline: Some(ts() + Duration::from_hours(1)),
+            }),
             updated_at: ts(),
             actor: Some(open_posture_actor()),
         }),
@@ -923,6 +935,7 @@ fn policy_config_preemption_knobs_roundtrip_and_default_when_absent() {
         preemptible_multiplier: PriorityMultiplier(1 << 30),
         preemption_notice_floor: Duration::from_secs(10),
         preemption_notice_cap: Duration::from_mins(3),
+        drain_cleanup_margin: Duration::from_secs(5),
         ..PolicyConfig::default()
     };
     let encoded: pb::core::v1::PolicyConfig = (&policy).into();
@@ -934,7 +947,9 @@ fn policy_config_preemption_knobs_roundtrip_and_default_when_absent() {
     absent.preemptible_multiplier_q32_32 = None;
     absent.preemption_notice_floor_us = None;
     absent.preemption_notice_cap_us = None;
+    absent.drain_cleanup_margin_us = None;
     let back: PolicyConfig = absent.try_into().expect("policy must convert");
+    assert_eq!(back.drain_cleanup_margin, Duration::from_secs(30));
     assert_eq!(back.preemptible_multiplier, PriorityMultiplier(3 << 30));
     assert_eq!(back.preemption_notice_floor, Duration::from_secs(60));
     assert_eq!(back.preemption_notice_cap, Duration::from_mins(5));

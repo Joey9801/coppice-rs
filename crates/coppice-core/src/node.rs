@@ -47,15 +47,21 @@ pub struct Node {
     pub preemptible_only: bool,
 }
 
-/// An operator's drain of one node (ADR 0044 §5): a *regular* drain, which
-/// lets existing work finish naturally and admits only bounded backfill.
+/// An operator's drain of one node (ADR 0044 §5). A *regular* drain (no
+/// deadline) lets existing work finish naturally and admits only bounded
+/// backfill; a *deadline* drain additionally empties the node by `deadline`,
+/// notifying whatever still runs at `T_notice` and stopping it at `T_stop`.
 ///
-/// Set by `SetNodeDrain` (and by a loss declaration); cleared by undrain.
+/// Set by `SetNodeDrain` (and by a loss declaration, as a regular drain);
+/// cleared by undrain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Drain {
-    /// When the drain was first requested. A repeated drain keeps the
-    /// original stamp.
+    /// When the drain was first requested. A repeated drain, and a deadline
+    /// set or replaced on an existing drain, keeps the original stamp.
     pub requested_at: Timestamp,
+    /// The deadline `D` by which the node must be empty: containers gone and
+    /// exits reported. Absent for a regular drain.
+    pub deadline: Option<Timestamp>,
 }
 
 /// Static description of the machine an agent runs on, collected once at agent

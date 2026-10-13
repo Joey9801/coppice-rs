@@ -175,4 +175,8 @@ message PolicyConfig {
   // presence: absent decodes to 60 s and 5 min.
   optional int64 preemption_notice_floor_us = 15;
   optional int64 preemption_notice_cap_us = 16;
+  // A deadline drain's cleanup margin, microseconds (ADR 0044 §5): its
+  // T_stop is `deadline − drain_cleanup_margin − abort_grace`. Explicit
+  // presence: absent decodes to 30 s.
+  optional int64 drain_cleanup_margin_us = 17;
 }

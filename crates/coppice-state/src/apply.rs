@@ -400,7 +400,8 @@ impl StateMachine {
         // O(batch × allocations) (KOI-5). Built before validation because
         // drain backfill's fit check reads the pre-batch free capacity.
         let mut used = self.used_capacity_memo();
-        // The horizon of every drained node the batch places onto, in one
+        // The horizon of every regularly drained node the batch places onto (a
+        // deadline drain's cutoff is its T_notice, not the horizon), in one
         // more allocation scan, only when there is one (ADR 0044 §5). A
         // handler-scoped memo: backfill's cutoff is the horizon itself, so
         // seating it never moves the horizon and one value serves the batch.
@@ -409,9 +410,9 @@ impl StateMachine {
             .iter()
             .flat_map(|p| p.allocations.iter().map(|a| a.node))
             .filter(|n| {
-                self.nodes
-                    .get(n)
-                    .is_some_and(|r| r.node.drain.is_some() && !r.draining)
+                self.nodes.get(n).is_some_and(|r| {
+                    r.node.drain.is_some_and(|d| d.deadline.is_none()) && !r.draining
+                })
             })
             .collect();
         let mut backfill = BackfillCheck {
@@ -730,7 +731,7 @@ impl StateMachine {
         // an open node anything, and a drained one only bounded backfill
         // that completes by its horizon — the same `admits` the scheduler
         // asks, with this batch's `proposed_at` as the scheduler's `now`.
-        let admission = node.admits(&job.spec, backfill.now, self.policy.abort_grace, || {
+        let admission = node.admits(&job.spec, backfill.now, &self.policy, || {
             backfill
                 .horizons
                 .get(&spec.node)
@@ -1211,6 +1212,7 @@ impl StateMachine {
                 if rec.node.drain.is_none() {
                     rec.node.drain = Some(Drain {
                         requested_at: c.declared_at,
+                        deadline: None,
                     });
                 }
                 events.push(Event::NodeEpochBumped {
@@ -1261,17 +1263,63 @@ impl StateMachine {
         let Some(rec) = self.nodes.get_mut(&c.node) else {
             return Err(RejectionReason::UnknownNode(c.node));
         };
-        // Drain gates admission only: running work continues and existing
-        // accruals keep funding. Re-draining keeps the drain already on
-        // record, so `requested_at` never moves; undrain clears it.
-        match c.drain {
-            Some(drain) => {
-                if rec.node.drain.is_none() {
-                    rec.node.drain = Some(drain);
-                }
+        // ADR 0044 §5. A regular drain gates admission only: running work
+        // continues and existing accruals keep funding. The command's
+        // `requested_at` is the coordinator's receipt stamp — "now" for the
+        // rules below — while the stored drain keeps its original stamp on
+        // any re-drain. Undrain clears the record, always.
+        let Some(drain) = c.drain else {
+            rec.node.drain = None;
+            return Ok(Applied::default());
+        };
+        let now = drain.requested_at;
+        let Some(deadline) = drain.deadline else {
+            // A plain drain creates a regular drain, and on an existing record
+            // — regular or deadline — is a no-op: a repeated `drain` never
+            // removes a deadline (undrain, then drain again, does).
+            if rec.node.drain.is_none() {
+                rec.node.drain = Some(drain);
             }
-            None => rec.node.drain = None,
+            return Ok(Applied::default());
+        };
+        let current = rec.node.drain;
+        let previous = current.and_then(|d| d.deadline);
+        // The deadline already on record is a no-op, checked first so a
+        // retried request (a forward whose answer was lost) stays idempotent
+        // even once the lead below has run out.
+        if previous == Some(deadline) {
+            return Ok(Applied::default());
         }
+        // The deadline never moves later than the notice it promises: the
+        // lead from receipt must cover the longest notice, the stop grace and
+        // the cleanup margin.
+        let min_lead = self.policy.deadline_drain_min_lead();
+        if deadline.duration_since(now) < min_lead {
+            return Err(RejectionReason::DrainDeadlineTooSoon {
+                node: c.node,
+                min_lead,
+            });
+        }
+        if let Some(previous) = previous {
+            // A replacement — earlier or later — only while the deadline on
+            // record has not reached its notice time. A courtesy: one can
+            // still reach the agent after its notices went out, and the agent
+            // keeps every issued notice's stop regardless.
+            let notice_at = self.policy.deadline_drain_times(previous).t_notice;
+            if now >= notice_at {
+                return Err(RejectionReason::DrainNoticeStarted {
+                    node: c.node,
+                    notice_at,
+                });
+            }
+        }
+        let Some(rec) = self.nodes.get_mut(&c.node) else {
+            return Err(RejectionReason::UnknownNode(c.node));
+        };
+        rec.node.drain = Some(Drain {
+            requested_at: current.map_or(now, |d| d.requested_at),
+            deadline: Some(deadline),
+        });
         Ok(Applied::default())
     }
 

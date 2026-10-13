@@ -715,7 +715,7 @@ async fn every_write_endpoint_hits_its_exact_path_method_and_body_shape() {
         .update_job_metadata(job, &UpdateJobMetadataRequest::new())
         .await
         .unwrap();
-    client.drain_node(node).await.unwrap();
+    client.drain_node(node, None).await.unwrap();
     client.undrain_node(node).await.unwrap();
     client.remove_node(node).await.unwrap();
     client
@@ -747,6 +747,33 @@ async fn every_write_endpoint_hits_its_exact_path_method_and_body_shape() {
     for i in 4..7 {
         assert!(captured[i].body.is_empty(), "request {i} carried a body");
     }
+}
+
+/// If this fails, a deadline drain's deadline never reaches the server (or
+/// reaches it in a form other than the contract's RFC 3339 string).
+#[tokio::test]
+async fn a_deadline_drain_sends_its_deadline_as_a_json_body() {
+    let node = NodeId::new();
+    let store = capture_store();
+    let router = with_capture(
+        Router::new().route(
+            "/api/v1/nodes/:node/drain",
+            post(|| async { Json(empty_object()) }),
+        ),
+        store.clone(),
+    );
+    let base = spawn(router).await;
+    let client = Client::new(&base).unwrap();
+    let deadline: coppice_client::Timestamp = "2030-01-02T03:04:05.000000Z".parse().unwrap();
+    client.drain_node(node, Some(deadline)).await.unwrap();
+
+    let captured = store.lock().unwrap();
+    assert_eq!(captured.len(), 1);
+    let body: serde_json::Value = serde_json::from_slice(&captured[0].body).unwrap();
+    assert_eq!(
+        body,
+        serde_json::json!({ "deadline": "2030-01-02T03:04:05.000000Z" })
+    );
 }
 
 /// If this fails, a base URL a dev banner prints (already ending in
@@ -1042,7 +1069,7 @@ async fn a_non_json_error_body_becomes_unexpected_status_with_its_text() {
     );
     let base = spawn(router).await;
     let client = Client::new(&base).unwrap();
-    let err = client.drain_node(NodeId::new()).await.unwrap_err();
+    let err = client.drain_node(NodeId::new(), None).await.unwrap_err();
     assert!(matches!(err, Error::UnexpectedStatus { status: 502, .. }));
     assert_eq!(err.to_string(), "api error (HTTP 502): bad gateway");
 }
@@ -1057,7 +1084,7 @@ async fn an_empty_error_body_has_no_trailing_colon() {
     );
     let base = spawn(router).await;
     let client = Client::new(&base).unwrap();
-    let err = client.drain_node(NodeId::new()).await.unwrap_err();
+    let err = client.drain_node(NodeId::new(), None).await.unwrap_err();
     assert_eq!(err.to_string(), "api error (HTTP 502)");
 }
 
@@ -1078,7 +1105,7 @@ async fn a_421_leader_hint_surfaces_on_the_error_and_its_display() {
     );
     let base = spawn(router).await;
     let client = Client::new(&base).unwrap();
-    let err = client.drain_node(NodeId::new()).await.unwrap_err();
+    let err = client.drain_node(NodeId::new(), None).await.unwrap_err();
     assert_eq!(err.leader_hint(), Some("10.0.0.2:7070"));
     assert!(err.is_retryable());
     assert!(err

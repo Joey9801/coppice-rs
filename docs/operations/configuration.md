@@ -478,7 +478,7 @@ the replicated field still holds its booted default, exactly like the prices,
 so a re-run of `init` never overwrites an operator's later edit; either may be
 omitted, and zero is refused.
 
-The document may also set the three **preemption knobs** of
+The document may also set the four **preemption knobs** of
 [ADR 0044](../decisions/0044-job-preemption-and-spot-capacity.md):
 
 ```toml
@@ -486,6 +486,7 @@ The document may also set the three **preemption knobs** of
 preemptible_multiplier = 0.75 # charge discount for an effectively preemptible job, ≤ 1.0
 notice_floor = "60s"          # the shortest notice a job may declare, and the default
 notice_cap = "5m"             # the longest notice a job may declare
+drain_cleanup_margin = "30s"  # a deadline drain's margin for exits to be reported
 ```
 
 A job declares its own `[preemption]` table (`preemptible`, `notice`,
@@ -498,6 +499,12 @@ and is recorded on the attempt, so a later edit reprices nothing already
 placed. Each knob is seeded only while the replicated field still holds its
 booted default, like the retention windows; a multiplier above 1.0, or a
 floor that would end up above the cap, is refused.
+
+`drain_cleanup_margin` sizes a deadline drain (`coppice node drain
+--deadline`, see [scale-in](scale-in.md)): its attempts are stopped at
+`T_stop = deadline − drain_cleanup_margin − abort_grace` and notified
+`notice_cap` before that, and a deadline is refused unless it leaves at least
+`notice_cap + abort_grace + drain_cleanup_margin` from now.
 
 A `[[quota_entity]]` may also say `preemptible = false` to create the
 entity with preemption switched off for its whole subtree (the production

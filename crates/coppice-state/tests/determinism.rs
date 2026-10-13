@@ -283,14 +283,20 @@ fn arb_global() -> impl Strategy<Value = Command> {
             0usize..NODES as usize,
             any::<bool>(),
             any::<bool>(),
-            arb_ts()
+            arb_ts(),
+            proptest::option::of(arb_ts())
         )
-            .prop_map(|(n, drain, with_who, ts)| {
+            .prop_map(|(n, drain, with_who, ts, deadline)| {
                 Command::SetNodeDrain(SetNodeDrain {
                     node: node_of(n),
                     // Re-draining a draining node keeps the original stamp, so
-                    // sequences exercise both the set and the no-op paths.
-                    drain: drain.then_some(Drain { requested_at: ts }),
+                    // sequences exercise both the set and the no-op paths; a
+                    // deadline (ADR 0044 §5) exercises the lead rule, the
+                    // replacement rule and their rejections.
+                    drain: drain.then_some(Drain {
+                        requested_at: ts,
+                        deadline,
+                    }),
                     updated_at: ts,
                     // A cluster verb: whether this is accepted depends on the
                     // bindings installed earlier in the same sequence.
@@ -375,13 +381,16 @@ fn arb_global() -> impl Strategy<Value = Command> {
         }),
         // The preemption knobs (ADR 0044 §1), including refused ones: a
         // multiplier above 1.0 and a floor above the cap.
-        (0u64..(2 << 32), 0i64..400, 0i64..400).prop_map(|(m, floor_s, cap_s)| {
-            let mut policy = test_policy(4);
-            policy.preemptible_multiplier = PriorityMultiplier(m);
-            policy.preemption_notice_floor = Duration::from_secs(floor_s);
-            policy.preemption_notice_cap = Duration::from_secs(cap_s);
-            update_policy_cmd(policy)
-        }),
+        (0u64..(2 << 32), 0i64..400, 0i64..400, 0i64..120).prop_map(
+            |(m, floor_s, cap_s, margin_s)| {
+                let mut policy = test_policy(4);
+                policy.preemptible_multiplier = PriorityMultiplier(m);
+                policy.preemption_notice_floor = Duration::from_secs(floor_s);
+                policy.preemption_notice_cap = Duration::from_secs(cap_s);
+                policy.drain_cleanup_margin = Duration::from_secs(margin_s);
+                update_policy_cmd(policy)
+            }
+        ),
         // A preempting placement (ADR 0044 §4): a job from the pool seated
         // on a node with an eviction group drawn from the pool's
         // allocations. Most are refused (the job is not queued, a victim is

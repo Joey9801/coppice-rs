@@ -37,6 +37,7 @@ pub fn node_record(id: NodeId, epoch: u64, open: bool) -> NodeRecord {
             labels: BTreeMap::new(),
             drain: (!open).then_some(coppice_core::node::Drain {
                 requested_at: coppice_core::time::Timestamp::UNIX_EPOCH,
+                deadline: None,
             }),
             service_addr: None,
             host_facts: None,

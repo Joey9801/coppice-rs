@@ -422,7 +422,23 @@ pub fn drain_cmd(node: NodeId) -> Command {
 pub fn drain_cmd_at(node: NodeId, at: Timestamp) -> Command {
     Command::SetNodeDrain(SetNodeDrain {
         node,
-        drain: Some(Drain { requested_at: at }),
+        drain: Some(Drain {
+            requested_at: at,
+            deadline: None,
+        }),
+        actor: None,
+        updated_at: at,
+    })
+}
+
+/// Drain `node` with a deadline (ADR 0044 §5), the command received `at`.
+pub fn deadline_drain_cmd_at(node: NodeId, at: Timestamp, deadline: Timestamp) -> Command {
+    Command::SetNodeDrain(SetNodeDrain {
+        node,
+        drain: Some(Drain {
+            requested_at: at,
+            deadline: Some(deadline),
+        }),
         actor: None,
         updated_at: at,
     })

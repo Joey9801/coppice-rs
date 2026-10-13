@@ -604,7 +604,11 @@ fn node_read_models_round_trip_through_the_client() {
         labels: BTreeMap::from([("zone".to_string(), "a".to_string())]),
         drain: Some(dto::NodeDrain {
             requested_at: ts(3_000_000),
+            deadline: Some(ts(9_000_000)),
+            notice_at: Some(ts(4_500_000)),
             horizon: Some(ts(5_000_000)),
+            empty_by: Some(ts(9_500_000)),
+            max_notice_shortfall_seconds: Some(7),
             complete: false,
         }),
         agent_draining: true,

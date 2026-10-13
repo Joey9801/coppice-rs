@@ -865,6 +865,10 @@ pub struct PolicyConfig {
     /// long a termination can hold capacity. Validated ≥ the floor at policy
     /// commit. Default 5 min.
     pub preemption_notice_cap: Duration,
+    /// A deadline drain's cleanup margin (ADR 0044 §5): the time left
+    /// between `T_stop + abort_grace` and the drain's deadline for exits to
+    /// be reported. See [`PolicyConfig::deadline_drain_times`]. Default 30 s.
+    pub drain_cleanup_margin: Duration,
     /// Name of the token claim carrying a principal's groups (ADR 0022/0023),
     /// `"groups"` by default.
     ///
@@ -892,6 +896,7 @@ impl Default for PolicyConfig {
             preemptible_multiplier: DEFAULT_PREEMPTIBLE_MULTIPLIER,
             preemption_notice_floor: DEFAULT_PREEMPTION_NOTICE_FLOOR,
             preemption_notice_cap: DEFAULT_PREEMPTION_NOTICE_CAP,
+            drain_cleanup_margin: DEFAULT_DRAIN_CLEANUP_MARGIN,
             groups_claim: DEFAULT_GROUPS_CLAIM.to_string(),
         }
     }
@@ -904,6 +909,48 @@ pub const DEFAULT_PREEMPTION_NOTICE_FLOOR: Duration = Duration::from_secs(60);
 /// Default [`PolicyConfig::preemption_notice_cap`]: 5 min (ADR 0044 §6).
 /// Also the value an absent field decodes to.
 pub const DEFAULT_PREEMPTION_NOTICE_CAP: Duration = Duration::from_mins(5);
+
+/// Default [`PolicyConfig::drain_cleanup_margin`]: 30 s (ADR 0044 §5).
+/// Also the value an absent field decodes to.
+pub const DEFAULT_DRAIN_CLEANUP_MARGIN: Duration = Duration::from_secs(30);
+
+/// A deadline drain's two instants (ADR 0044 §5), from its deadline `D`:
+///
+/// ```text
+/// T_stop   = D − drain_cleanup_margin − abort_grace
+/// T_notice = T_stop − preemption_notice_cap
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeadlineDrainTimes {
+    /// When the coordinator plans every attempt still running to be stopped.
+    pub t_stop: Timestamp,
+    /// When notices go out, and when backfill admission closes.
+    pub t_notice: Timestamp,
+}
+
+impl PolicyConfig {
+    /// `T_stop` and `T_notice` of a deadline drain with deadline `deadline`,
+    /// under this policy (ADR 0044 §5). Apply, the scheduler's admission, the
+    /// read model, and dispatch all use this one helper.
+    pub fn deadline_drain_times(&self, deadline: Timestamp) -> DeadlineDrainTimes {
+        let t_stop = deadline
+            .saturating_sub(self.drain_cleanup_margin)
+            .saturating_sub(self.abort_grace);
+        DeadlineDrainTimes {
+            t_stop,
+            t_notice: t_stop.saturating_sub(self.preemption_notice_cap),
+        }
+    }
+
+    /// The least lead a deadline drain may be given from the coordinator's
+    /// receipt: `preemption_notice_cap + abort_grace + drain_cleanup_margin`
+    /// (ADR 0044 §5, "the deadline never moves later").
+    pub fn deadline_drain_min_lead(&self) -> Duration {
+        self.preemption_notice_cap
+            .saturating_add(self.abort_grace)
+            .saturating_add(self.drain_cleanup_margin)
+    }
+}
 
 /// Why a committed command was refused.
 ///
@@ -956,6 +1003,21 @@ pub enum RejectionReason {
     /// preemptible (ADR 0044 §4).
     #[error("node {0} accepts only preemptible work")]
     NodeRequiresPreemptible(NodeId),
+    /// A deadline drain whose deadline leaves less than
+    /// `preemption_notice_cap + abort_grace + drain_cleanup_margin` from the
+    /// command's receipt (ADR 0044 §5).
+    #[error(
+        "drain deadline for node {node} is too soon: a deadline drain needs at least {min_lead} \
+         from now (preemption_notice_cap + abort_grace + drain_cleanup_margin)"
+    )]
+    DrainDeadlineTooSoon { node: NodeId, min_lead: Duration },
+    /// A replacement deadline arrived once the deadline on record had
+    /// reached its notice time (ADR 0044 §5): notices may already be out.
+    #[error(
+        "node {node}'s drain deadline can no longer be replaced: its notice time {notice_at} has \
+         passed; undrain and drain again to start over"
+    )]
+    DrainNoticeStarted { node: NodeId, notice_at: Timestamp },
     /// Eviction of a node that is not draining by either flag (ADR 0041).
     #[error("node {0} is not draining")]
     NodeNotDraining(NodeId),

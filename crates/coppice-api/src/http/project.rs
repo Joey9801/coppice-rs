@@ -13,7 +13,6 @@ use coppice_core::attempt::AttemptState;
 use coppice_core::bytes::ByteSize;
 use coppice_core::id::{AllocationId, ClusterId, JobId, NodeId, QuotaEntityId};
 use coppice_core::job::JobState;
-use coppice_core::node::Drain;
 use coppice_core::quota::{self, CostUnits, PriorityMultiplier, TrueUp};
 use coppice_core::resource::Resources;
 use coppice_core::time::{Duration, Timestamp};
@@ -105,37 +104,102 @@ fn node_health(mark: Option<&LivenessMark>) -> dto::NodeHealth {
     }
 }
 
-/// The horizon of every drained node, in one allocation scan (ADR 0044 §5)
-/// — derived at read time, never stored.
-fn drain_horizons(state: &StateMachine) -> BTreeMap<NodeId, NodeHorizon> {
-    let drained = state
+/// The drain view of every node in `nodes` (all of them drained), in one
+/// allocation scan (ADR 0044 §5) — derived at read time, never stored.
+///
+/// - `horizon` / `complete`: from [`StateMachine::node_horizons`].
+/// - `notice_at`: `T_notice` of a deadline drain, else `null`.
+/// - `empty_by`: a regular drain's is its `horizon` (`null` when unbounded
+///   or complete). A deadline drain's is
+///   `max(D, ack.deadline + abort_grace + drain_cleanup_margin)` over the
+///   node's live (non-`Released`)
+///   allocations whose attempt has an acknowledged preemption — later than
+///   `D` only while a notice issued under an earlier, later deadline is still
+///   outstanding — and `null` once the drain is `complete`, matching a regular
+///   drain.
+/// - `max_notice_shortfall_seconds`: the largest acknowledged
+///   `notice_shortfall` among those attempts, whole seconds rounded up;
+///   `null` when no live attempt has an acknowledged preemption.
+fn drain_views(state: &StateMachine, nodes: &BTreeSet<NodeId>) -> BTreeMap<NodeId, dto::NodeDrain> {
+    let horizons = state.node_horizons(nodes);
+    // node -> (latest ack.deadline + grace + margin, max shortfall)
+    let mut acked: BTreeMap<NodeId, (Timestamp, Duration)> = BTreeMap::new();
+    let policy = &state.policy;
+    for record in state.allocations.values() {
+        let alloc = &record.allocation;
+        if matches!(alloc.state, AllocationState::Released) || !nodes.contains(&alloc.node) {
+            continue;
+        }
+        let Some(ack) = state
+            .attempts
+            .get(&alloc.attempt)
+            .and_then(|a| a.preemption.as_ref())
+            .and_then(|p| p.acknowledged.as_ref())
+        else {
+            continue;
+        };
+        let clear = ack
+            .deadline
+            .saturating_add(policy.abort_grace)
+            .saturating_add(policy.drain_cleanup_margin);
+        let entry = acked
+            .entry(alloc.node)
+            .or_insert((clear, ack.notice_shortfall));
+        entry.0 = entry.0.max(clear);
+        entry.1 = entry.1.max(ack.notice_shortfall);
+    }
+
+    nodes
+        .iter()
+        .filter_map(|id| {
+            let drain = state.nodes.get(id)?.node.drain.as_ref()?;
+            let (horizon, complete) = match horizons.get(id).copied().unwrap_or(NodeHorizon::Empty)
+            {
+                NodeHorizon::Empty => (None, true),
+                NodeHorizon::Unbounded => (None, false),
+                NodeHorizon::Bounded(at) => (Some(at), false),
+            };
+            let acked = acked.get(id);
+            let (notice_at, empty_by) = match drain.deadline {
+                None => (None, horizon),
+                Some(d) => (
+                    Some(policy.deadline_drain_times(d).t_notice),
+                    (!complete).then(|| acked.map_or(d, |(clear, _)| d.max(*clear))),
+                ),
+            };
+            Some((
+                *id,
+                dto::NodeDrain {
+                    requested_at: drain.requested_at,
+                    deadline: drain.deadline,
+                    notice_at,
+                    horizon,
+                    empty_by,
+                    max_notice_shortfall_seconds: acked.map(|(_, shortfall)| {
+                        let us = shortfall.as_micros().max(0);
+                        ((us + 999_999) / 1_000_000) as u64
+                    }),
+                    complete,
+                },
+            ))
+        })
+        .collect()
+}
+
+fn drained_nodes(state: &StateMachine) -> BTreeSet<NodeId> {
+    state
         .nodes
         .iter()
         .filter(|(_, record)| record.node.drain.is_some())
         .map(|(id, _)| *id)
-        .collect();
-    state.node_horizons(&drained)
-}
-
-/// A drain record and its derived status, as the node views show it.
-fn drain_view(drain: &Drain, horizon: Option<&NodeHorizon>) -> dto::NodeDrain {
-    let (horizon, complete) = match horizon.copied().unwrap_or(NodeHorizon::Empty) {
-        NodeHorizon::Empty => (None, true),
-        NodeHorizon::Unbounded => (None, false),
-        NodeHorizon::Bounded(at) => (Some(at), false),
-    };
-    dto::NodeDrain {
-        requested_at: drain.requested_at,
-        horizon,
-        complete,
-    }
+        .collect()
 }
 
 fn node_summary(
     node_id: &NodeId,
     record: &coppice_state::NodeRecord,
     memo: &NodeMemo,
-    horizons: &BTreeMap<NodeId, NodeHorizon>,
+    drains: &BTreeMap<NodeId, dto::NodeDrain>,
     usage: &UsageSnapshot,
     liveness: &LivenessMarks,
 ) -> dto::NodeSummary {
@@ -151,11 +215,7 @@ fn node_summary(
             .get(node_id)
             .map(|sample| (&sample.used).into()),
         labels: record.node.labels.clone(),
-        drain: record
-            .node
-            .drain
-            .as_ref()
-            .map(|drain| drain_view(drain, horizons.get(node_id))),
+        drain: drains.get(node_id).cloned(),
         agent_draining: record.draining,
         preemptible_only: record.node.preemptible_only,
         interruption_deadline: record.interruption_deadline,
@@ -177,7 +237,7 @@ pub fn list_nodes(
     liveness: &LivenessMarks,
 ) -> dto::ListNodesResponse {
     let memos = build_node_memos(state);
-    let horizons = drain_horizons(state);
+    let drains = drain_views(state, &drained_nodes(state));
     let empty = NodeMemo::default();
 
     let nodes = state
@@ -185,7 +245,7 @@ pub fn list_nodes(
         .iter()
         .map(|(id, record)| {
             let memo = memos.get(id).unwrap_or(&empty);
-            node_summary(id, record, memo, &horizons, usage, liveness)
+            node_summary(id, record, memo, &drains, usage, liveness)
         })
         .collect();
 
@@ -207,12 +267,12 @@ pub fn get_node(
     let memos = build_node_memos(state);
     let empty = NodeMemo::default();
     let memo = memos.get(id).unwrap_or(&empty);
-    let horizons = match record.node.drain {
-        Some(_) => BTreeMap::from([(*id, state.node_horizon(*id))]),
+    let drains = match record.node.drain {
+        Some(_) => drain_views(state, &BTreeSet::from([*id])),
         None => BTreeMap::new(),
     };
 
-    let summary = node_summary(id, record, memo, &horizons, usage, liveness);
+    let summary = node_summary(id, record, memo, &drains, usage, liveness);
 
     let active_attempts = state
         .attempts
@@ -1764,6 +1824,7 @@ mod tests {
         let open = NodeId::new();
         let drain = Some(coppice_core::node::Drain {
             requested_at: ts(5),
+            deadline: None,
         });
         let mut state = StateMachine::default();
         let mut record = test_node(empty);
@@ -1795,12 +1856,105 @@ mod tests {
         let complete = by_id[&empty].drain.clone().expect("drained");
         assert!(complete.complete);
         assert_eq!(complete.horizon, None);
+        assert_eq!(complete.empty_by, complete.horizon);
+        assert_eq!(complete.deadline, None);
+        assert_eq!(complete.notice_at, None);
+        assert_eq!(complete.max_notice_shortfall_seconds, None);
         assert!(!by_id[&empty].agent_draining);
         let unbounded = by_id[&busy].drain.clone().expect("drained");
         assert!(!unbounded.complete);
         assert_eq!(unbounded.horizon, None);
+        assert_eq!(unbounded.empty_by, unbounded.horizon);
         assert!(by_id[&busy].agent_draining);
         assert_eq!(by_id[&open].drain, None);
+    }
+
+    /// ADR 0044 §5: a deadline drain reports its notice time, an effective
+    /// emptying time of `D` — later only while an acknowledged notice from an
+    /// earlier, later deadline is outstanding — and the worst shortfall.
+    #[test]
+    fn a_deadline_drain_reports_notice_empty_by_and_shortfall() {
+        let node = NodeId::new();
+        let mut state = StateMachine::default();
+        let deadline = ts(10_000_000_000);
+        let mut record = test_node(node);
+        record.node.drain = Some(coppice_core::node::Drain {
+            requested_at: ts(5),
+            deadline: Some(deadline),
+        });
+        state.nodes.insert(node, record);
+        let times = state.policy.deadline_drain_times(deadline);
+
+        let view = |state: &StateMachine| {
+            list_nodes(state, &no_usage(), &no_liveness()).nodes[0]
+                .drain
+                .clone()
+                .expect("drained")
+        };
+
+        // Nothing live: complete, so no emptying time; no acknowledged notice.
+        let v = view(&state);
+        assert_eq!(v.deadline, Some(deadline));
+        assert_eq!(v.notice_at, Some(times.t_notice));
+        assert!(v.complete);
+        assert_eq!(v.empty_by, None);
+        assert_eq!(v.max_notice_shortfall_seconds, None);
+
+        // Live work with no acknowledged preemption: empty by D.
+        let (job, attempt, alloc) = (JobId::new(), AttemptId::new(), AllocationId::new());
+        state.attempts.insert(
+            attempt,
+            test_attempt(attempt, job, node, AttemptState::Running),
+        );
+        state.allocations.insert(
+            alloc,
+            test_allocation(alloc, job, attempt, node, AllocationState::Active),
+        );
+        let v = view(&state);
+        assert!(!v.complete);
+        assert_eq!(v.empty_by, Some(deadline));
+        assert_eq!(v.max_notice_shortfall_seconds, None);
+
+        // An acknowledged notice that clears before D leaves D; a zero
+        // shortfall is reported as 0, not null.
+        let policy = state.policy.clone();
+        let acknowledged = |ack_deadline: Timestamp, shortfall: Duration| {
+            Some(coppice_core::attempt::Preemption {
+                reason: coppice_core::attempt::PreemptReason::Drain,
+                requested_at: ts(6),
+                acknowledged: Some(coppice_core::attempt::Acknowledged {
+                    notified_at: ts(7),
+                    deadline: ack_deadline,
+                    notice_shortfall: shortfall,
+                }),
+            })
+        };
+        state.attempts.get_mut(&attempt).unwrap().preemption =
+            acknowledged(ts(1_000), Duration::ZERO);
+        let v = view(&state);
+        assert_eq!(v.empty_by, Some(deadline));
+        assert_eq!(v.max_notice_shortfall_seconds, Some(0));
+
+        // A notice issued under an earlier, later deadline is still
+        // outstanding: the node empties after D, and the shortfall rounds up.
+        let late = deadline.saturating_add(Duration::from_secs(100));
+        state.attempts.get_mut(&attempt).unwrap().preemption =
+            acknowledged(late, Duration::from_millis(1_500));
+        let v = view(&state);
+        assert_eq!(
+            v.empty_by,
+            Some(
+                late.saturating_add(policy.abort_grace)
+                    .saturating_add(policy.drain_cleanup_margin)
+            )
+        );
+        assert_eq!(v.max_notice_shortfall_seconds, Some(2));
+
+        // A released allocation no longer counts.
+        state.allocations.get_mut(&alloc).unwrap().allocation.state = AllocationState::Released;
+        let v = view(&state);
+        assert!(v.complete);
+        assert_eq!(v.max_notice_shortfall_seconds, None);
     }
 
     #[test]
@@ -2331,6 +2485,7 @@ mod tests {
         let mut draining = test_node(n2);
         draining.node.drain = Some(coppice_core::node::Drain {
             requested_at: ts(0),
+            deadline: None,
         });
         state.nodes.insert(n2, draining);
         state.allocations.insert(
