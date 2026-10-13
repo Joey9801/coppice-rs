@@ -2119,3 +2119,230 @@ async fn a_spot_reclaim_preempts_requeues_free_and_tells_the_next_attempt() {
     world.coord.shutdown().await;
     drop(world.agent_dir);
 }
+
+// ---- Scheduler priority preemption (ADR 0044 §4) -------------------------
+
+/// Propose a submission of `job` on node-filling `requests`, with an explicit
+/// class, multiplier and `[preemption]` table.
+async fn submit_classed(
+    coord: &RunningCoordinator,
+    job: JobId,
+    entity: QuotaEntityId,
+    requests: Resources,
+    priority: i32,
+    multiplier: PriorityMultiplier,
+    preemption: coppice_core::preemption::PreemptionSpec,
+) {
+    let applied = coord
+        .consensus()
+        .propose(Command::SubmitJob(SubmitJob {
+            job: Job {
+                id: job,
+                image: "registry/img:latest".into(),
+                command: vec!["run".into()],
+                entrypoint: None,
+                env: Default::default(),
+                requests,
+                priority,
+                max_runtime: None,
+                quota_entity: entity,
+                retry: RetryPolicy::default(),
+                abort_requested: None,
+                submitted_by: None,
+                metadata: Default::default(),
+                preemption,
+            },
+            multiplier,
+            submitted_at: Timestamp::now(),
+            actor: None,
+        }))
+        .await
+        .expect("propose SubmitJob");
+    assert!(
+        applied.outcome.is_ok(),
+        "SubmitJob rejected: {:?}",
+        applied.outcome
+    );
+}
+
+/// A scheduler preemption end to end: a low-class preemptible job fills the
+/// node, a higher-class job arrives with no room, and the pass evicts the
+/// first for the second. The victim is signalled, its mark is reported and
+/// acknowledged — which is what gives the waiting beneficiary a finite
+/// `projected_ready` — and at the end of its notice it is stopped,
+/// `Preempted { Priority }`, and requeued free while the beneficiary runs.
+#[tokio::test]
+async fn a_higher_class_job_preempts_running_work_and_runs_once_it_is_gone() {
+    use coppice_core::attempt::PreemptReason;
+    use coppice_core::preemption::{NoticeSignal, PreemptionSpec};
+
+    init_tracing();
+    let ca = Ca::new();
+    let coord = RunningCoordinator::start(ClusterId::new(), &ca).await;
+    poll(DEADLINE, "coordinator leadership", || {
+        let coord = &coord;
+        async move { coord.is_leader() }
+    })
+    .await;
+    let node = NodeId::new();
+    let agent_dir = tempfile::tempdir().expect("agent tempdir");
+    let executor = FakeExecutor::new();
+    let config = agent_config(
+        node,
+        agent_dir.path().join("data"),
+        &coord.agent_endpoint,
+        &ca,
+    );
+    let agent = spawn_agent(config, executor.clone()).await;
+    let views = coord.views();
+    poll(DEADLINE, "node registered", || {
+        let views = views.clone();
+        async move { node_epoch(&views, node).is_some_and(|e| e >= 1) }
+    })
+    .await;
+    let capacity = views.latest().state().nodes[&node].node.capacity;
+
+    // A short notice and grace, so the test waits seconds, not minutes.
+    let notice = coppice_core::time::Duration::from_secs(5);
+    let mut policy = views.latest().state().policy.clone();
+    policy.preemption_notice_floor = coppice_core::time::Duration::from_secs(1);
+    policy.abort_grace = coppice_core::time::Duration::from_secs(1);
+    let applied = coord
+        .consensus()
+        .propose(Command::UpdatePolicy(
+            coppice_state::command::UpdatePolicy {
+                policy,
+                updated_at: Timestamp::now(),
+                actor: None,
+            },
+        ))
+        .await
+        .expect("propose UpdatePolicy");
+    assert!(applied.outcome.is_ok(), "{:?}", applied.outcome);
+
+    let entity = QuotaEntityId::new();
+    seed_quota(&coord, entity).await;
+    let victim = JobId::new();
+    submit_classed(
+        &coord,
+        victim,
+        entity,
+        capacity,
+        0,
+        PriorityMultiplier::ONE,
+        PreemptionSpec {
+            preemptible: true,
+            notice: Some(notice),
+            notice_signal: NoticeSignal::Sigusr1,
+        },
+    )
+    .await;
+    poll(DEADLINE, "victim Running", || {
+        let views = views.clone();
+        async move {
+            current_attempt_id(&views, victim).and_then(|a| attempt_state(&views, a))
+                == Some(AttemptState::Running)
+        }
+    })
+    .await;
+    let victim_attempt = current_attempt_id(&views, victim).expect("victim attempt");
+    let victim_alloc = attempt_alloc(&views, victim_attempt).expect("victim allocation");
+
+    // The beneficiary: higher class, and a higher multiplier so its score
+    // beats the victim's head start in age (the score rule).
+    let beneficiary = JobId::new();
+    submit_classed(
+        &coord,
+        beneficiary,
+        entity,
+        capacity,
+        5,
+        PriorityMultiplier(2 << 32),
+        PreemptionSpec::default(),
+    )
+    .await;
+
+    // Chosen, signalled, and the mark acknowledged: the release event that
+    // mark manufactures gives the beneficiary's accrual a finite bound.
+    let reason = PreemptReason::Priority {
+        for_job: beneficiary,
+    };
+    poll(DEADLINE, "victim notified and acknowledged", || {
+        let views = views.clone();
+        async move {
+            views
+                .latest()
+                .state()
+                .attempts
+                .get(&victim_attempt)
+                .and_then(|a| a.preemption)
+                .is_some_and(|p| p.reason == reason && p.acknowledged.is_some())
+        }
+    })
+    .await;
+    // The notice window is seconds long, so the beneficiary is still
+    // waiting in its accrual here.
+    let state = views.latest().state().clone();
+    let Some(JobState::Attempting(attempt)) = state.jobs.get(&beneficiary).map(|j| j.state) else {
+        panic!("the beneficiary is committed accruing alongside the eviction");
+    };
+    let alloc = state.attempts[&attempt].attempt.allocation;
+    assert!(
+        state.accrual_queue.values().any(|a| *a == alloc),
+        "still accruing while its victim's notice runs"
+    );
+    let deadline = state.attempts[&victim_attempt]
+        .preemption
+        .and_then(|p| p.acknowledged)
+        .expect("acknowledged")
+        .deadline;
+    assert_eq!(
+        coppice_scheduler::projected_starts(&state)
+            .get(&alloc)
+            .copied()
+            .flatten(),
+        Some(deadline + state.policy.abort_grace),
+        "the acknowledged mark is the beneficiary's release event"
+    );
+    assert_eq!(
+        executor.signals_delivered(victim_alloc),
+        vec![NoticeSignal::Sigusr1]
+    );
+
+    // At the end of its notice the victim is stopped and resolves as a
+    // priority preemption, requeued without spending a retry.
+    let preempted = AttemptState::Terminal(AttemptOutcome::Preempted { reason });
+    poll(DEADLINE, "victim Preempted { Priority }", || {
+        let views = views.clone();
+        let preempted = preempted.clone();
+        async move { attempt_state(&views, victim_attempt) == Some(preempted) }
+    })
+    .await;
+    let victim_record = views.latest().state().jobs[&victim].clone();
+    assert_eq!(victim_record.retries_used, 0);
+    // Requeued: queued again, or already waiting in a fresh accrual of its
+    // own behind the beneficiary.
+    assert!(
+        match victim_record.state {
+            JobState::Queued => true,
+            JobState::Attempting(next) => next != victim_attempt,
+            _ => false,
+        },
+        "the victim requeues: {:?}",
+        victim_record.state
+    );
+
+    // The released capacity funds the beneficiary, which runs.
+    poll(DEADLINE, "beneficiary Running", || {
+        let views = views.clone();
+        async move {
+            current_attempt_id(&views, beneficiary).and_then(|a| attempt_state(&views, a))
+                == Some(AttemptState::Running)
+        }
+    })
+    .await;
+
+    stop_agent(agent).await;
+    coord.shutdown().await;
+    drop(agent_dir);
+}

@@ -288,3 +288,52 @@ pub fn setup(capacity: Resources, accrual_limit: u32) -> StateMachine {
     apply_ok(&mut sm, register_node_cmd(nid(1), capacity, base_ts()));
     sm
 }
+
+/// Submit a job with an explicit class, preemptibility and integer
+/// multiplier (ADR 0044 §1, §4); `submit_cmd_with` fixes `priority: 0`.
+pub fn submit_full(
+    sm: &mut StateMachine,
+    n: u128,
+    requests: Resources,
+    priority: i32,
+    preemptible: bool,
+    multiplier: u32,
+    max_runtime_s: Option<i64>,
+) {
+    let Command::SubmitJob(mut c) = submit_cmd_with(
+        jid(n),
+        requests,
+        max_runtime_s,
+        PriorityMultiplier::from_integer(multiplier),
+        base_ts(),
+        coppice_core::preemption::PreemptionSpec {
+            preemptible,
+            ..Default::default()
+        },
+    ) else {
+        unreachable!("submit_cmd_with builds a SubmitJob");
+    };
+    c.job.priority = priority;
+    apply_ok(sm, Command::SubmitJob(c));
+}
+
+/// Place, dispatch and start the already-submitted job `n` on `node` as
+/// attempt `aid(n)` / allocation `alid(n)`, started at `started_at`. The node
+/// must have room: the allocation is asserted funded.
+pub fn run_on(sm: &mut StateMachine, n: u128, node: NodeId, started_at: Timestamp) {
+    let requested = sm.jobs[&jid(n)].spec.requests;
+    apply_ok(
+        sm,
+        place_cmd(
+            placement(jid(n), aid(n), alid(n), node, requested),
+            started_at,
+        ),
+    );
+    assert_eq!(
+        sm.allocations[&alid(n)].allocation.state,
+        coppice_core::allocation::AllocationState::Funded,
+        "run_on needs room for job {n}"
+    );
+    apply_ok(sm, dispatch_cmd(aid(n), started_at));
+    apply_ok(sm, started_cmd(aid(n), started_at));
+}

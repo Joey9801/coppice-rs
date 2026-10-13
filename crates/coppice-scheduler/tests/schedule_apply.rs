@@ -54,6 +54,10 @@ struct JobGen {
     seed_running: bool,
     /// The job's `[preemption] preemptible` (ADR 0044 §1).
     preemptible: bool,
+    /// `Job.priority`, the class the preemption class rule compares.
+    priority: i32,
+    /// Which node (modulo the node count) a seeded-running job is placed on.
+    node: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -107,14 +111,20 @@ fn job_strategy() -> impl Strategy<Value = JobGen> {
         1u64..6,
         any::<bool>(),
         any::<bool>(),
+        0i32..3,
+        0usize..4,
     )
         .prop_map(
-            |(requests, max_runtime_s, multiplier_n, seed_running, preemptible)| JobGen {
-                requests,
-                max_runtime_s,
-                multiplier_n,
-                seed_running,
-                preemptible,
+            |(requests, max_runtime_s, multiplier_n, seed_running, preemptible, priority, node)| {
+                JobGen {
+                    requests,
+                    max_runtime_s,
+                    multiplier_n,
+                    seed_running,
+                    preemptible,
+                    priority,
+                    node,
+                }
             },
         )
 }
@@ -154,44 +164,74 @@ fn build_state(s: &Scenario) -> StateMachine {
         );
     }
 
-    let mut accrual_seeded = false;
+    // Nodes already holding their one seeded accrual, and the accruals seeded
+    // so far against the cap K.
+    let mut accrual_nodes = std::collections::BTreeSet::new();
     for (i, job) in s.jobs.iter().enumerate() {
         let job_id = jid((i + 1) as u128);
         let multiplier = PriorityMultiplier(job.multiplier_n << 32);
+        let Command::SubmitJob(mut submit) = submit_cmd_with(
+            job_id,
+            job.requests,
+            job.max_runtime_s,
+            multiplier,
+            base_ts(),
+            coppice_core::preemption::PreemptionSpec {
+                preemptible: job.preemptible,
+                ..Default::default()
+            },
+        ) else {
+            unreachable!("submit_cmd_with builds a SubmitJob");
+        };
+        submit.job.priority = job.priority;
+        apply_ok(&mut sm, Command::SubmitJob(submit));
+        // Seeding stops at a node's first accrual: a second would break the
+        // per-node ceiling, making the seeding command itself illegal. The
+        // seed is also skipped where apply would refuse it: work that is not
+        // preemptible on a spot node, or an accrual past the cap K.
+        let target = job.node % s.nodes.len();
+        let spot = target > 0 && s.spot[target];
+        if !job.seed_running || accrual_nodes.contains(&target) || (spot && !job.preemptible) {
+            continue;
+        }
+        let node = nid((target + 1) as u128);
+        let attempt = aid(1_000 + i as u128);
+        let alloc = alid(1_000 + i as u128);
+        // Funded work only: the node holds no accrual here (checked above),
+        // and released allocations hold nothing.
+        let used = sm
+            .allocations
+            .values()
+            .filter(|a| {
+                a.allocation.node == node
+                    && matches!(
+                        a.allocation.state,
+                        AllocationState::Funded | AllocationState::Active
+                    )
+            })
+            .fold(Resources::ZERO, |acc, a| {
+                acc.saturating_add(&a.allocation.funded)
+            });
+        let fits = used
+            .saturating_add(&job.requests)
+            .fits_within(&s.nodes[target]);
+        if !fits && accrual_nodes.len() as u32 >= s.accrual_limit {
+            continue;
+        }
         apply_ok(
             &mut sm,
-            submit_cmd_with(
-                job_id,
-                job.requests,
-                job.max_runtime_s,
-                multiplier,
+            place_cmd(
+                placement(job_id, attempt, alloc, node, job.requests),
                 base_ts(),
-                coppice_core::preemption::PreemptionSpec {
-                    preemptible: job.preemptible,
-                    ..Default::default()
-                },
             ),
         );
-        // Seeding stops at the node's first accrual: a second would break the
-        // per-node ceiling, making the seeding command itself illegal.
-        if job.seed_running && !accrual_seeded {
-            let attempt = aid(1_000 + i as u128);
-            let alloc = alid(1_000 + i as u128);
-            apply_ok(
-                &mut sm,
-                place_cmd(
-                    placement(job_id, attempt, alloc, nid(1), job.requests),
-                    base_ts(),
-                ),
-            );
-            if sm.allocations[&alloc].allocation.state == AllocationState::Funded {
-                apply_ok(&mut sm, dispatch_cmd(attempt, base_ts()));
-                apply_ok(&mut sm, started_cmd(attempt, base_ts()));
-            } else {
-                // Partially funded: the node's one accrual, left `Accruing` so
-                // passes start against an occupied node.
-                accrual_seeded = true;
-            }
+        if sm.allocations[&alloc].allocation.state == AllocationState::Funded {
+            apply_ok(&mut sm, dispatch_cmd(attempt, base_ts()));
+            apply_ok(&mut sm, started_cmd(attempt, base_ts()));
+        } else {
+            // Partially funded: the node's one accrual, left `Accruing` so
+            // passes start against an occupied node.
+            accrual_nodes.insert(target);
         }
     }
     for i in 0..s.nodes.len() {
@@ -242,6 +282,52 @@ proptest! {
         }
         prop_assert!(converged, "the pass never reached a fixpoint");
     }
+}
+
+/// Preemption is exercised by the keystone only when generation lines up, so
+/// pin it: a full node of preemptible class-0 work, queued class-2 jobs. The
+/// schedule -> apply loop proposes eviction groups, applies them cleanly and
+/// still reaches a fixpoint (victims stay running; the guard, the accrual cap
+/// and the placement caps bound the work).
+#[test]
+fn preemption_proposals_apply_and_reach_a_fixpoint() {
+    let mut sm = setup(cpu(8_000), 3);
+    apply_ok(&mut sm, register_node_cmd(nid(2), cpu(8_000), base_ts()));
+    for n in 1..=8u128 {
+        let node = nid(1 + (n % 2));
+        submit_full(&mut sm, n, cpu(2_000), 0, true, 1, None);
+        run_on(&mut sm, n, node, base_ts());
+    }
+    for n in 10..14u128 {
+        submit_full(&mut sm, n, cpu(3_000), 2, false, 3, Some(3600));
+    }
+    let mut mint = minter();
+    let mut now = ts(TS_US + 10);
+    let mut preempting = 0usize;
+    let mut converged = false;
+    for _ in 0..64 {
+        let proposal = schedule(&sm, now);
+        if proposal.is_empty() {
+            converged = true;
+            break;
+        }
+        preempting += proposal
+            .placements
+            .iter()
+            .filter(|p| !p.preemptions.is_empty())
+            .count();
+        apply_proposal(&mut sm, &proposal, &mut mint).expect("a preempting proposal applies");
+        now += Duration::from_secs(1);
+    }
+    assert!(converged, "the pass never reached a fixpoint");
+    assert!(
+        preempting >= 2,
+        "expected eviction groups, saw {preempting}"
+    );
+    assert!(
+        sm.attempts.values().any(|a| a.preemption.is_some()),
+        "apply recorded no termination"
+    );
 }
 
 /// A handful of fixed `synth_state` seeds at ~2k jobs: one schedule→apply cycle
