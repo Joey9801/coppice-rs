@@ -68,6 +68,9 @@ tower.workspace = true
 # mandatory client certs (ADR 0034), mirroring `coppice dev`'s PKI.
 rcgen.workspace = true
 tempfile.workspace = true
+# Paused time for the session's launch-bound tests (ADR 0044 §5): a hung pull
+# is abandoned at a wall-clock bound without the test waiting it out.
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

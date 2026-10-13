@@ -45,6 +45,27 @@ pub struct StartSpec {
     /// Enforced runtime bound; the agent's watchdog kills the container past
     /// it (outcome `RuntimeLimitExceeded`). `None` = unbounded.
     pub max_runtime: Option<Duration>,
+    /// Drain backfill's launch bound (ADR 0044 §5): an executor must refuse
+    /// to start the container after this instant, checking at the last point
+    /// before it starts — after the image pull — with
+    /// [`StartError::LaunchBoundPassed`]. `None` = no bound.
+    ///
+    /// It also bounds how long [`Executor::start`] may block: an executor
+    /// must stop waiting on any open-ended pre-start step (the image pull)
+    /// once this instant passes, clean up, and refuse — a hung pull past the
+    /// bound could only end in a refusal, so the attempt is handed back for
+    /// a free requeue then rather than whenever the pull gives up.
+    pub latest_start: Option<Timestamp>,
+}
+
+/// How long a start bounded by `latest_start` may still wait at `now` — zero
+/// once the bound has passed. The conversion from the wall-clock bound to the
+/// monotonic timer an executor waits on.
+pub(crate) fn launch_wait_budget(latest_start: Timestamp, now: Timestamp) -> StdDuration {
+    latest_start
+        .duration_since(now)
+        .to_std()
+        .unwrap_or(StdDuration::ZERO)
 }
 
 /// How a container exited, as observed from the runtime.
@@ -161,6 +182,11 @@ pub enum StartError {
     /// The container could not be started after a successful pull.
     #[error("start failed (user_error={user_error}): {message}")]
     Start { user_error: bool, message: String },
+    /// Drain backfill reached its launch point after its `latest_start`
+    /// (ADR 0044 §5): starting now could overrun the draining node's
+    /// horizon, so the launch is refused at the door.
+    #[error("launch refused: now is past the drain-backfill bound {latest_start}")]
+    LaunchBoundPassed { latest_start: Timestamp },
 }
 
 impl StartError {
@@ -173,6 +199,9 @@ impl StartError {
             StartError::Start { user_error, .. } => AttemptOutcome::StartFailed {
                 user_error: *user_error,
             },
+            // A revocation at the door: the attempt never ran, and it
+            // requeues free of retry budget like a scheduler revocation.
+            StartError::LaunchBoundPassed { .. } => AttemptOutcome::Revoked,
         }
     }
 }
@@ -243,6 +272,11 @@ pub trait Executor: Send + Sync + 'static {
     /// Start a container for `spec`. The intent has already been journaled and
     /// fsynced by the caller (ADR 0009), so a running container always has
     /// durable intent behind it.
+    ///
+    /// With a [`StartSpec::latest_start`] the call must not block past that
+    /// instant on an open-ended step such as the image pull: it gives up
+    /// there, undoes whatever it set up (created container, CPU grant, image
+    /// pin), and returns [`StartError::LaunchBoundPassed`].
     ///
     /// Desugared with an explicit `Send` bound: the live loop runs starts on
     /// their own tasks.
@@ -393,6 +427,10 @@ struct FakeInner {
     /// A container listed here exits naturally with the given code on the
     /// given signal; unlisted containers ignore notice signals.
     exit_on_signal: std::collections::BTreeMap<AllocationId, (NoticeSignal, i32)>,
+    /// When set, every [`Executor::start`] parks at its "pull" until the gate
+    /// opens — the fake's stand-in for a slow or hung image pull. Installed
+    /// by [`FakeExecutor::gate_pulls`].
+    pull_gate: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
 impl Default for FakeInner {
@@ -411,7 +449,19 @@ impl Default for FakeInner {
             started_env: Default::default(),
             signals: Vec::new(),
             exit_on_signal: std::collections::BTreeMap::new(),
+            pull_gate: None,
         }
+    }
+}
+
+/// The test's handle on a [`FakeExecutor`] pull gate: starts park at their
+/// pull until [`PullGate::open`] (or until the gate is dropped).
+pub struct PullGate(tokio::sync::watch::Sender<bool>);
+
+impl PullGate {
+    /// Let every parked and future pull through.
+    pub fn open(&self) {
+        self.0.send_replace(true);
     }
 }
 
@@ -566,13 +616,50 @@ impl FakeExecutor {
             .map(|(_, signal)| *signal)
             .collect()
     }
+
+    /// Hold every subsequent start at its "pull" until the returned gate
+    /// opens. A start with a `latest_start` stops waiting once the bound
+    /// passes — measured from the fake's clock, waited on tokio's — and is
+    /// refused, as the Docker executor gives up on a pull (ADR 0044 §5).
+    pub fn gate_pulls(&self) -> PullGate {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        self.lock().pull_gate = Some(rx);
+        PullGate(tx)
+    }
 }
 
 impl Executor for FakeExecutor {
     async fn start(&self, spec: StartSpec) -> Result<(), StartError> {
+        // The "pull": parks on the test's gate, if any, but never past the
+        // launch bound (the `Executor::start` contract). The std mutex is not
+        // held across the wait.
+        let gate = self.lock().pull_gate.clone();
+        if let Some(mut gate) = gate {
+            let opened = async {
+                // A dropped gate counts as opened.
+                let _ = gate.wait_for(|open| *open).await;
+            };
+            match spec.latest_start {
+                None => opened.await,
+                Some(latest_start) => {
+                    let budget = launch_wait_budget(latest_start, self.now());
+                    if tokio::time::timeout(budget, opened).await.is_err() {
+                        return Err(StartError::LaunchBoundPassed { latest_start });
+                    }
+                }
+            }
+        }
         let mut inner = self.lock();
         if let Some(err) = inner.fail_starts.remove(&spec.allocation) {
             return Err(err);
+        }
+        // The launch-bound check at the fake's "after the pull" point, read
+        // against the fake's own clock so a test can stand in for a slow pull
+        // with `advance`.
+        if let Some(latest_start) = spec.latest_start {
+            if inner.now > latest_start {
+                return Err(StartError::LaunchBoundPassed { latest_start });
+            }
         }
         *inner.start_counts.entry(spec.allocation).or_insert(0) += 1;
         let now = inner.now;
@@ -835,6 +922,13 @@ mod tests {
             .outcome(),
             AttemptOutcome::StartFailed { user_error: false }
         );
+        assert_eq!(
+            StartError::LaunchBoundPassed {
+                latest_start: Timestamp::UNIX_EPOCH
+            }
+            .outcome(),
+            AttemptOutcome::Revoked
+        );
     }
 
     #[tokio::test]
@@ -851,6 +945,7 @@ mod tests {
             env: Default::default(),
             limits: Resources::ZERO,
             max_runtime: None,
+            latest_start: None,
         })
         .await
         .unwrap();
@@ -886,6 +981,7 @@ mod tests {
             env: Default::default(),
             limits: Resources::ZERO,
             max_runtime: None,
+            latest_start: None,
         })
         .await
         .unwrap();

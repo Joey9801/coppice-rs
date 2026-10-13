@@ -110,6 +110,14 @@ message StartJob {
   // agent can run its own stop path (drain plan or interruption) without the
   // coordinator.
   uint64 abort_grace_us = 16;
+  // Drain backfill's launch bound (ADR 0044 §5): the latest wall-clock
+  // instant the agent may start this container, `cutoff − max_runtime −
+  // abort_grace`. Absent for an ordinary placement. The agent checks it at
+  // the last point before the container starts — after the image pull — and
+  // refuses a later launch, reporting the attempt terminal `Revoked` with
+  // runtime 0 (a free requeue), so a backfill admitted against a draining
+  // node's horizon can never overrun it.
+  optional int64 latest_start_us = 17;
 }
 
 // Stop the work under an allocation (SIGTERM, grace, SIGKILL). Idempotent,

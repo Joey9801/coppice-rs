@@ -631,6 +631,19 @@ impl<F: Fs, E: Executor> Session<F, E> {
                 .map(|(name, value)| (name.to_string(), value)),
         );
 
+        // Drain backfill's launch bound (ADR 0044 §5), under the same rule: a
+        // bound outside the timestamp range is a malformed command.
+        let latest_start = match sj.latest_start_us {
+            None => None,
+            Some(us) => match Timestamp::from_micros(us) {
+                Some(at) => Some(at),
+                None => {
+                    tracing::warn!(node = %self.node, %alloc, "dropping malformed StartJob (latest_start out of range)");
+                    return Ok(Vec::new());
+                }
+            },
+        };
+
         if self.drained {
             tracing::info!(node = %self.node, %alloc, "starting committed StartJob while drained (intent predates the drain)");
         }
@@ -673,11 +686,23 @@ impl<F: Fs, E: Executor> Session<F, E> {
                 .and_then(|r| r.try_into().ok())
                 .unwrap_or(Resources::ZERO),
             max_runtime,
+            latest_start,
         };
         // The intent is durable; the start itself (an image pull can take
         // minutes) runs on the loop's own task, and its result comes back
         // through `finish_start`.
         self.starting.insert(alloc);
+        // Already past the launch bound on arrival: refuse at the door
+        // without pulling. Otherwise the executor contract bounds the start:
+        // it stops waiting on the pull once `latest_start` passes and checks
+        // again just before the container starts.
+        if let Some(latest_start) = latest_start {
+            let now = Timestamp::now();
+            if now > latest_start {
+                let refused = Err(crate::executor::StartError::LaunchBoundPassed { latest_start });
+                return self.finish_start(alloc, refused, now).await;
+            }
+        }
         self.pending_starts.push(spec);
         Ok(Vec::new())
     }
@@ -723,6 +748,9 @@ impl<F: Fs, E: Executor> Session<F, E> {
                 Ok(reports)
             }
             Err(e) => {
+                // A refused launch (drain backfill past its bound) takes this
+                // path too: journaled and reported terminal `Revoked`, runtime
+                // zero, exactly like any start that never ran.
                 let outcome = e.outcome();
                 tracing::warn!(node = %self.node, %alloc, error = %e, "container start failed");
                 self.record_exit(alloc, attempt, job, outcome.clone(), Duration::ZERO)?;
