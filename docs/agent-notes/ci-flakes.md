@@ -35,12 +35,18 @@ reliably than running the test alone.
 
 ## Docker Hub anonymous pull-rate limit
 
-`crates/coppice-agent/tests/docker_executor.rs` pulls images anonymously
-from Docker Hub, both locally and in CI. Anonymous pulls are rate-limited;
-hitting the limit surfaces as a `429` and takes roughly 30 minutes to clear.
-This is a live flake vector for any CI run that touches the Docker executor
-tests, not just a local annoyance — if you see a `429`-shaped Docker pull
-failure in CI, that's the likely cause, not a real regression.
+**Fixed** ([#175](https://github.com/Joey9801/coppice-rs/issues/175)).
+Anonymous Docker Hub pulls are rate-limited per source IP, GitHub-hosted
+runners share egress IPs, and a limit hit (`toomanyrequests`, ~30 minutes to
+clear) failed every `docker_executor` test at once. Now the suite's images are
+named `mirror.gcr.io/library/...` (Google's pull-through cache of the official
+Hub images), and CI pulls them in a retrying step of its own,
+`scripts/pull-test-images.sh`, before nextest, so a lasting registry failure
+fails that one step. The image list lives in
+`crates/coppice-agent/tests/docker-test-images.txt`; the
+`image_list_is_complete` test keeps it in step with the test consts, so a new
+test image must be added to both. If you see `toomanyrequests` again, check
+that the image reference still goes through the mirror.
 
 ## Other resolved flakes (context if you hit something similar)
 
