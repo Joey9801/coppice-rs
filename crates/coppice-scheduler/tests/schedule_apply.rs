@@ -62,6 +62,11 @@ struct Scenario {
     /// Which nodes beyond the first are spot-only (ADR 0044 §4). The first
     /// node is always ordinary: seeding places on it without asking the gate.
     spot: Vec<bool>,
+    /// Which nodes are under the operator's drain once seeding is done
+    /// (ADR 0044 §5): with the first node's seeded work — bounded, unbounded,
+    /// or an accrual — that covers backfill against a bounded horizon, no
+    /// horizon, and an empty drained node.
+    drained: Vec<bool>,
     accrual_limit: u32,
     jobs: Vec<JobGen>,
 }
@@ -118,12 +123,14 @@ fn scenario_strategy() -> impl Strategy<Value = Scenario> {
     (
         prop::collection::vec(node_strategy(), 1..4),
         prop::collection::vec(any::<bool>(), 4),
+        prop::collection::vec(any::<bool>(), 4),
         1u32..5,
         prop::collection::vec(job_strategy(), 1..30),
     )
-        .prop_map(|(nodes, spot, accrual_limit, jobs)| Scenario {
+        .prop_map(|(nodes, spot, drained, accrual_limit, jobs)| Scenario {
             nodes,
             spot,
+            drained,
             accrual_limit,
             jobs,
         })
@@ -185,6 +192,11 @@ fn build_state(s: &Scenario) -> StateMachine {
                 // passes start against an occupied node.
                 accrual_seeded = true;
             }
+        }
+    }
+    for i in 0..s.nodes.len() {
+        if s.drained[i] {
+            apply_ok(&mut sm, drain_cmd(nid((i + 1) as u128), base_ts()));
         }
     }
     sm

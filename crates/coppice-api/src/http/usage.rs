@@ -820,6 +820,7 @@ mod tests {
             settlement: None,
             effective_preemptible: false,
             preemption: None,
+            drain_cutoff: None,
         }
     }
 

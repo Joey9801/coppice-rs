@@ -156,6 +156,12 @@ message AttemptRecord {
   // while it is Running. Absent for an attempt the platform never asked to
   // stop.
   coppice.core.v1.Preemption preemption = 10;
+  // The completion cutoff this attempt was admitted under as drain backfill
+  // (ADR 0044 §5): the draining node's horizon at placement. Absent for an
+  // ordinary placement. It bounds the attempt for its whole life: dispatch
+  // derives the launch bound from it, and it keeps the node's horizon from
+  // moving later once the attempt runs.
+  optional int64 drain_cutoff_us = 11;
 }
 
 // An allocation's replicated record plus its commit-order sequence. Keyed

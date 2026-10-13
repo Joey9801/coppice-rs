@@ -1294,7 +1294,7 @@ async fn shutdown_while_idle_announces_the_drain_and_exits() {
         .expect_clean_exit(Duration::from_secs(5), "an idle agent's drain")
         .await;
 
-    // And the node takes no more work: `accepts_placements()` is false while
+    // And the node takes no more work: an announced node admits nothing while
     // draining, so a fresh job has nowhere to go and stays queued.
     let entity = QuotaEntityId::new();
     seed_quota(&coord, entity).await;

@@ -24,7 +24,7 @@ use coppice_core::job::{Job, JobState};
 use coppice_core::node::Node;
 use coppice_core::resource::Resources;
 use coppice_core::time::{Duration, Timestamp};
-use coppice_state::StateMachine;
+use coppice_state::{Admission, NodeAdmission, StateMachine};
 
 use crate::projection::{
     collect_release_events, sort_release_events, sweep_projected_ready, ReleaseEvent,
@@ -158,11 +158,13 @@ struct SimAccrual {
 /// packing loops read capacity and labels without a map lookup.
 struct NodeModel<'a> {
     node: &'a Node,
-    /// Whether this node may take new work: not draining by the record or
-    /// the announcement (`NodeRecord::is_draining`, ADR 0044 §5), captured
-    /// once per pass so every candidate filter asks the same question apply
-    /// will.
-    accepts_placements: bool,
+    /// What this node admits (`NodeRecord::admission`, ADR 0044 §5),
+    /// captured once per pass from the same horizon apply computes, so every
+    /// candidate filter asks the question apply will. Only `Open` nodes are
+    /// candidates for ordinary seats, accrual opens and moves, and lends; a
+    /// `Backfill` node takes bounded backfill alone, through
+    /// `try_drain_backfill`.
+    admission: NodeAdmission,
     /// Free capacity mirroring `free_capacity`, decremented as the batch seats
     /// work and incremented (then re-pledged) as it revokes accruals.
     sim_free: Resources,
@@ -178,13 +180,20 @@ struct NodeModel<'a> {
     pending_accruals: Vec<Resources>,
 }
 
-/// The placement gate a candidate node must pass for one job: the node
-/// takes new work at all (ADR 0041), and — when it is a spot-only node — the
-/// job is effectively preemptible (ADR 0044 §4). The same two checks apply's
-/// `validate_placement` makes, asked from the same snapshot, so the pass
-/// never proposes a seat apply would refuse.
+/// The placement gate a candidate node must pass for one job on every path
+/// except drain backfill: the node is open (not draining by either flag,
+/// ADR 0044 §5), and — when it is a spot-only node — the job is effectively
+/// preemptible (ADR 0044 §4). The same checks apply's `validate_placement`
+/// makes, asked from the same snapshot, so the pass never proposes a seat
+/// apply would refuse. A draining node never passes, so no accrual is ever
+/// opened on one or moved onto one.
 fn node_admits(nm: &NodeModel, preemptible: bool) -> bool {
-    nm.accepts_placements && (!nm.node.preemptible_only || preemptible)
+    nm.admission == NodeAdmission::Open && spot_admits(nm, preemptible)
+}
+
+/// The spot-only rule alone (ADR 0044 §4).
+fn spot_admits(nm: &NodeModel, preemptible: bool) -> bool {
+    !nm.node.preemptible_only || preemptible
 }
 
 /// The spot tie-break (ADR 0044 §4): between two equally scored nodes, an
@@ -244,14 +253,30 @@ impl<'a> Pass<'a> {
         // Events for every node, not only accrual hosts: candidate bounds for
         // opening or moving an accrual sweep any eligible node (ADR 0027).
         let mut events = collect_release_events(snapshot);
+        // The horizon of every drained node its agent has not announced
+        // leaving, in one allocation scan: a pass-scoped memo (ADR 0044 §5).
+        let drained: BTreeSet<NodeId> = snapshot
+            .nodes
+            .iter()
+            .filter(|(_, rec)| rec.node.drain.is_some() && !rec.draining)
+            .map(|(id, _)| *id)
+            .collect();
+        let horizons = snapshot.node_horizons(&drained);
 
         let mut nodes: Vec<NodeModel> = Vec::new();
         let mut node_index: BTreeMap<NodeId, usize> = BTreeMap::new();
         for (id, rec) in &snapshot.nodes {
             let hosts_accrual = accrual_nodes.contains(id);
-            // Nodes that refuse placements matter only as accrual sources to
-            // re-plan off of; a drained node with no accruals is dead weight.
-            if rec.is_draining() && !hosts_accrual {
+            let admission = rec.admission(|| {
+                horizons
+                    .get(id)
+                    .copied()
+                    .unwrap_or(coppice_state::NodeHorizon::Unbounded)
+            });
+            // A closed node matters only as an accrual source to re-plan off
+            // of; with no accruals it is dead weight. A drained node with a
+            // bounded horizon stays in as a backfill target.
+            if admission == NodeAdmission::Closed && !hosts_accrual {
                 continue;
             }
             let mut accruals: Vec<SimAccrual> = Vec::new();
@@ -283,7 +308,7 @@ impl<'a> Pass<'a> {
             node_index.insert(*id, idx);
             nodes.push(NodeModel {
                 node: &rec.node,
-                accepts_placements: !rec.is_draining(),
+                admission,
                 sim_free: base_free.get(id).copied().unwrap_or(Resources::ZERO),
                 accruals,
                 events: evs,
@@ -363,7 +388,7 @@ impl<'a> Pass<'a> {
     }
 
     /// Re-plan existing accruals (scheduling-model.md): if a distinct
-    /// accruing job's full request now fits on another placement-accepting node,
+    /// accruing job's full request now fits on another open node,
     /// revoke its accrual and reseat it there, funded. Failing that, move it
     /// to a node that meaningfully improves its `projected_ready` bound
     /// (ADR 0027): always when the move turns an indefinite bound finite,
@@ -616,7 +641,7 @@ impl<'a> Pass<'a> {
         best.map(|(_, _, i)| i)
     }
 
-    /// Best placement-accepting node — other than `source`, accrual-free, and not
+    /// Best open node — other than `source`, accrual-free, and not
     /// already a revocation source — whose free capacity holds the whole
     /// request. Accrual-free keeps the target off any future revocation, so the
     /// batch never places-then-revokes on one node.
@@ -715,6 +740,9 @@ impl<'a> Pass<'a> {
             if self.try_free_fit(rank.job, &jr.spec, preemptible, &requested, &required) {
                 continue;
             }
+            if self.try_drain_backfill(rank.job, &jr.spec, preemptible, &requested, &required) {
+                continue;
+            }
             if self.try_backfill(rank.job, &jr.spec, preemptible, &requested, &required) {
                 continue;
             }
@@ -758,6 +786,67 @@ impl<'a> Pass<'a> {
         // join the accrual set.
         let pledge = self.nodes[idx].sim_free.component_min(requested);
         self.nodes[idx].sim_free = self.nodes[idx].sim_free.saturating_sub(&pledge);
+        self.placed_nodes.insert(node_id);
+        self.placements.push(ProposedPlacement {
+            job: job_id,
+            node: node_id,
+            requested: *requested,
+            expect_funded: true,
+        });
+        true
+    }
+
+    /// Drain backfill (ADR 0044 §5): seat a bounded job, fully funded, on the
+    /// best-fit draining node whose horizon it completes by. The cutoff is
+    /// the horizon itself, so the seat never moves the horizon and one
+    /// pass-start value serves every later candidate.
+    ///
+    /// Fit is against `sim_free`, which on a backfill node is exactly what
+    /// apply checks: free capacity before the batch, less the batch's
+    /// earlier seats there. A backfill node holds no accrual (an accrual
+    /// leaves its horizon unbounded), so no revocation ever touches it, and
+    /// no other path places onto it.
+    fn try_drain_backfill(
+        &mut self,
+        job_id: JobId,
+        job: &Job,
+        preemptible: bool,
+        requested: &Resources,
+        required: &BTreeMap<String, String>,
+    ) -> bool {
+        if job.max_runtime.is_none() {
+            return false;
+        }
+        let abort_grace = self.snapshot.policy.abort_grace;
+        let mut best: Option<(f64, usize)> = None;
+        for (i, nm) in self.nodes.iter().enumerate() {
+            if !matches!(nm.admission, NodeAdmission::Backfill { .. })
+                || !matches!(
+                    nm.admission.admits(job, self.now, abort_grace),
+                    Admission::Backfill { .. }
+                )
+                || !spot_admits(nm, preemptible)
+                || !requested.fits_within(&nm.node.capacity)
+                || !node_satisfies_labels(required, &nm.node.labels)
+                || !requested.fits_within(&nm.sim_free)
+            {
+                continue;
+            }
+            let key = dominant_leftover_fraction(&nm.sim_free, requested, &nm.node.capacity)
+                - cache_affinity_bonus(job, nm.node);
+            let better = match best {
+                None => true,
+                Some((bk, bi)) => {
+                    key < bk || (key == bk && prefers_on_tie(preemptible, nm, &self.nodes[bi]))
+                }
+            };
+            if better {
+                best = Some((key, i));
+            }
+        }
+        let Some((_, idx)) = best else { return false };
+        let node_id = self.nodes[idx].node.id;
+        self.nodes[idx].sim_free = self.nodes[idx].sim_free.saturating_sub(requested);
         self.placed_nodes.insert(node_id);
         self.placements.push(ProposedPlacement {
             job: job_id,

@@ -668,6 +668,11 @@ fn build_attempt(
             settlement,
             effective_preemptible: false,
             preemption: None,
+            // Roughly one attempt in sixteen as drain backfill (ADR 0044
+            // §5), keyed off the id rather than the rng so the rest of the
+            // synthetic stream is unchanged.
+            drain_cutoff: (attempt_id.0.as_u128() % 16 == 0)
+                .then(|| charged_at + Duration::from_secs(7_200)),
         },
     ));
     let allocation = Allocation {

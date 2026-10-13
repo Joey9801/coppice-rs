@@ -796,3 +796,174 @@ fn a_finite_bound_moves_only_for_a_meaningful_improvement() {
     assert_eq!(proposal.placements.len(), 1);
     assert_eq!(proposal.placements[0].node, nid(2));
 }
+
+// ---- drain backfill (ADR 0044 §5) ----
+
+/// `setup` (one 32-cpu node), a running anchor `jid(1)` of 8 cpu with the
+/// given `max_runtime`, started at `base_ts()`, then the node drained. With
+/// the default 30 s `abort_grace` a 3600 s anchor bounds the node at
+/// `base + 3630 s`.
+fn drained_with_anchor(max_runtime_s: Option<i64>) -> StateMachine {
+    let mut sm = setup(cpu(32_000), 4);
+    seed_running(&mut sm, 1, 1, cpu(8_000), max_runtime_s);
+    apply_ok(&mut sm, drain_cmd(nid(1), base_ts()));
+    sm
+}
+
+fn secs(n: i64) -> Timestamp {
+    ts(TS_US + n * 1_000_000)
+}
+
+#[test]
+fn a_drained_node_takes_bounded_backfill_within_its_horizon() {
+    let mut sm = drained_with_anchor(Some(3_600));
+    // Fits by the horizon: 60 + 1800 + 30 ≤ 3630.
+    apply_ok(
+        &mut sm,
+        submit_cmd(
+            jid(2),
+            cpu(4_000),
+            Some(1_800),
+            PriorityMultiplier::ONE,
+            base_ts(),
+        ),
+    );
+    // Overruns it: 60 + 3600 + 30 > 3630.
+    apply_ok(
+        &mut sm,
+        submit_cmd(
+            jid(3),
+            cpu(4_000),
+            Some(3_600),
+            PriorityMultiplier::ONE,
+            base_ts(),
+        ),
+    );
+    // No bound at all.
+    apply_ok(
+        &mut sm,
+        submit_cmd(jid(4), cpu(4_000), None, PriorityMultiplier::ONE, base_ts()),
+    );
+    let proposal = schedule(&sm, secs(60));
+    let jobs: Vec<_> = proposal.placements.iter().map(|p| p.job).collect();
+    assert_eq!(jobs, vec![jid(2)], "only the bounded fit is backfill");
+    assert!(proposal.placements[0].expect_funded);
+    let minted = commit(&mut sm, &proposal).expect("apply admits what the pass proposed");
+    let attempt = &sm.attempts[&minted[0].0];
+    assert_eq!(attempt.drain_cutoff, Some(secs(3_630)));
+}
+
+#[test]
+fn unbounded_running_work_leaves_a_drained_node_nothing_to_backfill() {
+    let mut sm = drained_with_anchor(None);
+    apply_ok(
+        &mut sm,
+        submit_cmd(
+            jid(2),
+            cpu(1_000),
+            Some(300),
+            PriorityMultiplier::ONE,
+            base_ts(),
+        ),
+    );
+    assert!(schedule(&sm, secs(60)).is_empty());
+}
+
+#[test]
+fn an_empty_drained_node_takes_nothing() {
+    let mut sm = setup(cpu(32_000), 4);
+    apply_ok(&mut sm, drain_cmd(nid(1), base_ts()));
+    apply_ok(
+        &mut sm,
+        submit_cmd(
+            jid(2),
+            cpu(1_000),
+            Some(300),
+            PriorityMultiplier::ONE,
+            base_ts(),
+        ),
+    );
+    assert!(schedule(&sm, secs(60)).is_empty());
+}
+
+/// A bounded job too big for the drained node's free capacity now is not
+/// left accruing there: backfill is fully funded or not placed at all.
+#[test]
+fn no_accrual_opens_on_a_drained_node() {
+    let mut sm = drained_with_anchor(Some(3_600));
+    apply_ok(
+        &mut sm,
+        submit_cmd(
+            jid(2),
+            cpu(30_000),
+            Some(300),
+            PriorityMultiplier::ONE,
+            base_ts(),
+        ),
+    );
+    assert!(schedule(&sm, secs(60)).is_empty());
+}
+
+/// Backfill's cutoff is the horizon itself, so seating it leaves the horizon
+/// exactly where it was, and later passes keep refusing work that would
+/// overrun it — however many backfill seats have landed.
+#[test]
+fn backfill_cannot_move_the_horizon_later() {
+    let mut sm = drained_with_anchor(Some(3_600));
+    let before = sm.node_horizon(nid(1));
+    assert_eq!(before, coppice_state::NodeHorizon::Bounded(secs(3_630)));
+    for n in 2..=4 {
+        apply_ok(
+            &mut sm,
+            submit_cmd(
+                jid(n),
+                cpu(4_000),
+                Some(1_800),
+                PriorityMultiplier::ONE,
+                base_ts(),
+            ),
+        );
+    }
+    let proposal = schedule(&sm, secs(60));
+    assert_eq!(proposal.placements.len(), 3);
+    commit(&mut sm, &proposal).expect("applies");
+    assert_eq!(sm.node_horizon(nid(1)), before);
+
+    // At 1900 s a 1800 s job would end at 3730 > 3630: refused, though the
+    // node has room.
+    apply_ok(
+        &mut sm,
+        submit_cmd(
+            jid(5),
+            cpu(1_000),
+            Some(1_800),
+            PriorityMultiplier::ONE,
+            base_ts(),
+        ),
+    );
+    assert!(schedule(&sm, secs(1_900)).is_empty());
+}
+
+/// An open node still wins a bounded job's free fit; the drained node takes
+/// what the open one cannot.
+#[test]
+fn open_nodes_are_tried_before_drain_backfill() {
+    let mut sm = drained_with_anchor(Some(3_600));
+    apply_ok(&mut sm, register_node_cmd(nid(2), cpu(4_000), base_ts()));
+    for n in 2..=3 {
+        apply_ok(
+            &mut sm,
+            submit_cmd(
+                jid(n),
+                cpu(4_000),
+                Some(1_800),
+                PriorityMultiplier::ONE,
+                base_ts(),
+            ),
+        );
+    }
+    let proposal = schedule(&sm, secs(60));
+    let nodes: BTreeSet<NodeId> = proposal.placements.iter().map(|p| p.node).collect();
+    assert_eq!(nodes, BTreeSet::from([nid(1), nid(2)]));
+    commit(&mut sm, &proposal).expect("applies");
+}
