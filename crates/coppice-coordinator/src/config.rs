@@ -33,6 +33,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use coppice_core::id::ClusterId;
+use coppice_scheduler::SchedulerConfig;
 use serde::Deserialize;
 
 pub(crate) use auth::{AuthConfig, AuthPosture};
@@ -387,6 +388,11 @@ pub(crate) struct Config {
     /// forms in milliseconds instead of production seconds.
     #[serde(default)]
     pub(crate) pacing: PacingConfig,
+
+    /// Scheduler tuning (ADR 0044 §4, ADR 0020's node-config side). Optional:
+    /// the defaults are [`coppice_scheduler::SchedulerConfig::default`].
+    #[serde(default)]
+    pub(crate) scheduler: SchedulerSection,
 
     /// Argon2id cost for hashing enrollment-token secrets. Optional; the
     /// defaults are the `argon2` crate's recommended production parameters.
@@ -1027,6 +1033,121 @@ impl Default for PacingConfig {
     }
 }
 
+/// The `[scheduler]` table: the placement pass's tuning knobs.
+///
+/// Node-local per ADR 0020 — the scheduler only *proposes*, and apply
+/// re-validates every proposal, so replicas need not agree on these. Every
+/// default is read from [`SchedulerConfig::default`], which stays the one
+/// definition.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SchedulerSection {
+    /// Jobs considered for seating per pass.
+    #[serde(default = "default_max_candidates")]
+    pub(crate) max_candidates: usize,
+
+    /// Placements emitted per pass.
+    #[serde(default = "default_max_placements_per_cycle")]
+    pub(crate) max_placements_per_cycle: usize,
+
+    /// Weight of the ADR 0021 age term.
+    #[serde(default = "default_w_age")]
+    pub(crate) w_age: f64,
+
+    /// Minimum earliness for revoking and reseating an accrual (ADR 0027).
+    #[serde(default = "default_replan_min_improvement", with = "humantime_serde")]
+    pub(crate) replan_min_improvement: Duration,
+
+    /// Preemption-funded placements per pass (ADR 0044 §4).
+    #[serde(default = "default_max_preempting_placements_per_cycle")]
+    pub(crate) max_preempting_placements_per_cycle: usize,
+
+    /// A node with a scheduler-initiated preemption request younger than this
+    /// hosts no new victims.
+    #[serde(default = "default_preemption_cooldown", with = "humantime_serde")]
+    pub(crate) preemption_cooldown: Duration,
+
+    /// Earliness a preemption must buy over the job's natural wait.
+    #[serde(
+        default = "default_preemption_min_improvement",
+        with = "humantime_serde"
+    )]
+    pub(crate) preemption_min_improvement: Duration,
+}
+
+impl SchedulerSection {
+    /// Reject values the scheduler cannot honour, at load.
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        if !self.w_age.is_finite() || self.w_age < 0.0 {
+            bail!(
+                "[scheduler] w_age must be a finite, non-negative number, got {}",
+                self.w_age
+            );
+        }
+        Ok(())
+    }
+
+    /// The scheduler's own config, as this table states it.
+    pub(crate) fn to_scheduler_config(&self) -> SchedulerConfig {
+        SchedulerConfig {
+            max_candidates: self.max_candidates,
+            max_placements_per_cycle: self.max_placements_per_cycle,
+            w_age: self.w_age,
+            replan_min_improvement: self.replan_min_improvement.into(),
+            max_preempting_placements_per_cycle: self.max_preempting_placements_per_cycle,
+            preemption_cooldown: self.preemption_cooldown.into(),
+            preemption_min_improvement: self.preemption_min_improvement.into(),
+        }
+    }
+}
+
+impl Default for SchedulerSection {
+    fn default() -> Self {
+        SchedulerSection {
+            max_candidates: default_max_candidates(),
+            max_placements_per_cycle: default_max_placements_per_cycle(),
+            w_age: default_w_age(),
+            replan_min_improvement: default_replan_min_improvement(),
+            max_preempting_placements_per_cycle: default_max_preempting_placements_per_cycle(),
+            preemption_cooldown: default_preemption_cooldown(),
+            preemption_min_improvement: default_preemption_min_improvement(),
+        }
+    }
+}
+
+fn default_max_candidates() -> usize {
+    SchedulerConfig::default().max_candidates
+}
+
+fn default_max_placements_per_cycle() -> usize {
+    SchedulerConfig::default().max_placements_per_cycle
+}
+
+fn default_w_age() -> f64 {
+    SchedulerConfig::default().w_age
+}
+
+fn default_replan_min_improvement() -> Duration {
+    scheduler_default_duration(SchedulerConfig::default().replan_min_improvement)
+}
+
+fn default_max_preempting_placements_per_cycle() -> usize {
+    SchedulerConfig::default().max_preempting_placements_per_cycle
+}
+
+fn default_preemption_cooldown() -> Duration {
+    scheduler_default_duration(SchedulerConfig::default().preemption_cooldown)
+}
+
+fn default_preemption_min_improvement() -> Duration {
+    scheduler_default_duration(SchedulerConfig::default().preemption_min_improvement)
+}
+
+fn scheduler_default_duration(d: coppice_core::time::Duration) -> Duration {
+    d.to_std()
+        .expect("scheduler default durations are positive")
+}
+
 /// SSO connection parameters.
 ///
 /// This is a **resource-server** validator, not an OAuth client: the
@@ -1390,6 +1511,10 @@ pub fn load(path: &Path) -> Result<ResolvedConfig> {
         .with_context(|| format!("reading coordinator config {}", path.display()))?;
     config
         .token_kdf
+        .validate()
+        .with_context(|| format!("reading coordinator config {}", path.display()))?;
+    config
+        .scheduler
         .validate()
         .with_context(|| format!("reading coordinator config {}", path.display()))?;
     // Here rather than at first use for a different reason than those two: the
@@ -2672,5 +2797,61 @@ addrs = []
         let (_guard, path) = write_config(MINIMAL_EXAMPLE);
         let resolved = load(&path).expect("load");
         assert!(resolved.config.enrollment.is_none());
+    }
+
+    #[test]
+    fn scheduler_table_defaults_match_scheduler_config() {
+        let absent = read_config(&write_config(MINIMAL_EXAMPLE).1).expect("parse");
+        assert_eq!(
+            absent.scheduler.to_scheduler_config(),
+            SchedulerConfig::default()
+        );
+        let empty = read_config(&write_config(&format!("{MINIMAL_EXAMPLE}\n[scheduler]\n")).1)
+            .expect("parse");
+        assert_eq!(
+            empty.scheduler.to_scheduler_config(),
+            SchedulerConfig::default()
+        );
+    }
+
+    #[test]
+    fn scheduler_table_full_parse() {
+        let doc = format!(
+            "{MINIMAL_EXAMPLE}\n[scheduler]\nmax_candidates = 10\nmax_placements_per_cycle = 20\n\
+             w_age = 2.5\nreplan_min_improvement = \"10m\"\n\
+             max_preempting_placements_per_cycle = 4\npreemption_cooldown = \"30s\"\n\
+             preemption_min_improvement = \"2h\"\n"
+        );
+        let cfg = read_config(&write_config(&doc).1)
+            .expect("parse")
+            .scheduler
+            .to_scheduler_config();
+        assert_eq!(cfg.max_candidates, 10);
+        assert_eq!(cfg.max_placements_per_cycle, 20);
+        assert_eq!(cfg.w_age, 2.5);
+        assert_eq!(
+            cfg.replan_min_improvement,
+            coppice_core::time::Duration::from_mins(10)
+        );
+        assert_eq!(cfg.max_preempting_placements_per_cycle, 4);
+        assert_eq!(
+            cfg.preemption_cooldown,
+            coppice_core::time::Duration::from_secs(30)
+        );
+        assert_eq!(
+            cfg.preemption_min_improvement,
+            coppice_core::time::Duration::from_hours(2)
+        );
+    }
+
+    #[test]
+    fn scheduler_table_rejects_unknown_key_and_bad_w_age() {
+        let typo = format!("{MINIMAL_EXAMPLE}\n[scheduler]\nmax_candidate = 1\n");
+        assert!(read_config(&write_config(&typo).1).is_err());
+        for bad in ["-1.0", "nan", "inf"] {
+            let doc = format!("{MINIMAL_EXAMPLE}\n[scheduler]\nw_age = {bad}\n");
+            let cfg = read_config(&write_config(&doc).1).expect("parse");
+            assert!(cfg.scheduler.validate().is_err(), "w_age = {bad}");
+        }
     }
 }

@@ -217,7 +217,11 @@ followers, which is what lets followers serve reads and event streams.
    `PerNodeAccrualExceeded`) is
    a recompute, the normal path of [scheduling-model.md](../scheduling/scheduling-model.md#operating-model).
    `expected_version` comes from `StateView::version()` — see the [two
-   coordinates](#the-two-coordinates-trap) distinction.
+   coordinates](#the-two-coordinates-trap) distinction. The pass's tuning
+   knobs come from the node's `[scheduler]` TOML table, read once at startup
+   and handed to `HeuristicScheduler::new` (node config per
+   [ADR 0020](../decisions/0020-node-config-vs-replicated-policy.md); see
+   [configuration.md](../operations/configuration.md)).
 
 11. **Housekeeping** (leader-only, 60 s tick). Scans the view for terminal
    jobs past retention — measured from each job's `terminal_at_us`, never

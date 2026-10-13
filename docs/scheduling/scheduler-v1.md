@@ -270,6 +270,24 @@ still holds.
 
 ## Work bounds
 
+These and the other scheduler knobs are **node config** (ADR 0020's
+node-config side of the line): they are set in the coordinator TOML's
+`[scheduler]` table, and replicas need not agree on them. Besides the two
+bounds below the table carries `w_age` (default 1.0) and
+`replan_min_improvement` (default `5m`), and the three ADR 0044 §4
+preemption knobs:
+
+- `max_preempting_placements_per_cycle` (default **2**): preemption-funded
+  placements per pass; counts beneficiaries, a victim set is proposed whole
+  or not at all.
+- `preemption_cooldown` (default `5m`): a node whose latest
+  scheduler-initiated preemption request is younger than this hosts no new
+  victims.
+- `preemption_min_improvement` (default `1h`): preemption is tried only when
+  the job's natural `projected_ready` is indefinite or later than the bound a
+  preemption would manufacture by at least this much; deliberately longer than
+  `replan_min_improvement` because a preemption costs a victim its progress.
+
 - `max_candidates` (default **4096**) bounds scored-and-considered jobs per
   pass. Scoring is `O(#queued)` cheap float arithmetic with memoized
   penalties, so this remains fast well past the pass's own budget even at

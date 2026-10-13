@@ -48,7 +48,7 @@ pub use projection::{
 /// proposal is re-validated against replicated state at commit
 /// (`docs/architecture/command-catalog.md`), so replicas need not agree on
 /// them (ADR 0020's node-config side of the line).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SchedulerConfig {
     /// Jobs considered for seating per pass — the top of the effective-score
     /// order. Bounds per-cycle work so a deep backlog cannot wedge a pass.
@@ -64,6 +64,17 @@ pub struct SchedulerConfig {
     /// will revoke and reseat it there (ADR 0027). An indefinite bound is
     /// always worth trading for a finite one, whatever the threshold.
     pub replan_min_improvement: Duration,
+    /// Preemption-funded placements per pass (ADR 0044 §4). Counts
+    /// beneficiaries: a victim set is proposed whole or not at all.
+    pub max_preempting_placements_per_cycle: usize,
+    /// A node whose latest scheduler-initiated preemption request is younger
+    /// than this hosts no new victims.
+    pub preemption_cooldown: Duration,
+    /// Preemption is tried only when the job's natural `projected_ready` is
+    /// indefinite or later than the bound a preemption would manufacture by at
+    /// least this much. Deliberately longer than `replan_min_improvement`
+    /// because a preemption costs a victim its progress.
+    pub preemption_min_improvement: Duration,
 }
 
 impl Default for SchedulerConfig {
@@ -72,7 +83,10 @@ impl Default for SchedulerConfig {
             max_candidates: 4096,
             max_placements_per_cycle: 512,
             w_age: score::DEFAULT_AGE_WEIGHT,
-            replan_min_improvement: Duration::from_secs(300),
+            replan_min_improvement: Duration::from_mins(5),
+            max_preempting_placements_per_cycle: 2,
+            preemption_cooldown: Duration::from_mins(5),
+            preemption_min_improvement: Duration::from_hours(1),
         }
     }
 }

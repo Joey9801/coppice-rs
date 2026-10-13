@@ -107,6 +107,17 @@ client_id = "COGNITO_APP_CLIENT_ID"
 # file rather than inferred from `client_id`.
 audience = "COGNITO_APP_CLIENT_ID"
 
+# Optional placement-pass tuning (ADR 0044 §4); the defaults are right for the
+# demo. Uncomment to override.
+# [scheduler]
+# max_candidates = 4096
+# max_placements_per_cycle = 512
+# w_age = 1.0
+# replan_min_improvement = "5m"
+# max_preempting_placements_per_cycle = 2
+# preemption_cooldown = "5m"
+# preemption_min_improvement = "1h"
+
 [observability]
 log_level = "info"
 # The code default is "text"; JSON is set here because these logs are read out

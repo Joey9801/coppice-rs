@@ -216,6 +216,18 @@ m_cost_kib = 19456  # memory cost in KiB
 t_cost = 2          # iteration count
 p_cost = 1          # parallelism lanes
 
+[scheduler]
+# Placement-pass tuning (ADR 0044 §4; node-local per ADR 0020 — the scheduler
+# only proposes and apply re-validates, so replicas need not agree). Optional;
+# every value shown is the default.
+max_candidates = 4096                   # jobs considered per pass
+max_placements_per_cycle = 512          # placements emitted per pass
+w_age = 1.0                             # ADR 0021 age weight; finite, >= 0
+replan_min_improvement = "5m"           # earliness needed to reseat an accrual (ADR 0027)
+max_preempting_placements_per_cycle = 2 # preemption-funded placements per pass
+preemption_cooldown = "5m"              # no new victims on a node preempted more recently
+preemption_min_improvement = "1h"       # earliness a preemption must buy over the natural wait
+
 # No [tls] table. MACHINE-PLANE material — the leaf served on the raft and
 # agent-gateway listeners, and this node's client identity toward peers — is
 # entirely cluster-owned and lives at the fixed layout

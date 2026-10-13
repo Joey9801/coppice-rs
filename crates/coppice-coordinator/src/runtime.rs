@@ -12,7 +12,7 @@ use tonic::transport::Server;
 
 use coppice_consensus::{Consensus, EventTapReceiver, NodeHandle, StateViews};
 use coppice_core::id::ClusterId;
-use coppice_scheduler::HeuristicScheduler;
+use coppice_scheduler::{HeuristicScheduler, SchedulerConfig};
 
 use crate::bootstrap::{AgentListener, ClientListener};
 use crate::limits::AGENT_INBOUND_CAPACITY;
@@ -239,6 +239,9 @@ pub async fn run<C>(
     // `[pacing]` housekeeping knob (ADR 0012). Liveness only — it decides how
     // promptly a due job is noticed, never which jobs are due.
     housekeeping_interval: std::time::Duration,
+    // The `[scheduler]` table (ADR 0044 §4): placement-pass tuning, node-local
+    // per ADR 0020. Embedders without a config pass `SchedulerConfig::default()`.
+    scheduler: SchedulerConfig,
     // How the public HTTP edge authenticates its callers (ADR 0022): the
     // posture the daemon path resolved from `[sso]` / `[auth]`. Like
     // `history`, it has no default at either seam — "authentication is off" is
@@ -466,7 +469,7 @@ where
     let scheduler_join = tokio::spawn(scheduler_driver::run(
         Arc::clone(&consensus),
         views.clone(),
-        Arc::new(HeuristicScheduler::default()),
+        Arc::new(HeuristicScheduler::new(scheduler)),
         status.clone(),
         shutdown_rx.clone(),
     ));
