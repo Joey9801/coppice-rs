@@ -85,7 +85,7 @@ pub enum NodeVerb {
     },
     /// Drain a node: running work continues, and only bounded backfill
     /// guaranteed gone by the node's horizon is admitted. With `--deadline`,
-    /// running preemptible work is given notice and stopped so the node is
+    /// every running attempt is given notice and stopped so the node is
     /// empty by then (ADR 0044 §5).
     Drain {
         /// Node id (`node-<uuid>`).

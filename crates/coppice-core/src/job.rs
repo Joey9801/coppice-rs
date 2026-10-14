@@ -51,8 +51,9 @@ pub struct Job {
     /// Resources requested for scheduling and isolation.
     pub requests: Resources,
     /// User-chosen priority. A multiplier on the job's cost, not a free lane:
-    /// burning budget faster pushes this job forward. See
-    /// `docs/decisions/0005-cost-based-soft-quotas.md`.
+    /// burning budget faster pushes this job forward (ADR 0005). Also the
+    /// job's preemption class: a scheduler preemption's victim is always of
+    /// a strictly lower priority than its beneficiary (ADR 0044 §4).
     pub priority: i32,
     /// Enforced runtime bound. Part of the job's price (ADR 0005) and the
     /// license to backfill (ADR 0014); jobs without one never touch pledged

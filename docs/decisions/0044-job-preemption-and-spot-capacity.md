@@ -91,8 +91,9 @@ notice_signal = "SIGUSR1"   # default SIGUSR1; from a fixed allowlist
   every job has, preemptible or not: a non-preemptible job is never
   *chosen* by the scheduler, but it is still evacuated by a deadline
   drain or an interruption (§5) and is told first. The allowlist is
-  `SIGHUP`, `SIGINT`, `SIGUSR1`, `SIGUSR2`, `SIGTERM`; a job naming
-  `SIGTERM` gets one signal and a longer grace.
+  `SIGHUP`, `SIGINT`, `SIGUSR1`, `SIGUSR2`, `SIGTERM`. The stop path (§2)
+  is the same for every choice, so a job naming `SIGTERM` receives it
+  twice: at notice, and again at the stop time.
 - `notice` is validated against replicated policy,
   `preemption_notice_floor ≤ notice ≤ preemption_notice_cap` (defaults
   **60 s** and **5 min**). The cap bounds how long a termination can hold
@@ -122,8 +123,8 @@ policy field (Q32.32, validated ≤ 1.0, default **0.75**). For an
 effectively preemptible job it is folded into the charge multiplier at
 `commit_placements` exactly as ADR 0029 folds the unbounded-runtime
 multiplier, `m' = ⌊m' × preemptible_multiplier / 2³²⌋`, multiplying with
-it when both apply, and is recorded on the charge record so a policy edit
-does not reprice a running attempt. A job that is not effectively
+it when both apply, and is recorded on the attempt so a policy edit does
+not reprice a running attempt. A job that is not effectively
 preemptible gets no discount. A preempted attempt's actual consumption is
 charged at the discounted rate, as `NodeLost` charges it today: the
 discount compensates for the risk and is not an exemption from quota
@@ -221,17 +222,24 @@ pub enum PreemptReason {
   reported.
 - Each attempt gets a fresh `max_runtime` clock.
 
-**`Revoked` gains one case.** An attempt whose `StartJob` is refused by
-the agent because its start no longer fits a drain's admission cutoff
-(§5) is reported `Revoked`. It never ran, and the job is requeued free.
-`Revoked` remains pre-`Running` only.
+**Refusals at the door.** The agent refuses a `StartJob` without
+launching it in two cases, reporting a terminal outcome with zero
+runtime; the job is requeued free either way. A drain backfill whose
+`latest_start` (§5) has passed is reported `Revoked`, the one case in
+which an agent reports it; `Revoked` remains pre-`Running` only. A start
+that arrives while the agent admits nothing (§5), because it has
+announced `draining` or an operator deadline drain's `T_notice` has
+passed, is reported `Preempted { Drain }`, or `Preempted { Interruption }`
+under an interruption. The agent journals the tombstone before it
+answers, so a re-delivered `StartJob` resolves the same way.
 
 ### 3. Shared termination state, delivery, and recovery
 
 Every platform termination, whatever started it, uses one replicated
 record, one agent protocol, and one set of precedence rules.
 
-**Replicated state: `Attempt.preemption`.** There is no new allocation
+**Replicated state: the attempt record's `preemption` field.** There is
+no new allocation
 phase. The allocation stays `Active`, consuming and counted as used,
 until the attempt ends. "Preempting" is a display status derived from
 this record.
@@ -285,9 +293,9 @@ event in commit order.
 2. delivers the notice signal;
 3. journals a **notice mark** (allocation, stop time as agent-local
    wall-clock, shortfall);
-4. reports the mark as a new `AttemptStatus` field,
-   `notified { reason, remaining_us, shortfall_us }`, and repeats it in
-   the `ObservedSet` after a reconnect;
+4. reports the mark as an `AttemptNotice { reason, remaining_us,
+   shortfall_us }` report, its own arm beside `AttemptStatus`, and
+   repeats it in the `ObservedSet` after a reconnect;
 5. runs the stop path at the stop time, journaling a tombstone that
    carries the reason.
 
@@ -304,7 +312,7 @@ Agent journal additions, all local to the node and never replicated:
 | Notice intent | Classification: the platform asked before this exit |
 | Notice mark | Enforcement across a restart: the attempt's stop time |
 | Tombstone reason (`Abort` or `Preempt { reason }`) | A tombstone found on recovery resolves as the command that wrote it |
-| Drain plan (`deadline`, `reason`, accepted target) | A restarted agent still runs the node's plan (§5) |
+| Drain plan (operator deadline, notice window, interruption deadline) | A restarted agent still runs the node's plan (§5); the operator deadline is the target the heartbeat echoes, and the reason follows from which component is active |
 
 **Classification is the agent's**, as it is for `Aborted` today: the
 agent's terminal report carries the outcome and apply trusts it.
@@ -321,10 +329,13 @@ agent's terminal report carries the outcome and apply trusts it.
   most one free retry; reading it as `Exited` would charge the job for
   a platform kill.
 
-**Commands.** `PreemptJob { allocation, notice_us, grace_us, reason }` is
-a new agent command, re-sent on reconnect like any undelivered command
-and idempotent on the journaled intent. The existing, unused advisory
-`Drain` command gains an optional `deadline_us` (§5).
+**Commands.** `PreemptJob { allocation, notice_us, reason }` is a new
+agent command; the stop path's grace is the `abort_grace` the attempt's
+`StartJob` carried. Dispatch derives it from the replicated record and
+sends it again on reconnect and on a leadership change while the record
+is unacknowledged, and the agent is idempotent on the journaled intent.
+The existing, unused advisory `Drain` command gains an optional
+`deadline_us` and the notice window (§5).
 
 **Stop-time precedence.** A notified attempt has exactly one stop time.
 These rules decide it, and are the only rules that do:
@@ -388,25 +399,30 @@ Relocation (below) is the one deliberate exception to both rules.
 
 **Victim choice.** Eligible victims on a node are ordered by class
 ascending, then `effective_score` ascending, then work at risk ascending,
-where work at risk is `(now − started_at) × requested`. The pass takes
+where work at risk is `(now − started_at) × rate`, the attempt's charge
+rate being the cost-weighted scalar of `requested`. The pass takes
 the smallest prefix `V` that, with the node's free capacity and its other
 guaranteed releases inside the notice bound, fits `J`. A node is not
 considered if `J` would not fit with every eligible victim released.
 
-**Proposal and apply.** `PlacementProposal` gains
-`preemptions: Vec<AllocationId>`, committed in the same batch as the
-placement they enable. `J` is committed **accruing** on the victims'
+**Proposal and apply.** Each `Placement` carries its eviction group,
+`preemptions`, naming every victim with the rule it was chosen under,
+`Priority` or `Relocation`, committed in the same batch as the placement
+it enables. `J` is committed **accruing** on the victims'
 node, and the manufactured release funds it through the ordinary
 pledge-in-commit-order path. ADR 0027's one-accrual-per-node guard
 applies unchanged. No link from the accrual to its victims is stored.
 
 Apply re-validates each victim: allocation `Active`, recorded effective
-preemptibility, the class rule or the relocation condition, the per-node
-guard, and that `J` fits once `V` is released. The score rule is
+preemptibility, the named rule (the class rule for a `Priority` victim,
+the relocation condition for a `Relocation` victim), the per-node guard,
+and that `J` fits once `V` is released. The score rule is
 **proposal-side only**, because `effective_score` depends on the
-scheduler-local `w_age`, which is not replicated. Any failure rejects the
-batch as a proposer bug. Apply then creates each victim's `preemption`
-record and dispatch sends `PreemptJob`.
+scheduler-local `w_age`, which is not replicated; a victim `J` outranks
+by class but not by score is therefore proposed under `Relocation`, so
+apply checks its spot room. Any failure rejects the batch as a proposer
+bug. Apply then creates each victim's `preemption` record with the named
+reason, and dispatch sends `PreemptJob`.
 
 The notice is measured from delivery, so a slow agent delays the release
 and never shortens the warning. Until the mark is reported `J`'s accrual
@@ -509,7 +525,8 @@ announcement, is unchanged. The CLI is
   bound is enforced at launch, because dispatch and image pulls are not
   instant.
 - An agent that has announced `draining`, including for an interruption,
-  admits nothing.
+  admits nothing, and refuses a `StartJob` already in flight at its door
+  (§2).
 
 **Regular drain (no deadline).** Existing work finishes naturally. The
 drain signals nothing and kills nothing. The cutoff is the horizon `H`,
@@ -522,6 +539,7 @@ commitments:
 | Drain backfill, running | The earlier of its recorded cutoff and `started_at + max_runtime + abort_grace` |
 | Any other running attempt with `max_runtime` | `started_at + max_runtime + abort_grace` |
 | Running attempt without `max_runtime` | None |
+| Running attempt with an acknowledged termination (§3) | The earlier of the above and `acknowledged.deadline + abort_grace` |
 | Any other attempt not yet started, or an accrual | None: nothing bounds its start |
 
 If any commitment has no bound there is no `H` and nothing is admitted.
@@ -571,10 +589,11 @@ decommission verb for an empty node and terminates nothing.
 
 **Durability.** `Node.drain` is the source of intent. The agent's
 heartbeat echoes `drain_target_us`, the deadline it last accepted. On
-every heartbeat the leader's dispatch loop reconciles record against
-echo: a deadline the echo does not match sends `Drain` with
-`deadline_us`; no deadline on the record while the echo reports one
-sends `Drain` with `deadline_us` unset, the **withdrawal**. A command
+every heartbeat the leader's ingestion reconciles record against echo: a
+deadline the echo does not match sends `Drain` with `deadline_us` and
+the notice window, `preemption_notice_cap`; no deadline on the record
+while the echo reports one sends `Drain` with `deadline_us` unset, the
+**withdrawal**. A command
 lost to a disconnect or a leadership change is re-sent by the next
 leader to see the mismatch. The agent journals the target it accepted,
 so a repeated target is a no-op. A regular drain sends no agent command.
@@ -598,7 +617,8 @@ product. This record reverses that for one piece, because the only
 time-critical step in the design should not live in a user-data script.
 
 - `[preemption] interruption_source = "aws-imds"` (agent TOML, default
-  none) polls `spot/instance-action` every five seconds. It handles
+  none) polls `spot/instance-action` every `imds_poll_interval` (default
+  five seconds), at `imds_endpoint` when one is set. It handles
   `terminate` and `stop` and treats `hibernate` as `terminate`. Other
   sources are variants of the same enum.
 - A notice starts a deadline drain with the provider's deadline as `D`
@@ -608,9 +628,12 @@ time-critical step in the design should not live in a user-data script.
 - The notice is best effort (§1), and the interruption overrides later
   stop times (§3).
 - The floor default of 60 s fits inside EC2's two minutes with the
-  default `abort_grace`. The agent logs a warning at startup when
-  `interruption_source` is set and that arithmetic does not close. The
-  warning is a sizing aid, not a guarantee.
+  default `abort_grace` and `drain_cleanup_margin`. Policy is replicated
+  and the agent holds none of it, so the check is per `StartJob`: when
+  `interruption_source` is set and the attempt's declared notice plus
+  `abort_grace` plus `drain_cleanup_margin` exceeds two minutes, the agent
+  logs a warning, once per distinct sizing. The warning is a sizing aid,
+  not a guarantee.
 
 **The agent's SIGTERM drain is unchanged**: drain-and-wait for
 `shutdown_grace`, work left running at the end, and no notices. Planned
@@ -629,8 +652,8 @@ documents is where that call belongs.
 3. `coppice node drain` gains `--deadline`, and `--wait` also shows the
    horizon or the deadline.
 4. The agent's SIGTERM drain is explicitly notice-free.
-5. The advisory `Drain` agent command carries the operator's deadline or
-   its withdrawal.
+5. The advisory `Drain` agent command carries the operator's deadline and
+   the notice window, or the deadline's withdrawal.
 
 ### 6. Configuration, compatibility changes, and rationale
 
@@ -644,7 +667,7 @@ documents is where that call belongs.
 | Replicated policy | `preemption_notice_floor`, `preemption_notice_cap` | 60 s, 5 min |
 | Replicated policy | `drain_cleanup_margin` | 30 s |
 | Scheduler config | `max_preempting_placements_per_cycle`, `preemption_cooldown`, `preemption_min_improvement` | 2, 5 min, 1 h |
-| Agent TOML `[preemption]` | `preemptible_only`, `interruption_source` | `false`, none |
+| Agent TOML `[preemption]` | `preemptible_only`, `interruption_source`, `imds_endpoint`, `imds_poll_interval` | `false`, none, the SDK's resolution, 5 s |
 
 **Compatibility changes.** The project has no external users, so none of
 these carries a shim.
