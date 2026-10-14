@@ -8,8 +8,8 @@
 //! constant-time verify. The replicated record (id, role, hash, TTL, label) is
 //! the state layer's concern.
 
-use argon2::password_hash::rand_core::{OsRng, RngCore};
-use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::password_hash::phc::PasswordHash;
+use argon2::password_hash::{PasswordHasher, PasswordVerifier};
 use argon2::Argon2;
 use base64::Engine;
 
@@ -38,7 +38,7 @@ pub const TOKEN_PREFIX: &str = "cpk_";
 /// string is a single header-safe token).
 pub fn generate_secret() -> String {
     let mut raw = [0u8; SECRET_BYTES];
-    OsRng.fill_bytes(&mut raw);
+    getrandom::fill(&mut raw).expect("the OS CSPRNG is available");
     let body = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw);
     format!("{TOKEN_PREFIX}{body}")
 }
@@ -104,9 +104,9 @@ pub fn hash_secret_with(secret: &str, kdf: TokenKdf) -> Result<String, TokenErro
         argon2::Version::V0x13,
         kdf.params()?,
     );
-    let salt = SaltString::generate(&mut OsRng);
-    let hash = argon
-        .hash_password(secret.as_bytes(), &salt)
+    // A fresh 16-byte salt from the OS CSPRNG, drawn by `hash_password`.
+    let hash: PasswordHash = argon
+        .hash_password(secret.as_bytes())
         .map_err(|e| TokenError::Hash(e.to_string()))?;
     Ok(hash.to_string())
 }
