@@ -1,7 +1,7 @@
 //! Instants on the wire.
 //!
 //! Coppice renders every instant as an RFC 3339 / ISO 8601 string in UTC with
-//! microsecond precision (`"2026-07-16T09:30:00.000000Z"`, ADR 0031). A bare
+//! microsecond precision (`"2026-07-16T09:30:00.000000Z"`). A bare
 //! integer carries neither its epoch nor its unit, and the mistake that
 //! invites — reading µs as ms — is silent and off by a thousand.
 //!
@@ -24,8 +24,7 @@
 //! constructors (`from_datetime`, and by extension `now`) clamp into this
 //! range; untrusted-input constructors (`from_micros`, `FromStr`/
 //! `Deserialize`, `TryFrom<SystemTime>`) reject values outside it instead.
-//! This mirrors `coppice_core::time::Timestamp` exactly, by design — the two
-//! types must serialize identically.
+//! The server enforces the same bounds, so every value the API returns parses.
 
 use std::fmt;
 use std::str::FromStr;
@@ -38,7 +37,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 /// microseconds since the Unix epoch.
 ///
 /// `DateTime<Utc>` itself reaches back to `-262143-01-01`, but RFC 3339 (and
-/// therefore the `/api/v1` wire, ADR 0031) only ever spells a four-digit
+/// therefore the `/api/v1` wire) only ever spells a four-digit
 /// year. Bounding `Timestamp` here means every instant this type can hold
 /// has a legal RFC 3339 rendering that this type's own `FromStr` can parse
 /// back. The server's own timestamp type has the same bounds.
@@ -132,7 +131,7 @@ impl Timestamp {
     ///
     /// Not `DateTime::MAX_UTC` — that instant's year does not fit RFC 3339's
     /// four-digit year, so it has no legal wire rendering this type's own
-    /// `FromStr`/`Deserialize` (or the `/api/v1` surface's, ADR 0031) can
+    /// `FromStr`/`Deserialize` (or the `/api/v1` surface's) can
     /// parse back.
     pub fn max_value() -> Timestamp {
         Timestamp(
@@ -163,9 +162,10 @@ impl Timestamp {
 
     /// The span from `earlier` to `self`, or `None` when `self` precedes it.
     ///
-    /// Instants on this wire are advisory proposer stamps that can run
-    /// backwards (ADR 0032), so a regression is a real possibility a caller
-    /// has to answer for rather than a case to saturate away silently.
+    /// Instants on this wire are advisory stamps assigned by the server and can
+    /// run backwards relative to each other, so a regression is a real
+    /// possibility a caller has to answer for rather than a case to saturate
+    /// away silently.
     pub fn duration_since(self, earlier: Timestamp) -> Option<Duration> {
         let delta = self.as_micros().checked_sub(earlier.as_micros())?;
         u64::try_from(delta).ok().map(Duration::from_micros)

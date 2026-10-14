@@ -15,18 +15,16 @@ use super::{AccrualView, AttemptView, Resources};
 /// is `healthy`, tracked but silent for the deadline or longer is
 /// `lost`.
 ///
-/// **Naming note.** The server's own vocabulary literally has a variant
-/// named `Unknown`, which collides with this crate's own `Unknown`
-/// catch-all of the same name (see [`super`]). This client resolves the
-/// clash by naming the known value `Unreported` instead: [`NodeHealth::Unreported`]
-/// is the server's `"unknown"` verdict — the honest "no marks to judge by"
-/// for a follower or stepped-down replica serving the read (the marks
-/// are leader-local, like a node's `used` reading), a leader no agent
-/// has reported to yet, or a node inside the grace window a new leader
-/// granted it — never a fabricated `healthy`. [`NodeHealth::Unknown`] (this
-/// crate's own catch-all) is a different thing entirely: a verdict this
-/// client does not recognize at all, from a server vocabulary newer than
-/// this crate.
+/// **Naming note.** The server reports the wire value `"unknown"`, which would
+/// collide with this crate's own `Unknown` catch-all (see [`super`]). This
+/// client names the known value `Unreported` instead:
+/// [`NodeHealth::Unreported`] is the `"unknown"` verdict — the honest "no marks
+/// to judge by" for a follower or stepped-down replica serving the read (the
+/// marks are leader-local, like a node's `used` reading), a leader no agent has
+/// reported to yet, or a node inside the grace window a new leader granted it —
+/// never a fabricated `healthy`. [`NodeHealth::Unknown`] (this crate's own
+/// catch-all) is a different thing entirely: a verdict this client does not
+/// recognize at all, from a server vocabulary newer than this crate.
 #[derive(
     Debug,
     Clone,
@@ -44,7 +42,7 @@ use super::{AccrualView, AttemptView, Resources};
 #[strum(serialize_all = "snake_case")]
 #[non_exhaustive]
 pub enum NodeHealth {
-    /// The server's `"unknown"` — no heartbeat marks to judge by.
+    /// The wire value `"unknown"` — no heartbeat marks to judge by.
     #[serde(rename = "unknown")]
     #[strum(serialize = "unknown")]
     Unreported,
@@ -136,11 +134,11 @@ pub struct NodeSummary {
     /// re-registration. Distinct from the operator's `drain`: an operator
     /// did not necessarily ask for this. An announced node admits nothing.
     pub agent_draining: bool,
-    /// The node takes only effectively preemptible work (ADR 0044 §4) —
+    /// The node takes only effectively preemptible work —
     /// spot capacity, from the agent's `[preemption] preemptible_only`.
     pub preemptible_only: bool,
-    /// The provider's interruption deadline (ADR 0044 §5), by the agent's wall
-    /// clock: display only, never a scheduling input.
+    /// The provider's interruption deadline by the agent's wall
+    /// clock: informational only; the scheduler does not use it.
     pub interruption_deadline: Option<Timestamp>,
     /// Liveness verdict.
     pub health: NodeHealth,
@@ -251,18 +249,16 @@ pub struct UtilizationSample {
 /// empty. The node's resulting state is read back from
 /// `GET /api/v1/nodes/{node}` rather than echoed here.
 ///
-/// Both routes are bodyless (no `SetNodeSchedulableRequest` is sent on the
-/// wire — that type is a server-internal seam argument, not a request
-/// body), so this crate defines no request type for them.
+/// Both routes take no request body, so this crate defines no request type
+/// for them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct DrainNodeResponse {}
 
 /// The answer to `POST /api/v1/nodes/{node}/remove` — always empty.
 ///
-/// Bodyless like drain/undrain (no `EvictNodeRequest` is sent on the wire —
-/// that type is a server-internal seam argument, not a request body), so
-/// this crate defines no request type for it.
+/// Like drain/undrain, the route takes no request body, so this crate
+/// defines no request type for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct RemoveNodeResponse {}

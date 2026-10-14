@@ -1,4 +1,4 @@
-//! Quota-entity names, paths, and references (ADR 0045).
+//! Quota-entity names, paths, and references.
 //!
 //! A quota entity's `name` is one path **segment**: 1–63 characters from
 //! `[A-Za-z0-9._-]`, the first alphanumeric, and never itself a
@@ -25,7 +25,7 @@ pub const MAX_SEGMENT_LEN: usize = 63;
 /// The separator between the segments of a [`QuotaEntityPath`].
 pub const PATH_SEPARATOR: char = '/';
 
-/// A string failed the quota-entity segment grammar (ADR 0045).
+/// A string failed the quota-entity segment grammar.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("invalid quota entity name {input:?}: {reason}")]
 pub struct InvalidSegment {
@@ -186,7 +186,7 @@ impl<'de> serde::Deserialize<'de> for QuotaEntityPath {
     }
 }
 
-/// How a client names a quota entity: its id or its path (ADR 0045).
+/// How a client names a quota entity: its id or its path.
 ///
 /// On the wire a plain string. Parsing tries the id first — a string that
 /// parses as `quota-<uuid>` is an id — and parses anything else as a path,

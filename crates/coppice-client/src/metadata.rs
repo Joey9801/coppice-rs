@@ -1,11 +1,11 @@
-//! Job metadata: small, mutable, user-owned annotations on a job (ADR 0042).
+//! Job metadata: small, mutable, user-owned annotations on a job.
 //!
 //! A job's metadata is a map from string keys to string values. There is no
 //! value type: a value is a UTF-8 string, and any structure a caller wants is
 //! theirs to encode in it.
 //!
-//! The server enforces the limits below at admission and again at apply. This
-//! crate checks them too, in [`JobMetadata::insert`] and
+//! The server enforces the limits below when a job is submitted or its metadata
+//! changed. This crate checks them too, in [`JobMetadata::insert`] and
 //! [`JobMetadata::validate`], so a typo in a key fails locally with a typed
 //! error instead of costing a round trip. Decoding is deliberately *not*
 //! checked: whatever a server sends is read back faithfully, even if a future
@@ -91,7 +91,7 @@ impl JobMetadata {
         JobMetadata::default()
     }
 
-    /// Insert one entry, checking the key and value against the ADR 0042
+    /// Insert one entry, checking the key and value against the metadata
     /// limits.
     ///
     /// The whole-map key count is *not* checked here — that is
@@ -151,7 +151,7 @@ impl JobMetadata {
         &self.0
     }
 
-    /// Check the whole map against every ADR 0042 limit.
+    /// Check the whole map against every metadata limit.
     ///
     /// Checks run cheapest-first and in key order, matching the server, so a
     /// map refused here is refused there with the same reason.

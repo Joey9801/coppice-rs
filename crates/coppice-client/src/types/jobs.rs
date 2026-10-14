@@ -20,15 +20,11 @@ use super::{
 /// Deserialize a float that may arrive as `null`, mapping `null` to
 /// [`f64::INFINITY`].
 ///
-/// This is the exact inverse of the serialization side: JSON has no
-/// infinity, so `serde_json` renders a non-finite float as `null`, and a
-/// plain `f64` field then *fails* to read its own output back. The quota
-/// figures this decorates are legitimately infinite (an entity with zero
-/// quota and nonzero usage is infinitely over), so every such field opts
-/// into this reader; without it a client that decodes a job carrying such a
-/// figure errors on an otherwise valid cluster state.
-///
-/// Serialization is untouched — this only affects reading.
+/// JSON has no infinity, so the server renders a non-finite float as `null`,
+/// and a plain `f64` field would fail to read that back. The quota figures
+/// this decorates are legitimately infinite (an entity with zero quota and
+/// nonzero usage is infinitely over), so every such field opts into this
+/// reader.
 fn null_as_infinity<'de, D>(deserializer: D) -> Result<f64, D::Error>
 where
     D: Deserializer<'de>,
@@ -56,15 +52,16 @@ pub struct JobSummary {
     pub image: String,
     /// The quota entity the job is charged to.
     pub quota_entity: QuotaEntityId,
-    /// The entity's path (ADR 0045), `""` if the entity is (impossibly)
-    /// absent from the tree, never a fabricated path.
+    /// The entity's path; `""` in the should-never-happen case that the
+    /// server cannot resolve the entity (never a fabricated path).
     pub quota_entity_path: String,
     /// Scheduling priority.
     pub priority: i32,
     /// When the job was submitted.
     pub submitted_at: Timestamp,
-    /// The principal that submitted the job; `null` for a job with no actor
-    /// on its submit command.
+    /// The principal that submitted the job — `"anonymous"` for a submission
+    /// to a cluster in open mode, and `null` only for a job the cluster
+    /// created itself rather than on a caller's behalf.
     pub submitted_by: Option<String>,
     /// When the job reached a terminal state, if it has.
     pub terminal_at: Option<Timestamp>,
@@ -82,7 +79,7 @@ pub struct JobSummary {
     pub cost_ucu: u64,
     /// Outcome of the last attempt; only when the job is terminal.
     pub outcome: Option<AttemptOutcome>,
-    /// User-owned annotations (ADR 0042) — always present, `{}` when empty.
+    /// User-owned annotations — always present, `{}` when empty.
     /// Carried on the summary so a list row can be titled by
     /// `metadata.name` without a second fetch per row.
     pub metadata: JobMetadata,
@@ -122,27 +119,28 @@ pub struct JobSpecView {
     pub max_runtime: Option<Duration>,
     /// The quota-entity leaf charged.
     pub quota_entity: QuotaEntityId,
-    /// The entity's path (ADR 0045), `""` if the entity is (impossibly)
-    /// absent from the tree, never a fabricated path.
+    /// The entity's path; `""` in the should-never-happen case that the
+    /// server cannot resolve the entity (never a fabricated path).
     pub quota_entity_path: String,
     /// The job's retry policy.
     pub retry: RetryPolicy,
-    /// The principal that submitted the job, stamped from the command's
-    /// verified actor — never client-supplied. `null` for a job whose
-    /// submit command carried no actor.
+    /// The principal that submitted the job, taken from the authenticated
+    /// caller — never client-supplied. A submission to a cluster in open mode
+    /// records `"anonymous"`; `null` only for a job the cluster created itself
+    /// rather than on a caller's behalf.
     pub submitted_by: Option<String>,
     /// The environment overlay, `{}` when the job set none. Fixed at
     /// submission; there is no update route. Defaulted on decode so a
-    /// coordinator that predates the field still reads.
+    /// response from an older server that omits it still reads.
     #[serde(default)]
     pub env: JobEnv,
-    /// The job's `[preemption]` declarations as stored (ADR 0044 §1), with
+    /// The job's `[preemption]` declarations as stored, with
     /// the notice resolved — a job that declared none shows the floor it was
     /// given.
     pub preemption: PreemptionView,
 }
 
-/// A stored job's `[preemption]` declarations (ADR 0044 §1).
+/// A stored job's `[preemption]` declarations.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct PreemptionView {
@@ -175,26 +173,24 @@ pub struct PenaltyLink {
     pub entity: QuotaEntityId,
     /// Its stored name.
     pub name: String,
-    /// Its path (ADR 0045).
+    /// Its path.
     pub path: String,
     /// Decayed usage as of read time.
     pub usage_ucu: u64,
     /// Its configured quota.
     pub quota_ucu: u64,
-    /// `null` on the wire when infinite; see `null_as_infinity`.
+    /// `null` on the wire when infinite; read back as [`f64::INFINITY`].
     #[serde(deserialize_with = "null_as_infinity")]
     pub over_quota_ratio: f64,
-    /// `null` on the wire when infinite; see `null_as_infinity`.
+    /// `null` on the wire when infinite; read back as [`f64::INFINITY`].
     #[serde(deserialize_with = "null_as_infinity")]
     pub penalty: f64,
 }
 
 /// The priority-term inputs for a `Queued` job.
 ///
-/// `rank`, `queue_depth`, `score`, and the age-bonus inputs are absent,
-/// never a fabricated value: ranking the whole queue per read would cost an
-/// O(queue) scan, and composing the score would duplicate scheduler-owned
-/// inputs that could drift from it.
+/// This is a partial explanation: the job's rank in the queue, the queue
+/// depth, its overall score, and the age-bonus inputs are not reported.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct QueuePositionExplainer {
@@ -203,7 +199,7 @@ pub struct QueuePositionExplainer {
     /// One entry per ancestor entity, leaf → root.
     pub penalty_chain: Vec<PenaltyLink>,
     /// Product of the chain penalties. Infinite — hence `null` on the wire,
-    /// see `null_as_infinity` — whenever any link in the chain is: each
+    /// read back as [`f64::INFINITY`] — whenever any link in the chain is: each
     /// link's penalty is `>= 1`, so one infinite ancestor carries through.
     #[serde(deserialize_with = "null_as_infinity")]
     pub penalty_product: f64,
@@ -274,8 +270,8 @@ pub struct TrueUpView {
     pub amount_ucu: u64,
 }
 
-/// A job's cost breakdown, computed from replicated policy and the job's
-/// charge records.
+/// A job's cost breakdown, computed from the cluster's cost policy and the
+/// job's charge records.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct CostReport {
@@ -290,21 +286,21 @@ pub struct CostReport {
     /// Runtime penalty folded in for a job with no declared max runtime;
     /// `1.0` when the job is bounded.
     pub unbounded_multiplier: f64,
-    /// Preemptibility discount folded in for an effectively preemptible job
-    /// (ADR 0044 §1); `1.0` when the job is not.
+    /// Preemptibility discount folded in for an effectively preemptible job;
+    /// `1.0` when the job is not.
     pub preemptible_multiplier: f64,
     /// The µCU/second actually priced: rate × priority × unbounded ×
     /// preemptible.
     pub effective_rate_ucu_per_second: u64,
     /// Duration the upfront placement charge covers: the job's declared max
-    /// runtime. For an unbounded job it is the renewal interval (ADR 0046).
+    /// runtime. For an unbounded job it is the cluster's charge renewal interval.
     #[serde(rename = "charge_window_seconds", with = "crate::time::seconds")]
     pub charge_window: Duration,
-    /// True iff the job is unbounded, i.e. `charge_window` is the policy
-    /// renewal interval rather than the job's own max runtime.
+    /// True iff the job is unbounded, i.e. `charge_window` is the cluster's
+    /// charge renewal interval rather than the job's own max runtime.
     pub charge_window_is_default: bool,
     /// Upfront charge for one placement: effective_rate × charge_window. For
-    /// an unbounded job this is the cost of one interval (ADR 0046).
+    /// an unbounded job this is the cost of one renewal interval.
     pub estimated_ucu: u64,
     /// Gross µCU charged across attempts so far; 0 before the job is
     /// placed.
@@ -358,7 +354,7 @@ pub struct JobDetail {
     pub accrual: Option<AccrualView>,
     /// The job's cost breakdown.
     pub cost: CostReport,
-    /// User-owned annotations (ADR 0042) — always present, `{}` when empty.
+    /// User-owned annotations — always present, `{}` when empty.
     /// A sibling of `spec` rather than a field of it: the map is mutable
     /// after submission, and `spec` is the immutable submission.
     pub metadata: JobMetadata,
@@ -372,9 +368,9 @@ pub struct JobDetail {
 /// — no endpoint invents its own shape.
 ///
 /// `(index, ordinal)` is the event's identity: the ordering and
-/// deduplication key everywhere. `at` is the advisory proposer stamp — it
-/// may run backwards across proposers as the index advances, and no
-/// consumer may reorder or "correct" by it.
+/// deduplication key everywhere. `at` is an advisory server timestamp —
+/// it may run backwards as the index advances, so never reorder or
+/// "correct" by it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct TimelineEvent {
@@ -384,14 +380,14 @@ pub struct TimelineEvent {
     /// before any filtering — a scoped stream may show gaps, never
     /// renumber.
     pub ordinal: u32,
-    /// When the proposer asserted this fact.
+    /// When the server recorded this event (advisory; see above).
     pub at: Timestamp,
     /// The event's kind and its scope keys.
     #[serde(flatten)]
     pub body: TimelineEventBody,
 }
 
-/// The event payload: kind plus the scope keys stamped during apply.
+/// The event payload: kind plus the scope keys recorded with it.
 ///
 /// Internally tagged on `"kind"`. The final `Unknown` variant is this
 /// client's forward-compatibility escape hatch: `#[serde(tag)]` enums
@@ -446,7 +442,7 @@ pub enum TimelineEventBody {
         /// The job.
         job: JobId,
     },
-    /// The scheduler chose a running attempt as a victim (ADR 0044 §4); its
+    /// The scheduler chose a running attempt as a victim; its
     /// notice deadline arrives later, with `AttemptNotified`.
     PreemptRequested {
         /// The victim attempt.
@@ -464,7 +460,7 @@ pub enum TimelineEventBody {
         for_job: Option<JobId>,
     },
     /// A running attempt's termination record was created or its deadline
-    /// moved earlier (ADR 0044 §3); re-read the attempt for the record.
+    /// moved earlier; re-read the attempt for the record.
     AttemptNotified {
         /// The attempt.
         attempt: AttemptId,
@@ -560,7 +556,7 @@ pub struct GetJobTimelineResponse {
     pub events: Vec<TimelineEvent>,
     /// The exclusive coverage floor.
     pub floor_index: u64,
-    /// Opaque continuation token; `null` iff the ring scan reached its
+    /// Opaque continuation token; `null` iff the scan reached the
     /// newest retained event.
     pub next_cursor: Option<TimelineCursor>,
 }
@@ -571,12 +567,11 @@ pub struct GetJobTimelineResponse {
 
 /// `POST /api/v1/jobs`.
 ///
-/// The client-minted `job` id is the submission's idempotency identity
-/// (ADR 0026): retrying after a timeout, connection loss, or leader change
-/// re-sends the identical request, and a repeat whose first attempt already
-/// committed resolves to the same job — success with the original
-/// [`JobId`], never a second job. Reusing an id with a *different* payload
-/// is rejected.
+/// The client-minted `job` id is the submission's idempotency identity:
+/// retrying after a timeout, connection loss, or leader change re-sends the
+/// identical request, and a repeat whose first attempt already committed
+/// resolves to the same job — success with the original [`JobId`], never a
+/// second job. Reusing an id with a *different* payload is rejected.
 ///
 /// `#[non_exhaustive]` blocks a struct literal; build one with
 /// [`SubmitJobRequest::new`] and the `with_*` builder methods.
@@ -596,22 +591,24 @@ pub struct SubmitJobRequest {
     pub entrypoint: Option<Vec<String>>,
     /// Resources requested for scheduling and isolation.
     pub requests: Resources,
-    /// Resolved through the replicated multiplier table; a priority with no
-    /// configured multiplier is invalid.
+    /// Mapped to a cost multiplier by the cluster's policy; a priority with
+    /// no configured multiplier is rejected.
     pub priority: i32,
-    /// Enforced runtime bound; absent = charged the policy default
-    /// runtime. Must be positive when present.
+    /// Enforced runtime bound; absent = charged for the cluster's
+    /// default runtime. Must be positive when present.
     #[serde(rename = "max_runtime_seconds", with = "crate::time::seconds::option")]
     pub max_runtime: Option<Duration>,
-    /// The quota-entity leaf to charge, by id or path (ADR 0045). A path is
-    /// resolved by the leader, whichever replica the request reached (a
-    /// follower forwards it unresolved), and the proposed command carries the
-    /// id it resolved to.
+    /// The quota-entity leaf to charge, by id or path. A path is resolved
+    /// by the server, whichever replica the request reaches.
     pub quota_entity: QuotaEntityRef,
     /// Absent = the platform default policy.
     pub retry: Option<RetryPolicy>,
-    /// User-owned annotations (ADR 0042); absent is the empty map. Checked
-    /// against the ADR's limits at admission, and again at apply.
+    /// User-owned annotations; absent is the empty map. Limited to
+    /// [`MAX_KEYS`](crate::MAX_KEYS) keys,
+    /// [`MAX_KEY_BYTES`](crate::MAX_KEY_BYTES)-byte keys and
+    /// [`MAX_VALUE_BYTES`](crate::MAX_VALUE_BYTES)-byte values. Checked when
+    /// the request is accepted, and again when it takes effect, so a concurrent
+    /// change can still reject it.
     pub metadata: JobMetadata,
     /// Environment overlay for the container; absent is the empty map.
     /// Immutable after submission and part of the submission's idempotency
@@ -620,14 +617,14 @@ pub struct SubmitJobRequest {
     /// spec.
     #[serde(default)]
     pub env: JobEnv,
-    /// The `[preemption]` table (ADR 0044 §1); absent is all defaults. Fixed
+    /// The `[preemption]` table; absent is all defaults. Fixed
     /// at submission and part of the submission's idempotency identity, so a
     /// retry must resend it verbatim.
     #[serde(default)]
     pub preemption: Option<PreemptionRequest>,
 }
 
-/// A submission's `[preemption]` table (ADR 0044 §1).
+/// A submission's `[preemption]` table.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct PreemptionRequest {
@@ -768,17 +765,17 @@ impl SubmitJobRequest {
     }
 }
 
-/// The answer to a submission: the job id, and the index its command
-/// applied at.
+/// The answer to a submission: the job id, and the log index at which the
+/// submission took effect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct SubmitJobResponse {
     /// Echo of the client-minted id from the request.
     pub job: JobId,
-    /// Raft log index at which this request's command applied. Pair it
-    /// with `?min_index=` on a subsequent read for read-your-writes. On an
-    /// idempotent repeat this is the repeat's own apply index — `>=` the
-    /// original commit, so still a valid cursor.
+    /// Raft log index at which this request took effect. Pair it with
+    /// `?min_index=` on a subsequent read for read-your-writes. On an
+    /// idempotent repeat this is the repeat's own index — `>=` the
+    /// original, so still a valid cursor.
     pub log_index: u64,
 }
 
@@ -823,13 +820,13 @@ impl Default for AbortJobRequest {
 }
 
 /// The answer to an abort request: empty. A write that resolved is a write
-/// that applied; the job's resulting state is read back from
+/// that took effect; the job's resulting state is read back from
 /// `GET /api/v1/jobs/{job}` rather than echoed here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct AbortJobResponse {}
 
-/// `PUT /api/v1/jobs/{job}/metadata` (ADR 0042) — the whole map, replacing
+/// `PUT /api/v1/jobs/{job}/metadata` — the whole map, replacing
 /// whatever is stored.
 ///
 /// `metadata` is required, unlike the patch's two halves: a body that
@@ -849,7 +846,7 @@ impl ReplaceJobMetadataRequest {
     }
 }
 
-/// `POST /api/v1/jobs/{job}/metadata` (ADR 0042) — the small patch for a
+/// `POST /api/v1/jobs/{job}/metadata` — the small patch for a
 /// caller that owns only some keys: `set` merged over the stored map, then
 /// `unset` keys removed.
 ///
@@ -874,7 +871,8 @@ impl UpdateJobMetadataRequest {
     }
 
     /// Merge one entry into `set`, checking the key and value against the
-    /// ADR 0042 limits.
+    /// metadata limits ([`MAX_KEY_BYTES`](crate::MAX_KEY_BYTES),
+    /// [`MAX_VALUE_BYTES`](crate::MAX_VALUE_BYTES)).
     pub fn set(
         mut self,
         key: impl Into<String>,
@@ -896,7 +894,7 @@ impl UpdateJobMetadataRequest {
     /// Deliberately **not** checked here: the *resulting* map. A patch is
     /// merged over state this client may not hold the latest copy of, so
     /// the key count and whole-map size of the result are the server's to
-    /// judge, at apply.
+    /// judge when the change takes effect.
     pub fn validate(&self) -> Result<(), String> {
         for key in &self.unset {
             if key.is_empty() {
@@ -918,27 +916,26 @@ impl UpdateJobMetadataRequest {
     }
 }
 
-/// The answer to either metadata write: the job, and the index its command
-/// applied at, for a read-your-writes `?min_index=`.
+/// The answer to either metadata write: the job, and the log index at which the
+/// change took effect, for a read-your-writes `?min_index=`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct ReplaceJobMetadataResponse {
     /// The job that was updated.
     pub job: JobId,
-    /// The apply index, for read-your-writes.
+    /// The log index at which the change took effect, for read-your-writes.
     pub log_index: u64,
 }
 
 /// The patch's answer. Identical in shape to
-/// [`ReplaceJobMetadataResponse`] and deliberately a separate type: the two
-/// routes are two distinct message pairs, and a client generating from a
-/// message table gets the name it expects for each.
+/// [`ReplaceJobMetadataResponse`] and a separate type for the separate
+/// route.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct UpdateJobMetadataResponse {
     /// The job that was updated.
     pub job: JobId,
-    /// The apply index, for read-your-writes.
+    /// The log index at which the change took effect, for read-your-writes.
     pub log_index: u64,
 }
 
@@ -1190,7 +1187,7 @@ mod tests {
         assert!(request.validate().is_ok());
     }
 
-    /// A path ref is as valid a `quota_entity` as an id (ADR 0045).
+    /// A path ref is as valid a `quota_entity` as an id.
     #[test]
     fn submit_job_request_accepts_a_path_entity_ref() {
         let path: crate::entity_ref::QuotaEntityPath = "acme/eng".parse().unwrap();

@@ -255,7 +255,7 @@ pub enum AttemptState {
     Dispatching,
     /// Observed running.
     Running,
-    /// Running, but the platform has asked it to stop (ADR 0044 §3). Derived for
+    /// Running, but the platform has asked it to stop. Derived for
     /// display, so never on a timeline event.
     Preempting,
     /// Stopping, with its charge not yet settled.
@@ -277,8 +277,8 @@ impl AttemptState {
     }
 }
 
-/// The signal a preemptible job's container is sent when its notice starts
-/// (ADR 0044 §1): a closed set of five, spelled `SIGUSR1` style on the wire.
+/// The signal a preemptible job's container is sent when its notice starts:
+/// a closed set of five, spelled `SIGUSR1` style on the wire.
 #[derive(
     Debug,
     Clone,
@@ -385,7 +385,7 @@ impl AttemptOutcomeKind {
     }
 }
 
-/// Why the platform terminated a running attempt (ADR 0044 §2). The job the
+/// Why the platform terminated a running attempt. The job the
 /// termination made room for travels beside it as `for_job`.
 #[derive(
     Debug,
@@ -553,12 +553,12 @@ pub struct AttemptView {
     pub rate_ucu_per_second: u64,
     /// The upfront charge for this attempt, trued up at finalization.
     pub charged_ucu: u64,
-    /// The attempt's effective preemptibility, recorded at placement (ADR
-    /// 0044 §1): the job's `preemptible` and every ancestor entity's switch,
+    /// The attempt's effective preemptibility, recorded at placement:
+    /// the job's `preemptible` and every ancestor entity's switch,
     /// as they stood then. When `true` the charge carries the preemptibility
     /// discount.
     pub preemptible: bool,
-    /// The termination record (ADR 0044 §3): `null` unless the platform has
+    /// The termination record: `null` unless the platform has
     /// asked this attempt to stop; kept after the attempt ends.
     pub preemption: Option<AttemptPreemption>,
 }

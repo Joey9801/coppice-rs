@@ -53,10 +53,8 @@ Around those:
 - `get_value`, `post_value`, and `put_value` as an escape hatch to the raw
   JSON when the server is newer than the client.
 
-The crate is standalone. It depends on no other `coppice-*` crate and carries
-its own copy of every wire type. A contract test on the server side
-round-trips every server value through this crate's copy and compares the
-parsed JSON on both sides, so the two cannot drift silently.
+The crate is standalone: it depends on no other `coppice-*` crate and carries
+its own definition of every wire type.
 
 ## Install
 
@@ -81,7 +79,7 @@ async fn main() -> coppice_client::Result<()> {
         .token_opt(std::env::var("COPPICE_TOKEN").ok())
         .build()?;
 
-    // Name the quota entity to charge by its path (ADR 0045) — an id works
+    // Name the quota entity to charge by its path — an id works
     // too, but a path is what a person actually thinks in. The job id is
     // minted here and is the submission's idempotency identity: resend it
     // verbatim on a retry.
@@ -114,10 +112,11 @@ async fn main() -> coppice_client::Result<()> {
 
 ## Preemption
 
-A job opts in to being preempted with a `[preemption]` table (ADR 0044). The
-default is not preemptible; a preemptible job is charged at a discount and may
-be placed on preemptible-only nodes, in return for a notice signal ahead of the
-kill.
+A job opts in to being preempted with a `[preemption]` table. A preemptible job
+is charged at a discount and may be placed on preemptible-only nodes (eg AWS
+spot nodes), but in return must accept potentially being killed early by the
+platform to make way for higher priority work or spot node reclaim. Jobs killed
+early by the platform like this are given a free retry.
 
 ```rust,no_run
 use std::time::Duration;
@@ -147,10 +146,11 @@ for the entity's whole subtree.
 
 ## Watching a set of jobs
 
-Polling every job a service owns is almost all redundant requests. Instead,
-subscribe: `Client::watch_jobs` takes a filter naming an **open set** — every
-job matching it, including ones submitted later — lists it a page at a time,
-subscribes from the first page's applied index, and keeps one connection open.
+Polling every job a service owns would mean many redundant requests when nothing
+is changing. Instead, subscribe: `Client::watch_jobs` takes a filter naming an
+**open set** — every job matching it, including ones submitted later — lists a
+snapshot of the current state one page at a time, then streams incremental
+updates on top of that.
 
 ```rust,no_run
 use coppice_client::{Client, JobFilter, JobWatchItem, WatchOptions};

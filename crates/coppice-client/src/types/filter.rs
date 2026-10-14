@@ -66,7 +66,7 @@ pub enum JobFilter {
     SubmittedBy(String),
     /// Matches a requested-resource dimension against one or both bounds.
     Requests(RequestsFilter),
-    /// Matches a metadata key's presence, or its exact value (ADR 0042).
+    /// Matches a metadata key's presence, or its exact value.
     Metadata(MetadataFilter),
 }
 
@@ -78,7 +78,7 @@ pub struct PhaseFilter {
 }
 
 /// `{"entity": {"ref": "acme/eng", "scope": "subtree"}}` — the entity to
-/// match, by id or path (ADR 0045).
+/// match, by id or path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EntityFilter {
     /// The entity to match.
@@ -188,12 +188,11 @@ pub enum RequestsResource {
 }
 
 /// `{"metadata": {"key": "…"}}` — presence; plus `"equals"` for exact
-/// string equality (ADR 0042). Nothing else: a pattern match is a further
-/// leaf for a future ADR, not a shape this one carries.
+/// string equality. Pattern matching is not supported.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MetadataFilter {
     /// The metadata key, under the same charset and length rules as a stored
-    /// key (ADR 0042): a key that could never be stored can never match, and
+    /// key: a key that could never be stored can never match, and
     /// refusing it names the typo.
     pub key: String,
     /// The exact value to compare against, byte for byte and
@@ -362,16 +361,16 @@ impl JobFilter {
     }
 
     /// [`validate`](Self::validate), plus the one extra rule an **event
-    /// subscription** adds (ADR 0043): only the leaves that say *which job
+    /// subscription** adds: only the leaves that say *which job
     /// this is* may be used.
     ///
-    /// A subscription matches against the identity keys the apply loop stamped
-    /// onto the event — the job's metadata, its submitter, its quota entity
+    /// A subscription matches against the identity keys recorded with the
+    /// event — the job's metadata, its submitter, its quota entity
     /// chain, its id — and nothing else, because anything else would be read
     /// from state that has moved on by delivery time and differs between
-    /// replicas. So `phase`, `node`, `image`, `search`, `submitted` and
+    /// servers. So `phase`, `node`, `image`, `search`, `submitted` and
     /// `requests` are refused, by name, with the server's own wording: the fix
-    /// is to move that leaf into the `ListJobs` resync query instead.
+    /// is to move that leaf into the `ListJobs` query used to resync instead.
     ///
     /// Every accepted subscription filter is therefore also a valid
     /// [`Client::list_jobs`](crate::Client::list_jobs) filter, which is what
@@ -497,7 +496,7 @@ impl JobFilter {
     }
 }
 
-/// The metadata leaf's own rule (ADR 0042): a storable key.
+/// The metadata leaf's own rule: a storable key.
 ///
 /// Read off the domain validator rather than restated here — one charset,
 /// one length bound, one error text. The `equals` operand needs no check:
@@ -779,7 +778,7 @@ mod tests {
         );
     }
 
-    /// A subscription may only name the identity leaves (ADR 0043), and the
+    /// A subscription may only name the identity leaves, and the
     /// refusal names the one that was the problem — the first thing a caller
     /// needs, since the fix is to move it into the resync query.
     #[test]

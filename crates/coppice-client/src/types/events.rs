@@ -1,5 +1,5 @@
 //! The three frames of `GET /api/v1/events` — the filtered job-event
-//! subscription (ADR 0043).
+//! subscription.
 //!
 //! Unlike everything else in [`crate::types`], these bodies never arrive on
 //! their own: each is the `data:` payload of one named SSE frame, and the
@@ -7,8 +7,7 @@
 //! [`events`](crate::events) module is what turns a response body into them;
 //! they are public because the items that module yields carry them.
 //!
-//! All three are hand-written copies of the server's DTOs like every other
-//! type here, and held to them by the same contract test.
+//! Like every other type here they follow the server's JSON exactly.
 
 use serde::{Deserialize, Serialize};
 
@@ -19,24 +18,24 @@ use super::TimelineEvent;
 /// The `event: batch` frame: everything one applied command produced that the
 /// subscription's filter admitted.
 ///
-/// One frame per Raft index, **never split** — a command's events are one unit
-/// on this stream (ADR 0008) — which is what makes the bare index a safe
+/// One frame per log index, **never split** — a command's events are one unit
+/// on this stream — which is what makes the bare index a safe
 /// cursor: a resume can never land inside a command.
 ///
-/// The events are the same [`TimelineEvent`] shape `GetJobTimeline` serves
-/// (ADR 0032): thin, identified by `(index, ordinal)`, with no job snapshot
+/// The events are the same [`TimelineEvent`] shape `GetJobTimeline` serves:
+/// thin, identified by `(index, ordinal)`, with no job snapshot
 /// attached. A consumer that needs the job's state reads it with
 /// [`ReadOptions::at_least`](crate::ReadOptions::at_least) set to this frame's
-/// `index`, so a lagging replica cannot answer with state older than the
+/// `index`, so a lagging server cannot answer with state older than the
 /// event.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct EventBatchFrame {
-    /// The producing command's Raft log index — the resume cursor, and the
+    /// The producing command's log index — the resume cursor, and the
     /// frame's SSE event id.
     pub index: u64,
-    /// The command's advisory proposer stamp (ADR 0032). It may run backwards
-    /// as `index` advances; never reorder by it.
+    /// When the server recorded the command — advisory only. It may run
+    /// backwards as `index` advances; never reorder by it.
     pub at: Timestamp,
     /// Ascending by `ordinal`, with gaps wherever the filter excluded an
     /// event — ordinals are batch positions, never renumbered per
@@ -70,8 +69,8 @@ pub struct EventProgressFrame {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct EventGapFrame {
-    /// The oldest index this replica could still have served — everything
-    /// below it is gone from the reconnection ring (ADR 0008).
+    /// The oldest index the server could still have served — everything
+    /// below it is no longer available for replay.
     pub earliest_available: u64,
 }
 

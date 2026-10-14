@@ -4,10 +4,10 @@
 //! never be passed where a [`NodeId`] belongs. Every textual form — `Display`,
 //! `FromStr`, and serde — is `<prefix>-<uuid>`, e.g.
 //! `job-1683852a-993f-4497-a48b-6527b458fbd1`, which is exactly what the
-//! server puts on the wire (ADR 0024).
+//! server puts on the wire.
 //!
 //! Ids are **client-minted** on two write paths: a job's id and a quota
-//! entity's id are the idempotency identity of their submission (ADR 0026), so
+//! entity's id are the idempotency identity of their submission, so
 //! mint one with [`JobId::new`] per logical submission and re-send it verbatim
 //! on every retry.
 

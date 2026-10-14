@@ -22,8 +22,8 @@
 //! underlying read returned, indexes intact — paging through a list is
 //! exactly when staleness matters, and a pager that stripped them would leave
 //! a caller no way to notice a page served by a replica that had fallen
-//! behind. `Versioned` derefs to the body, so a walk reads the same as it
-//! always did:
+//! behind. `Versioned` derefs to the body, so a walk reads the same as one
+//! over the bare body:
 //!
 //! ```no_run
 //! # async fn walk(client: &coppice_client::Client, job: coppice_client::JobId)

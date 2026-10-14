@@ -1,14 +1,9 @@
 //! The `/api/v1` request and response bodies, and the query parameters that
 //! go with them.
 //!
-//! These are hand-written copies of the coordinator's own DTOs. This crate
-//! deliberately depends on no `coppice-*` crate, so that it can be published
-//! on its own; a contract test inside the server's `coppice-api` builds every
-//! server value, serializes it, decodes that into the type here, serializes
-//! it again, and asserts the two JSON documents are equal — every key, every
-//! value, every enum spelling, compared as `serde_json::Value`s rather than
-//! as text, so key order and whitespace are the only things it lets differ.
-//! That is what keeps the copies honest.
+//! These types mirror the JSON the coordinator's HTTP API speaks — every key,
+//! value and enum spelling — and are defined here so this crate stands on
+//! its own.
 //!
 //! Three conventions run through everything here, and knowing them explains
 //! most of the shapes:

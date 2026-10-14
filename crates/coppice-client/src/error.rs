@@ -4,14 +4,13 @@
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// The closed error vocabulary the server carries in an error body's `code`
-/// field (ADR 0031), plus a catch-all.
+/// field, plus a catch-all.
 ///
-/// Clients switch on this, so the server treats a new variant as a contract
-/// change. [`ErrorCode::Other`] exists anyway: an old client must be able to
-/// name a newer server's code rather than fail to decode the error at all.
-/// `FromStr` never fails — an unrecognized spelling becomes `Other` — which
-/// is what lets [`crate::Client`] parse every error body's `code` field
-/// unconditionally.
+/// Switch on it to decide how to react to a failure. [`ErrorCode::Other`]
+/// exists because a newer server may send a code this client predates: it is
+/// named rather than failing to decode the error at all. `FromStr` never fails — an unrecognized spelling
+/// becomes `Other` — which is what lets [`crate::Client`] parse every error
+/// body's `code` field unconditionally.
 #[derive(Debug, Clone, PartialEq, Eq, strum::Display, strum::EnumString)]
 #[strum(serialize_all = "SCREAMING_SNAKE_CASE")]
 #[non_exhaustive]
@@ -23,10 +22,12 @@ pub enum ErrorCode {
     Unauthenticated,
     /// The caller's role bindings do not cover the target.
     PermissionDenied,
-    /// The id is well-formed but absent from the read view.
+    /// The id is well-formed but names nothing the server can see.
     NotFound,
-    /// The command committed and apply refused it deterministically — a
-    /// normal race outcome, never a server fault.
+    /// The request was accepted and processed, but the server deterministically
+    /// refused it — a normal race outcome (for example, aborting a job that
+    /// already finished), never a server fault. The identical request will be
+    /// refused again.
     Rejected,
     /// A write reached a follower. [`Error::leader_hint`] carries where to
     /// retry, when the follower knew.
@@ -34,9 +35,10 @@ pub enum ErrorCode {
     /// The request did not resolve: a timeout, overload, shutdown, or a
     /// follower that cannot bound its staleness. Retryable.
     Unavailable,
-    /// A reserved route with no backing implementation yet.
+    /// The route exists but the server does not implement it.
     Unimplemented,
-    /// A server-side bug. Details are logged there, never leaked here.
+    /// A server-side fault. The details stay in the server's logs and are not
+    /// returned to the caller.
     Internal,
     /// A code this client does not know — a newer server's vocabulary.
     #[strum(default)]
@@ -46,8 +48,8 @@ pub enum ErrorCode {
 /// Everything a call to a coordinator can fail with.
 ///
 /// The `Display` of the three server-answered cases is deliberately stable
-/// text — `api error (NOT_FOUND): no such job …` — because it is what the
-/// `coppice` CLI prints to operators.
+/// text — `api error (NOT_FOUND): no such job …` — suitable for showing to
+/// an operator.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
@@ -71,7 +73,7 @@ pub enum Error {
     #[error("sending the request")]
     Transport(#[source] reqwest::Error),
 
-    /// The server answered non-2xx with the ADR 0031 `{code, message}` body.
+    /// The server answered non-2xx with a `{code, message}` error body.
     #[error("api error ({code}): {message}{}", leader_suffix(.leader))]
     Api {
         /// The HTTP status that carried it.
@@ -118,7 +120,7 @@ pub enum Error {
 
     /// A [`JobEventStream`](crate::JobEventStream) produced no frame at all —
     /// not even the `progress` bookmark that doubles as the server's keepalive
-    /// (ADR 0043) — for longer than its idle timeout allows.
+    /// — for longer than its idle timeout allows.
     ///
     /// Retryable: nothing here says the request was wrong, only that this
     /// connection is dead. [`JobEventWatcher`](crate::JobEventWatcher)
@@ -131,7 +133,8 @@ pub enum Error {
     },
 }
 
-/// `; retry against the leader at …`, the suffix the CLI has always printed.
+/// `; retry against the leader at …`, the suffix appended to an API error that
+/// names a leader.
 fn leader_suffix(leader: &Option<String>) -> String {
     match leader {
         Some(leader) => format!("; retry against the leader at {leader}"),
@@ -193,8 +196,8 @@ impl Error {
     /// True for a transport failure, for `UNAVAILABLE`, for `NOT_LEADER` (aim
     /// the retry at [`leader_hint`](Self::leader_hint)), and for a 5xx that
     /// carried no error body. False for everything the caller got wrong, and
-    /// false for `REJECTED`, which is apply's deterministic refusal — the
-    /// identical command will be refused again.
+    /// false for `REJECTED`, which is a deterministic refusal — the
+    /// identical request will be refused again.
     pub fn is_retryable(&self) -> bool {
         match self {
             Error::Transport(_) => true,
@@ -212,8 +215,7 @@ impl Error {
 mod tests {
     use super::*;
 
-    /// The exact strings the CLI has always printed. Phase-2 output must not
-    /// move, so these are pinned.
+    // Pinned: the display strings are user-visible output.
     #[test]
     fn display_matches_the_cli_wording() {
         let api = Error::Api {
