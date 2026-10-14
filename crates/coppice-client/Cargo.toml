@@ -10,10 +10,10 @@ documentation = "https://docs.rs/coppice-client"
 version = "0.0.2"
 edition.workspace = true
 # Not inherited: this is the one crate whose `rust-version` strangers rely on,
-# so it states what CI actually proves (the `client-msrv` job) rather than the
-# workspace's untested aspiration. 1.86 is the floor the dependency graph sets
-# today — `reqwest` → `url` → `idna_adapter` needs it.
-rust-version = "1.86"
+# so it states what CI actually proves (the `client-msrv` job, against the
+# checked-in lockfile). It matches the workspace's floor so that one lockfile
+# serves both.
+rust-version = "1.94.1"
 license.workspace = true
 repository.workspace = true
 authors.workspace = true

@@ -812,7 +812,7 @@ fn list_jobs_scan(
             break;
         }
         last_examined = Some(*id);
-        if filter.map_or(true, |f| ctx.matches(state, f, record)) {
+        if filter.is_none_or(|f| ctx.matches(state, f, record)) {
             jobs.push(job_summary(state, record));
         }
     }
@@ -882,8 +882,8 @@ impl FilterContext {
             // `after` inclusive (≥), `before` exclusive (<) — the contract's
             // half-open window.
             F::Submitted(sf) => {
-                sf.after.map_or(true, |a| record.submitted_at >= a)
-                    && sf.before.map_or(true, |b| record.submitted_at < b)
+                sf.after.is_none_or(|a| record.submitted_at >= a)
+                    && sf.before.is_none_or(|b| record.submitted_at < b)
             }
             // Both bounds inclusive.
             F::Requests(r) => {
@@ -894,7 +894,7 @@ impl FilterContext {
                     dto::RequestsResource::MemoryBytes => record.spec.requests.memory.as_u64(),
                     dto::RequestsResource::DiskBytes => record.spec.requests.disk.as_u64(),
                 };
-                r.min.map_or(true, |m| value >= m) && r.max.map_or(true, |m| value <= m)
+                r.min.is_none_or(|m| value >= m) && r.max.is_none_or(|m| value <= m)
             }
             F::Metadata(m) => self.matches_metadata(m, record),
         }

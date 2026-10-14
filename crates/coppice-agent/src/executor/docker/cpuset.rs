@@ -216,7 +216,7 @@ impl Allocator {
             });
         }
 
-        if cpu_millis > 0 && cpu_millis % 1000 == 0 {
+        if cpu_millis > 0 && cpu_millis.is_multiple_of(1000) {
             let count = usize::try_from(cpu_millis / 1000)
                 .map_err(|_| "whole-core request does not fit usize".to_string())?;
             let indices = self.choose_cores(count).ok_or_else(|| {

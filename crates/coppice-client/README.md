@@ -10,7 +10,7 @@
 <p align="center">
   <a href="https://crates.io/crates/coppice-client"><img src="https://img.shields.io/crates/v/coppice-client" alt="crates.io"></a>
   <a href="https://docs.rs/coppice-client"><img src="https://img.shields.io/docsrs/coppice-client" alt="docs.rs"></a>
-  <img src="https://img.shields.io/badge/MSRV-1.86-blue" alt="MSRV 1.86">
+  <img src="https://img.shields.io/badge/MSRV-1.94.1-blue" alt="MSRV 1.94.1">
   <img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue" alt="MIT OR Apache-2.0">
 </p>
 
@@ -269,7 +269,7 @@ Either way the token is held as a `BearerToken`, which redacts itself in
 
 ## Minimum supported Rust version
 
-1.86, checked in CI.
+1.94.1, checked in CI.
 
 ## Stability
 

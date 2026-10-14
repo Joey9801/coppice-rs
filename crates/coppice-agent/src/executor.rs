@@ -374,7 +374,7 @@ pub fn classify_exit(exit: &ExitInfo, attribution: &Attribution) -> AttemptOutco
 /// The container runtime. Every method is executor-agnostic from the agent
 /// core's point of view; classification and journaling happen above it.
 ///
-/// Native async-fn-in-trait is used deliberately (MSRV 1.79): the agent runs
+/// Native async-fn-in-trait is used deliberately: the agent runs
 /// one session at a time, so the auto-trait leakage the lint warns about is
 /// not a concern here.
 #[allow(async_fn_in_trait)]

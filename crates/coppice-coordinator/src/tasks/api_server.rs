@@ -312,7 +312,7 @@ fn multiplier_for(view: &StateView, priority: i32) -> Option<PriorityMultiplier>
 /// committed.
 fn notice_fits(view: &StateView, notice: Option<Duration>) -> bool {
     let policy = &view.state().policy;
-    notice.map_or(true, |n| {
+    notice.is_none_or(|n| {
         coppice_core::preemption::validate_notice(
             n,
             policy.preemption_notice_floor,

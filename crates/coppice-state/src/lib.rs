@@ -172,7 +172,7 @@ impl StateMachine {
     ) -> impl Iterator<Item = (&EnrollTokenId, &EnrollToken)> {
         self.enroll_tokens
             .iter()
-            .filter(move |(_, t)| !t.revoked && t.expires_at.map_or(true, |exp| exp > now))
+            .filter(move |(_, t)| !t.revoked && t.expires_at.is_none_or(|exp| exp > now))
     }
 
     /// Whether a node has confirmed durable receipt of the CA key (ADR 0037
@@ -266,7 +266,7 @@ impl StateMachine {
             && self
                 .entity_chain(job.quota_entity)
                 .iter()
-                .all(|id| self.quota_entities.get(id).map_or(true, |e| e.preemptible))
+                .all(|id| self.quota_entities.get(id).is_none_or(|e| e.preemptible))
     }
 
     /// An entity's path (ADR 0045): its ancestors' names, root first, joined

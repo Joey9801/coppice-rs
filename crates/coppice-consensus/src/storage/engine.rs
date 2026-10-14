@@ -928,7 +928,7 @@ impl<F: Fs> StorageCore<F> {
         let floor = self.manifest.purge_floor;
         let empties_log = match floor {
             Some(f) => from <= f.index + 1,
-            None => self.manifest.segments.first().map_or(true, |&s| from <= s),
+            None => self.manifest.segments.first().is_none_or(|&s| from <= s),
         };
         let (new_last, logical_end, dropped): (Option<FrameLogId>, Option<FrameLogId>, Vec<u64>) =
             if empties_log {
@@ -1022,7 +1022,7 @@ impl<F: Fs> StorageCore<F> {
             return Ok(());
         }
 
-        let purges_everything = self.last_log_id.map_or(true, |l| upto.index >= l.index);
+        let purges_everything = self.last_log_id.is_none_or(|l| upto.index >= l.index);
         let dropped = self.covered_segments(upto.index, purges_everything);
 
         // Step 1: the manifest stops claiming, floor advances, fsync.
@@ -1248,10 +1248,9 @@ impl<F: Fs> StorageCore<F> {
                 if self
                     .manifest
                     .purge_floor
-                    .map_or(true, |f| f.index < upto.index)
+                    .is_none_or(|f| f.index < upto.index)
                 {
-                    let purges_everything =
-                        self.last_log_id.map_or(true, |l| upto.index >= l.index);
+                    let purges_everything = self.last_log_id.is_none_or(|l| upto.index >= l.index);
                     dropped = self.covered_segments(upto.index, purges_everything);
                     self.manifest.purge_floor = Some(upto);
                     self.manifest.segments.retain(|s| !dropped.contains(s));
