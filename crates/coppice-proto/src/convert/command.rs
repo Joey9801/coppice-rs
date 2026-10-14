@@ -20,12 +20,13 @@ use coppice_state::command::JobMetadataUpdate;
 use coppice_state::command::{
     AbortJob, AllocationSpec, BindMachineIdentity, BumpClusterVersion, Command, CommitPlacements,
     ConfigureQuotaEntity, ConfirmKeyPossession, ConfirmStagedKeyPossession, DeclareNodeLost,
-    DispatchAttempt, EvictNodes, EvictTerminalJobs, IntervalRenewal, LostAttempt, MintEnrollToken,
-    Placement, RebindMachineAddress, ReconcileNode, RecordAttemptExited, RecordAttemptNotified,
-    RecordAttemptOutcome, RecordAttemptStarted, RecordCaCertificate, RecordEnrolledIdentity,
-    RecordKeyTransferIntent, RecordStagedKeyTransferIntent, RegisterNode, RenewIntervalCharges,
-    RetireMachineBinding, RevokeEnrollToken, RevokeIdentity, SetNodeDrain, SetNodeDraining,
-    SubmitJob, UpdateAuthorization, UpdateJobMetadata, UpdatePolicy,
+    DispatchAttempt, EvictNodes, EvictTerminalJobs, Eviction, EvictionRule, IntervalRenewal,
+    LostAttempt, MintEnrollToken, Placement, RebindMachineAddress, ReconcileNode,
+    RecordAttemptExited, RecordAttemptNotified, RecordAttemptOutcome, RecordAttemptStarted,
+    RecordCaCertificate, RecordEnrolledIdentity, RecordKeyTransferIntent,
+    RecordStagedKeyTransferIntent, RegisterNode, RenewIntervalCharges, RetireMachineBinding,
+    RevokeEnrollToken, RevokeIdentity, SetNodeDrain, SetNodeDraining, SubmitJob,
+    UpdateAuthorization, UpdateJobMetadata, UpdatePolicy,
 };
 use coppice_state::{
     CaCertBundle, EnrollRole, PolicyConfig, RevokedIdentity, DEFAULT_DRAIN_CLEANUP_MARGIN,
@@ -284,7 +285,7 @@ impl From<&Placement> for pb::Placement {
             attempt: Some(p.attempt.into()),
             group: Some(p.group.into()),
             allocations: p.allocations.iter().map(Into::into).collect(),
-            preemptions: p.preemptions.iter().map(|id| (*id).into()).collect(),
+            evictions: p.preemptions.iter().map(Into::into).collect(),
         }
     }
 }
@@ -303,11 +304,48 @@ impl TryFrom<pb::Placement> for Placement {
                 .map(TryInto::try_into)
                 .collect::<Result<_, _>>()?,
             preemptions: p
-                .preemptions
+                .evictions
                 .into_iter()
                 .map(TryInto::try_into)
                 .collect::<Result<_, _>>()?,
         })
+    }
+}
+
+impl From<&Eviction> for pb::Eviction {
+    fn from(e: &Eviction) -> Self {
+        pb::Eviction {
+            allocation: Some(e.allocation.into()),
+            rule: eviction_rule_to_pb(e.rule) as i32,
+        }
+    }
+}
+
+impl TryFrom<pb::Eviction> for Eviction {
+    type Error = ConvertError;
+
+    fn try_from(e: pb::Eviction) -> Result<Self, ConvertError> {
+        Ok(Eviction {
+            allocation: req(e.allocation, "Eviction.allocation")?.try_into()?,
+            rule: eviction_rule_from_pb(e.rule, "Eviction.rule")?,
+        })
+    }
+}
+
+fn eviction_rule_to_pb(rule: EvictionRule) -> pb::EvictionRule {
+    match rule {
+        EvictionRule::Priority => pb::EvictionRule::Priority,
+        EvictionRule::Relocation => pb::EvictionRule::Relocation,
+    }
+}
+
+/// Decode an `EvictionRule` from its `i32` wire value. The enum is closed:
+/// `UNSPECIFIED` and any unknown value are rejected, never defaulted.
+fn eviction_rule_from_pb(value: i32, field: &'static str) -> Result<EvictionRule, ConvertError> {
+    match pb::EvictionRule::try_from(value) {
+        Ok(pb::EvictionRule::Priority) => Ok(EvictionRule::Priority),
+        Ok(pb::EvictionRule::Relocation) => Ok(EvictionRule::Relocation),
+        _ => Err(ConvertError::UnknownEnum { field, value }),
     }
 }
 

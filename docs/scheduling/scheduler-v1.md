@@ -264,8 +264,9 @@ at or before the bound, fits `J`; a node where even every eligible victim
 is not enough is skipped. Among nodes, the earliest bound wins, then the
 least total work at risk, then the lowest `NodeId`.
 
-`J` is proposed **accruing** on that node with the victims as the
-placement's `preemptions`, gated on the batch simulator like any accrual
+`J` is proposed **accruing** on that node with the victims, each named
+with the rule it was chosen under, as the placement's `preemptions`,
+gated on the batch simulator like any accrual
 (so it needs room under the cap K, and the node must hold no other
 accrual). Limits, all scheduler-side and read off attempt records through a
 pass-scoped `PreemptionLedger`:
@@ -283,17 +284,17 @@ pass-scoped `PreemptionLedger`:
 **Relocation** is the one exception to both rules: for a beneficiary that
 is not effectively preemptible, a victim on a persistent node is eligible
 whatever its class and score if it is effectively preemptible now and a
-`preemptible_only` node has room for it. A relocated victim the class rule
-does not cover is recorded `Relocation`, and apply checks its room: the
-first open spot node in `NodeId` order whose free capacity before the
-batch, less what the batch's earlier `Relocation` victims counted on, holds
-it. The pass replays that tally exactly to pick the same node. One the
-class rule covers (it failed only the score rule) is recorded `Priority`,
-and apply counts nothing for it — but the pass still reserves its room in a
-second, stricter tally of *every* relocation, which all relocated victims
-must also fit, together with the node's simulated free capacity, so no two
-victims ever rely on one slot. The spot capacity is a precondition, not a
-hold: the victim requeues and is placed by the ordinary rules. Relocation counts against every limit below.
+`preemptible_only` node has room for it. A victim is proposed under
+`Priority` when the class and score rules both hold, else under
+`Relocation`, and apply re-validates the named rule — so a victim the
+beneficiary outranks by class but not by score is a `Relocation` victim,
+and apply checks its room: the first open spot node in `NodeId` order
+whose free capacity before the batch, less what the batch's earlier
+relocations counted on, holds it. The pass replays that tally exactly to
+pick the same node, and also requires the room in the node's simulated
+free capacity, so no two victims ever rely on one slot. The spot capacity
+is a precondition, not a hold: the victim requeues and is placed by the
+ordinary rules. Relocation counts against every limit above.
 
 An existing accrual is a candidate on the same test, by revoke-and-reseat
 (next section), with `natural` the better of its current bound and its best

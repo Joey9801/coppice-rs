@@ -258,8 +258,7 @@ struct Pass<'a> {
     /// `SchedulerConfig::preemption_cooldown`.
     cooldown: Duration,
     /// Spot capacity this pass's relocations already count on, per
-    /// `preemptible_only` node: apply's first-fit tally, replayed, and the
-    /// pass's own stricter one.
+    /// `preemptible_only` node: apply's first-fit tally, replayed.
     spot: preempt::SpotTally,
     /// `SchedulerConfig::preemption_min_improvement`.
     preempt_min_improvement: Duration,

@@ -15,7 +15,7 @@ use coppice_core::job::Job;
 use coppice_core::resource::Resources;
 use coppice_core::time::{Duration, Timestamp};
 
-use crate::command::{CommitPlacements, Placement};
+use crate::command::{CommitPlacements, EvictionRule, Placement};
 use crate::{AllocationRecord, RejectionReason, StateMachine};
 
 /// The scheduler's own terminations, per node, read off attempt records in
@@ -129,12 +129,14 @@ pub enum PreemptionRefusal {
     NotPreemptible,
     #[error("its node is draining")]
     NodeDraining,
-    #[error(
-        "the beneficiary does not outrank it (class rule) and relocation does not apply \
-         (a non-preemptible beneficiary on a persistent node, with spot capacity free for \
-         the victim)"
-    )]
+    #[error("named under the priority rule, but the beneficiary does not outrank it by class")]
     NotOutranked,
+    #[error(
+        "named under the relocation rule, but relocation does not apply (a non-preemptible \
+         beneficiary on a persistent node, a victim effectively preemptible now, and spot \
+         capacity free for it)"
+    )]
+    NotRelocatable,
     #[error(
         "the node already has outstanding scheduler terminations, or the beneficiary \
          already has victims (per-node guard)"
@@ -201,9 +203,12 @@ impl PreemptCheck {
 }
 
 impl StateMachine {
-    /// Re-validate one placement's eviction group (ADR 0044 §4) and decide
-    /// each victim's reason. The score rule is the proposer's alone: it
-    /// depends on the scheduler-local `w_age`, which is not replicated.
+    /// Re-validate one placement's eviction group (ADR 0044 §4): each victim
+    /// against the rule the placement names it under, which becomes its
+    /// recorded reason. A `Priority` victim must pass the class rule — the
+    /// score rule is the proposer's alone, as it depends on the
+    /// scheduler-local `w_age`, which is not replicated. A `Relocation`
+    /// victim must meet the relocation condition, spot room included.
     ///
     /// `revoked` is the batch's revocation set: a revoked accrual on the node
     /// (the beneficiary's own, in a revoke-and-reseat) holds nothing once the
@@ -215,7 +220,7 @@ impl StateMachine {
         used: &BTreeMap<NodeId, Resources>,
         check: &mut PreemptCheck,
     ) -> Result<Vec<(AllocationId, PreemptReason)>, RejectionReason> {
-        let Some(&first) = p.preemptions.first() else {
+        let Some(first) = p.preemptions.first().map(|e| e.allocation) else {
             return Ok(Vec::new());
         };
         let refuse = |allocation: AllocationId, refusal: PreemptionRefusal| {
@@ -247,7 +252,8 @@ impl StateMachine {
         let relocating = !node.node.preemptible_only && !self.effective_preemptible(&job.spec);
         let mut out = Vec::with_capacity(p.preemptions.len());
         let mut max_notice = Duration::ZERO;
-        for &victim in &p.preemptions {
+        for eviction in &p.preemptions {
+            let victim = eviction.allocation;
             if !check.victims.insert(victim) {
                 return refuse(victim, PreemptionRefusal::Duplicate);
             }
@@ -277,17 +283,30 @@ impl StateMachine {
             if !attempt.effective_preemptible {
                 return refuse(victim, PreemptionRefusal::NotPreemptible);
             }
-            // The class rule: a chain of priority preemptions is strictly
-            // increasing in class. Failing it, the relocation condition:
-            // some spot node has free capacity for the victim right now.
-            let reason = if victim_job.spec.priority < job.spec.priority {
-                PreemptReason::Priority { for_job: p.job }
-            } else if relocating
-                && self.reserve_spot_capacity(victim_job, alloc, used, &mut check.spot_reserved)
-            {
-                PreemptReason::Relocation { for_job: p.job }
-            } else {
-                return refuse(victim, PreemptionRefusal::NotOutranked);
+            let reason = match eviction.rule {
+                // The class rule: a chain of priority preemptions is strictly
+                // increasing in class.
+                EvictionRule::Priority => {
+                    if victim_job.spec.priority >= job.spec.priority {
+                        return refuse(victim, PreemptionRefusal::NotOutranked);
+                    }
+                    PreemptReason::Priority { for_job: p.job }
+                }
+                // The relocation condition: some spot node has free capacity
+                // for the victim right now.
+                EvictionRule::Relocation => {
+                    if !(relocating
+                        && self.reserve_spot_capacity(
+                            victim_job,
+                            alloc,
+                            used,
+                            &mut check.spot_reserved,
+                        ))
+                    {
+                        return refuse(victim, PreemptionRefusal::NotRelocatable);
+                    }
+                    PreemptReason::Relocation { for_job: p.job }
+                }
             };
             max_notice = max_notice.max(self.declared_notice(&victim_job.spec));
             out.push((victim, reason));
@@ -308,7 +327,7 @@ impl StateMachine {
             .flatten()
             .filter(|(id, _, release)| {
                 !revoked.contains(id)
-                    && !p.preemptions.contains(id)
+                    && !p.preemptions.iter().any(|e| e.allocation == *id)
                     && !release.is_some_and(|at| at <= bound)
             })
             .fold(Resources::ZERO, |acc, (_, funded, _)| {
