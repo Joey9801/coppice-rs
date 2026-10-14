@@ -59,14 +59,14 @@
 //!
 //! - `COPPICE_JOB_ID`: the job's id.
 //! - `COPPICE_ATTEMPT_ID`: this attempt's id.
-//! - `COPPICE_ATTEMPT_INDEX`: this attempt's zero-based index within the job.
-//! - `COPPICE_PREVIOUS_ATTEMPT_ID`: the previous attempt's id; unset on the
-//!   first attempt.
-//! - `COPPICE_PREVIOUS_ATTEMPT_OUTCOME`: how the previous attempt ended (for
-//!   example whether it was preempted); unset on the first attempt.
-//! - `COPPICE_PREEMPTIBLE`: `true` when this attempt is effectively
-//!   preemptible (the job's flag and every ancestor quota entity's switch),
-//!   else `false`.
+//! - `COPPICE_ATTEMPT_INDEX`: this attempt's zero-based index within the job,
+//!   counting attempts that never ran.
+//! - `COPPICE_PREVIOUS_ATTEMPT_ID`: the id of the most recent earlier attempt
+//!   that reached `Running`; unset when none did.
+//! - `COPPICE_PREVIOUS_ATTEMPT_OUTCOME`: how that attempt ended (`preempted`,
+//!   `node_lost`, `exited`, …); unset with the id.
+//! - `COPPICE_PREEMPTIBLE`: `1` when this attempt is effectively preemptible
+//!   (the job's flag and every ancestor quota entity's switch), else `0`.
 //! - `COPPICE_NOTICE_SIGNAL`: the notice signal's name, such as `SIGUSR1`.
 //! - `COPPICE_NOTICE_S`: the notice length in whole seconds.
 //!

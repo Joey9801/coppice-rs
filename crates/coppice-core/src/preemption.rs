@@ -25,9 +25,9 @@ use crate::time::Duration;
 /// The signal a job is sent as its notice.
 ///
 /// A closed allowlist (ADR 0044 §1): the signals a batch workload can
-/// reasonably trap to mean "checkpoint now". A job naming
-/// [`NoticeSignal::Sigterm`] gets one signal and a longer grace; every other
-/// choice is followed later by the ordinary `SIGTERM` stop path.
+/// reasonably trap to mean "checkpoint now". Every choice is followed at the
+/// stop time by the ordinary `SIGTERM` stop path, so a job naming
+/// [`NoticeSignal::Sigterm`] receives it twice.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum NoticeSignal {
     Sighup,
