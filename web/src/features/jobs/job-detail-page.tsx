@@ -20,6 +20,7 @@ import {
   formatTimeAgo,
   formatTimestamp,
 } from '@/lib/format'
+import { useNow } from '@/lib/use-now'
 import {
   CopyButton,
   EmptyState,
@@ -195,7 +196,7 @@ function JobDetailView({ job }: { job: JobDetail }) {
 
 function HeroTiles({ job, phase }: { job: JobDetail; phase: JobPhase }) {
   const lastAttempt = currentOrLastAttempt(job)
-  const now = new Date()
+  const now = useNow()
   const runtimeSeconds = attemptRuntimeSeconds(lastAttempt, now)
   const preempted = job.attempts.filter((a) => a.outcome?.kind === 'Preempted').length
 
