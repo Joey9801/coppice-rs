@@ -73,7 +73,7 @@ pub const COMMITTED_INDEX_HEADER: &str = "coppice-committed-index";
 /// The response header a follower sets to say where the leader is.
 pub const LEADER_HEADER: &str = "coppice-leader";
 
-/// The request header carrying a subscription's resume cursor (ADR 0043).
+/// The request header carrying a subscription's resume cursor.
 ///
 /// The server honours it ahead of `?cursor=`, because it is what the client
 /// actually last processed rather than whatever was baked into the URL when
@@ -86,14 +86,14 @@ pub const LAST_EVENT_ID_HEADER: &str = "last-event-id";
 /// A `reqwest` timeout covers reading the response body, so the timeout that
 /// keeps a wedged endpoint from hanging a program would also cut a
 /// subscription off mid-stream — after thirty seconds by default, and rather
-/// sooner than any ADR 0043 consumer expects. There is no per-request way to
+/// sooner than a long-lived subscriber expects. There is no per-request way to
 /// say "no timeout" (a request-level `None` falls back to the client's), so
 /// the exemption is a year: longer than any stream, and still not forever.
 ///
 /// The connect timeout is untouched and still bounds reaching the host.
 pub const STREAM_TIMEOUT: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 
-/// How fresh a read has to be (ADR 0007).
+/// How fresh a read has to be.
 ///
 /// Every read endpoint has its own default — a list is `Bounded`, a
 /// configuration read is `Strong`, a derived series is `Eventual` — so most
@@ -301,7 +301,7 @@ fn normalize_base_url(raw: &str) -> String {
 /// Loading native roots enumerates the macOS keychain eagerly inside
 /// `ClientBuilder::build` — seconds, before any request is made — even for a
 /// plain `http://127.0.0.1` base that will never touch TLS. This is the one
-/// trick worth keeping from the `coppice` CLI: a plain-HTTP base pays nothing,
+/// trick worth keeping: a plain-HTTP base pays nothing,
 /// and an `https://` base keeps the platform trust store automatically under
 /// the same scheme check.
 ///
@@ -719,9 +719,10 @@ impl Client {
     /// A short page with a non-null `next_cursor` means *continue*, never
     /// *done*. [`list_jobs_paged`](Self::list_jobs_paged) does the walking.
     ///
-    /// A filter is checked with [`JobFilter::validate`](crate::JobFilter::validate)
-    /// before anything is sent, so a malformed tree is an
-    /// [`Error::InvalidRequest`] rather than a round trip to be refused.
+    /// A filter is checked with
+    /// [`JobFilter::validate`](crate::JobFilter::validate) before anything is
+    /// sent, so a malformed tree is an [`Error::InvalidRequest`] rather than a
+    /// round trip to be refused.
     pub async fn list_jobs(&self, params: &ListJobsParams) -> Result<Versioned<ListJobsResponse>> {
         if let Some(filter) = &params.filter {
             filter.validate().map_err(Error::InvalidRequest)?;
@@ -856,7 +857,7 @@ impl Client {
     // -- job events ---------------------------------------------------------
 
     /// `GET /api/v1/events` — one subscription to the filtered job-event
-    /// stream (ADR 0043).
+    /// stream.
     ///
     /// `filter` selects an **open set**: every job matching it, including jobs
     /// submitted after the subscription opened. It is checked with
@@ -872,8 +873,9 @@ impl Client {
     ///
     /// The returned stream is **one connection**, and the server ends it when
     /// the credential expires or the replica drains. For a subscription that
-    /// outlives its connections, use [`watch_job_events`](Self::watch_job_events);
-    /// for the full list-then-subscribe loop, [`watch_jobs`](Self::watch_jobs).
+    /// outlives its connections, use
+    /// [`watch_job_events`](Self::watch_job_events); for the full
+    /// list-then-subscribe loop, [`watch_jobs`](Self::watch_jobs).
     ///
     /// Opening the stream is an ordinary request: it waits for the rate-limit
     /// slot and carries the credential like any other. What it does not carry
@@ -881,10 +883,10 @@ impl Client {
     /// hours cannot be abandoned after thirty seconds — so only the connect
     /// timeout bounds it. See [`STREAM_TIMEOUT`].
     ///
-    /// Quiet is fine: the server bookmarks progress at least every 15 s (ADR
-    /// 0043), and that bookmark doubles as the stream's keepalive. Silence
-    /// beyond [`crate::DEFAULT_STREAM_IDLE_TIMEOUT`] is treated as a dead
-    /// connection instead — [`JobEventStream::next_item`] fails with
+    /// Quiet is fine: the server bookmarks progress at least every 15 s, and
+    /// that bookmark doubles as the stream's keepalive. Silence beyond
+    /// [`crate::DEFAULT_STREAM_IDLE_TIMEOUT`] is treated as a dead connection
+    /// instead — [`JobEventStream::next_item`] fails with
     /// [`Error::StreamIdle`], and [`JobEventWatcher`] reconnects from the
     /// cursor exactly as it would after any other retryable failure.
     pub async fn subscribe_job_events(
@@ -929,9 +931,9 @@ impl Client {
         JobEventWatcher::new(self.clone(), filter, options)
     }
 
-    /// The ADR 0043 loop: list with `filter`, subscribe from that read's
-    /// applied index, and on a `gap` do both again. See [`JobWatcher`], which
-    /// documents the guarantee in full.
+    /// The list-then-subscribe loop: list with `filter`, subscribe from that
+    /// read's applied index, and on a `gap` do both again. See [`JobWatcher`],
+    /// which documents the guarantee in full.
     ///
     /// The snapshot arrives one page per
     /// [`next_item`](crate::JobWatcher::next_item) — a
@@ -973,7 +975,7 @@ impl Client {
     /// `POST /api/v1/nodes/{node}/drain` — drain a node. Only bounded
     /// backfill is admitted from then on; running work continues.
     ///
-    /// With a `deadline` the drain is a deadline drain (ADR 0044 §5): running
+    /// With a `deadline` the drain is a deadline drain: running
     /// work is given notice and stopped so the node is empty by then. `None`
     /// sends no body, a regular drain.
     pub async fn drain_node(
@@ -1012,8 +1014,8 @@ impl Client {
     /// `GET /api/v1/quota-entities/{entity}` — one entity, its ancestry, its
     /// children and its subtree stats. A **strong** read by default.
     ///
-    /// `entity` is a ref (ADR 0045): an id or a path. A path is percent-encoded
-    /// as a single path segment (`/` becomes `%2F`) — see [`paths::quota_entity`].
+    /// `entity` is a ref: an id or a path. A path is percent-encoded as a
+    /// single path segment (`/` becomes `%2F`) — see [`paths::quota_entity`].
     pub async fn quota_entity(
         &self,
         entity: impl Into<QuotaEntityRef>,

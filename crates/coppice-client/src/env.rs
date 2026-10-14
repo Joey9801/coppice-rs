@@ -7,7 +7,7 @@
 //! with the rest of the spec and served back through the API to anyone who
 //! can read the job.
 //!
-//! The server checks the limits at admission and again at apply.
+//! The server checks the limits when a job is submitted.
 //! [`JobEnv::insert`] and [`JobEnv::validate`] apply the same rules here, with
 //! the same wording, so a bad name fails where it was written rather than as
 //! an `INVALID_ARGUMENT` a round trip later. Decoding stays permissive: a

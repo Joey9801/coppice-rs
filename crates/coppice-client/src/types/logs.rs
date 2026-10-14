@@ -174,7 +174,7 @@ pub struct LogSourceRecord {
     /// The attempt this record covers.
     pub attempt: AttemptId,
     /// The node the attempt ran on; `null` only when the attempt record
-    /// itself is missing from replicated state, so no node is known.
+    /// itself is no longer recorded, so no node is known.
     pub node: Option<NodeId>,
     /// The verdict.
     pub availability: LogAvailability,
@@ -231,7 +231,7 @@ pub struct GetJobLogsResponse {
 
 /// The parameters of a `GET /api/v1/jobs/{job}/logs` request.
 ///
-/// Server contract this mirrors: `limit` defaults to 200 and must fall in
+/// Server behaviour: `limit` defaults to 200 and must fall in
 /// `1..=1000` — out of range is a `400`, never silently clamped; `order`
 /// defaults to `desc` (newest first); `to` is exclusive unless
 /// `to_inclusive` is set; a `cursor` whose embedded order disagrees with

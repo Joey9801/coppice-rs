@@ -11,10 +11,10 @@ use crate::time::Timestamp;
 
 use super::{JobPhase, Resources};
 
-/// The `/healthz` body's `status` field. Always `ok` on the server today;
-/// carries `Unknown` anyway since a probe endpoint outside `/api/v1`'s own
-/// versioning is exactly the kind of thing a future server might repurpose,
-/// and this client should degrade rather than fail to decode it.
+/// The `/healthz` body's `status` field. Currently always `ok`;
+/// `Unknown` is carried anyway because the probe endpoint sits outside
+/// `/api/v1`'s versioning, so a future server might extend it and this
+/// client should degrade rather than fail to decode it.
 #[derive(
     Debug,
     Clone,
@@ -74,9 +74,8 @@ pub struct QueueSample {
     /// The bucket's instant.
     pub t: Timestamp,
     /// The depth sampled when the bucket closed, on the same `Queued` +
-    /// accruing predicate as [`QueueStats::depth`] — the two are derived
-    /// from one shared server-side helper so the series and the headline
-    /// can never disagree.
+    /// accruing predicate as [`QueueStats::depth`] — the series and the
+    /// headline figure are computed the same way, so they agree.
     pub depth: u32,
     /// Jobs draining from the queue in this bucket, per minute.
     pub drained_per_minute: f64,
@@ -199,7 +198,7 @@ pub struct CapacitySample {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct GetClusterOverviewResponse {
-    /// The cluster this replica belongs to (node config).
+    /// The cluster this replica belongs to.
     pub cluster_id: ClusterId,
     /// Queue depth and composition.
     pub queue: QueueStats,
@@ -207,25 +206,25 @@ pub struct GetClusterOverviewResponse {
     pub capacity: ClusterCapacity,
 }
 
-/// The serving replica's last snapshot, as far as it is knowable from
-/// openraft metrics. Only the covered log index is real today.
+/// The serving replica's last snapshot. Only `last_included_index` (and the
+/// derived `entries_since_snapshot`) carry data; `size_bytes` and `taken_at`
+/// are currently always `None`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct CoordinatorSnapshot {
-    /// Snapshot size on disk. Always `null` on the wire: the server's
-    /// snapshot metadata carries no size, and computing one would mean
-    /// stat-ing snapshot files on a read path.
+    /// Snapshot size on disk. Always `null` on the wire: the server does
+    /// not report a snapshot size.
     pub size_bytes: Option<u64>,
-    /// Log index the last snapshot covers (openraft's snapshot metric).
+    /// Log index the last snapshot covers.
     pub last_included_index: u64,
-    /// When the snapshot was taken. Always `null` on the wire: the server's
-    /// snapshot metadata records no timestamp.
+    /// When the snapshot was taken. Always `null` on the wire: the server does
+    /// not report when a snapshot was taken.
     pub taken_at: Option<Timestamp>,
     /// Applied entries since the snapshot: `last_applied − last_included_index`.
     pub entries_since_snapshot: u64,
 }
 
-/// Object counts in the replicated state machine.
+/// Object counts in the cluster's replicated state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct CoordinatorStateCounts {
@@ -336,9 +335,8 @@ pub struct CoordinatorMember {
     /// Whether the member is a voter (vs a learner).
     pub voter: bool,
     /// Highest applied index on this member: the serving replica reports
-    /// its own exactly; peers are `null` (their apply progress is not
-    /// tracked here — the leader observes only their *replicated* index,
-    /// which feeds `replication_lag_entries` instead).
+    /// its own exactly; peers are `null` (their applied index is not
+    /// reported; see `replication_lag_entries` for how far behind they are).
     pub last_applied: Option<u64>,
     /// Entries this member is behind the leader's committed index,
     /// leader-only; `null` on followers or for a member the leader has no
@@ -349,13 +347,12 @@ pub struct CoordinatorMember {
 /// `GET /api/v1/coordinators` — this replica's view of the raft cluster:
 /// leader/term/indexes, replicated-state counts, and the per-member roster.
 ///
-/// Read locally off the consensus metrics and a replica-local state
-/// snapshot, so every figure is "as this replica sees it" — a follower
+/// Every figure is "as the replica that answered sees it" — a follower
 /// answers from its own applied position, not the leader's.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct GetCoordinatorStatusResponse {
-    /// The cluster this replica belongs to (node config).
+    /// The cluster this replica belongs to.
     pub cluster_id: ClusterId,
     /// The current leader's raft id, when one is known.
     pub leader: Option<RaftId>,
@@ -365,13 +362,13 @@ pub struct GetCoordinatorStatusResponse {
     pub known_committed: u64,
     /// Highest applied log index on the serving replica.
     pub last_applied: u64,
-    /// Applied-command count on the serving replica — a state coordinate,
-    /// distinct from the raft log index.
+    /// Count of commands applied on the serving replica; distinct from the
+    /// raft log index.
     pub state_version: u64,
     /// The last snapshot's coverage, or `null` when this replica has taken
     /// no snapshot yet.
     pub snapshot: Option<CoordinatorSnapshot>,
-    /// Object counts in the replicated state machine.
+    /// Object counts in the cluster's replicated state.
     pub state_counts: CoordinatorStateCounts,
     /// One entry per configured cluster member.
     pub members: Vec<CoordinatorMember>,

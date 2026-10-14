@@ -12,9 +12,9 @@
 //! no attempt yet) leaves the position alone; the follower never rewinds.
 //!
 //! Each page arrives as the [`Versioned`] its underlying
-//! read returned, so a follow that runs for hours can still see which replica
-//! served it and how far behind that replica was. `Versioned` derefs to the
-//! body, so the loop below reads as it always did.
+//! read returned, so a follow that runs for hours can still see which server
+//! answered it and how far behind that server was. `Versioned` derefs to the
+//! body, so the loop below reads as if pages were plain responses.
 //!
 //! **The job's state, not the page, says when to stop.** A page's `live` flag
 //! is best-effort, so the follower asks the job whether it is finished, and

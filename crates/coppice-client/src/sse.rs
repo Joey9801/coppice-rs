@@ -1,6 +1,6 @@
 //! A hand-rolled Server-Sent Events frame parser.
 //!
-//! `GET /api/v1/events` (ADR 0043) is a `text/event-stream` per the WHATWG
+//! `GET /api/v1/events` is a `text/event-stream` per the WHATWG
 //! spec, and this crate is deliberately dependency-light — pulling in a whole
 //! SSE crate for one endpoint is not worth it, and the wire format is small
 //! enough to parse by hand and pin with tests.
@@ -23,7 +23,7 @@ pub(crate) struct SseFrame {
     pub(crate) data: String,
     /// The `id:` field **as carried by this frame**, not the sticky
     /// last-event-id of the SSE spec. The caller keeps the cursor itself (see
-    /// ADR 0043), and a frame that deliberately carries no id — the ADR's
+    /// the events module), and a frame that deliberately carries no id — the
     /// `gap` frame — must not appear to hand one over by inheriting an
     /// earlier frame's id.
     pub(crate) id: Option<String>,

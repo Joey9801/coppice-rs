@@ -14,13 +14,11 @@ use super::JobPhase;
 /// Deserialize a float that may arrive as `null`, mapping `null` to
 /// [`f64::INFINITY`].
 ///
-/// This is the exact inverse of the server's serialization: JSON has no
-/// infinity, so a non-finite float is rendered as `null`, and a plain `f64`
-/// field then *fails* to read its own output back. The quota figures this
-/// helper backs are legitimately infinite (an entity with zero quota and
-/// nonzero usage is infinitely over quota), so every such field opts into
-/// this reader; without it a client decoding these DTOs errors on a
-/// perfectly valid cluster state.
+/// JSON has no infinity, so the server renders a non-finite float as `null`,
+/// and a plain `f64` field would fail to read that back. The quota figures
+/// this helper backs are legitimately infinite (an entity with zero quota
+/// and nonzero usage is infinitely over quota), so every such field opts
+/// into this reader.
 ///
 /// Serialization is untouched — this only affects reading.
 fn null_as_infinity<'de, D>(deserializer: D) -> Result<f64, D::Error>
@@ -32,10 +30,10 @@ where
 
 /// How a quota entity came to exist.
 ///
-/// `Sso` marks an entity auto-minted the first time the coordinator sees
-/// an OIDC principal. No such minting path exists on the server yet, so
-/// today every entity is `Configured`; the variant is declared so the
-/// wire vocabulary is stable when it lands.
+/// `Sso` marks an entity auto-created the first time the server sees an
+/// OIDC principal. The server does not currently create entities this way,
+/// so every entity you read is `Configured`; the variant is part of the
+/// wire vocabulary so that clients handle it when it appears.
 #[derive(
     Debug,
     Clone,
@@ -87,8 +85,8 @@ pub struct QuotaEntityNode {
     pub id: QuotaEntityId,
     /// The entity's own stored name segment.
     pub name: String,
-    /// The entity's path: its ancestors' names, root first, joined by `/`
-    /// (ADR 0045). Derived at read time, never stored.
+    /// The entity's path: its ancestors' names, root first, joined by `/`.
+    /// Computed when you read it, so it always reflects the current tree.
     pub path: String,
     /// The parent entity; `null` roots the entity.
     pub parent: Option<QuotaEntityId>,
@@ -101,9 +99,9 @@ pub struct QuotaEntityNode {
     /// Decayed usage as of read time.
     pub usage_ucu: u64,
     /// How far over quota, as a ratio. Serializes as `null` when infinite
-    /// (zero quota, nonzero usage) — JSON has no infinity, and the server
-    /// renders a non-finite float as null; `null_as_infinity` reads that
-    /// back.
+    /// (zero quota, nonzero usage) — JSON has no infinity, so the server
+    /// renders a non-finite float as null; this crate reads that back as
+    /// [`f64::INFINITY`].
     #[serde(deserialize_with = "null_as_infinity")]
     pub over_quota_ratio: f64,
     /// Multiplicative scheduling penalty ≥ 1 derived from the ratio (so also
@@ -114,7 +112,7 @@ pub struct QuotaEntityNode {
     pub created_at: Timestamp,
     /// When the entity was last configured.
     pub updated_at: Timestamp,
-    /// The entity's own preemption switch (ADR 0044 §1); `false` switches
+    /// The entity's own preemption switch; `false` switches
     /// preemption off for its whole subtree. Default `true`.
     pub preemptible: bool,
     /// Live job counts over this entity's **subtree** (itself + descendants):
@@ -134,8 +132,8 @@ pub struct QuotaEntityView {
     pub id: QuotaEntityId,
     /// The entity's own stored name segment.
     pub name: String,
-    /// The entity's path: its ancestors' names, root first, joined by `/`
-    /// (ADR 0045). Derived at read time, never stored.
+    /// The entity's path: its ancestors' names, root first, joined by `/`.
+    /// Computed when you read it, so it always reflects the current tree.
     pub path: String,
     /// The parent entity; `null` roots the entity.
     pub parent: Option<QuotaEntityId>,
@@ -161,9 +159,9 @@ pub struct ListQuotaEntitiesResponse {
     pub entities: Vec<QuotaEntityNode>,
 }
 
-/// One decayed-usage sample for an entity's sparkline. Unused today — no
-/// usage-series sampler exists on the server — so
-/// [`QuotaEntityStats::usage_history`] is always empty.
+/// One decayed-usage sample for an entity's sparkline. The server does not
+/// currently record usage series, so [`QuotaEntityStats::usage_history`] is
+/// always empty.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct UsageSample {
@@ -191,13 +189,12 @@ pub struct QuotaEntityStats {
     /// Σ µCU/s of the currently running attempts in the subtree (each
     /// attempt's recorded charge rate).
     pub burn_rate_ucu_per_second: u64,
-    /// µCU charged to the subtree in the trailing 24h. **`null`**: no charge
-    /// ledger exists on the server to measure it — a true-up settles against
-    /// entity usage and retains no per-window total. A decision to serve
-    /// null, never a fabricated 0.
+    /// µCU charged to the subtree in the trailing 24h. **Always `null`**: the
+    /// server does not track a per-window charge total. It is never a
+    /// fabricated 0.
     pub charged_ucu_24h: Option<u64>,
-    /// Recent decayed-usage samples, oldest first. **Always empty**: no
-    /// usage-series sampler exists on the server to produce them.
+    /// Recent decayed-usage samples, oldest first. **Always empty**: the
+    /// server does not currently record usage series.
     pub usage_history: Vec<UsageSample>,
 }
 
@@ -218,7 +215,7 @@ pub struct GetQuotaEntityResponse {
 
 /// `POST /api/v1/quota-entities` — the create-or-update upsert.
 ///
-/// The caller mints `entity` and it is **required**, mirroring a job
+/// The caller mints `entity` and it is **required**, as with a job
 /// submission's client-minted id: the id is the upsert's idempotency
 /// identity, so a retry after an unknown outcome re-sends the same request
 /// and lands on the same entity rather than creating a second one.
@@ -228,22 +225,22 @@ pub struct ConfigureQuotaEntityRequest {
     /// Client-minted entity id — required. The upsert target: an existing
     /// id updates its quota, a fresh one creates.
     pub entity: QuotaEntityId,
-    /// Parent in the quota tree, by id or path (ADR 0045); `null` roots the
+    /// Parent in the quota tree, by id or path; `null` roots the
     /// entity. A parent that does not exist is rejected by the server. A
-    /// path is resolved by the leader, as a submission's entity is. Fixed at
+    /// path is resolved by the server when the request is handled. Fixed at
     /// creation: an update must repeat the stored
     /// parent, or the server rejects it (`REJECTED`) — there is no move.
     #[serde(default)]
     pub parent: Option<QuotaEntityRef>,
-    /// The entity's name — one path segment (ADR 0045): 1–63 characters
-    /// from `[A-Za-z0-9._-]`, the first alphanumeric, unique among its
-    /// siblings. [`crate::validate_segment`] pre-checks the grammar; the
-    /// sibling-uniqueness rule is enforced by the server at apply. Fixed at
-    /// creation like `parent`: there is no rename.
+    /// The entity's name — one path segment: 1–63 characters from
+    /// `[A-Za-z0-9._-]`, the first alphanumeric, unique among its siblings.
+    /// [`crate::validate_segment`] pre-checks the grammar; the
+    /// sibling-uniqueness rule is enforced by the server when the change takes
+    /// effect. Fixed at creation like `parent`: there is no rename.
     pub name: String,
     /// Soft quota as a stock in µCU; the caller converts human rates.
     pub quota_ucu: u64,
-    /// The entity's preemption switch (ADR 0044 §1); `false` switches
+    /// The entity's preemption switch; `false` switches
     /// preemption off for its subtree. Absent leaves an existing entity's
     /// switch as it is and creates a new entity switched on.
     #[serde(default)]
@@ -279,10 +276,10 @@ impl ConfigureQuotaEntityRequest {
 }
 
 /// `POST /api/v1/quota-entities` response — the echoed entity id plus the
-/// apply's `log_index`.
+/// change's `log_index`.
 ///
-/// The write path (propose → committed decision) returns only the log
-/// index, not a fresh projected view; pair the echoed id + `log_index` with
+/// The response carries only the log index, not a fresh view of the
+/// entity; pair the echoed id + `log_index` with
 /// a strong `GET /api/v1/quota-entities/{entity}?min_index=…` for
 /// read-your-writes.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -290,10 +287,10 @@ impl ConfigureQuotaEntityRequest {
 pub struct ConfigureQuotaEntityResponse {
     /// Echo of the client-minted id from the request.
     pub entity: QuotaEntityId,
-    /// The entity's path (ADR 0045) — permanent, since an entity's name and
+    /// The entity's path — permanent, since an entity's name and
     /// parent are fixed at creation.
     pub path: String,
-    /// Raft log index at which this upsert applied; pair with `?min_index=`
+    /// Raft log index at which this upsert took effect; pair with `?min_index=`
     /// on a subsequent read for read-your-writes.
     pub log_index: u64,
 }
@@ -509,7 +506,7 @@ mod tests {
         assert_eq!(req.with_preemptible(false).preemptible, Some(false));
     }
 
-    /// `with_parent` accepts a path as readily as an id (ADR 0045).
+    /// `with_parent` accepts a path as readily as an id.
     #[test]
     fn with_parent_accepts_a_path_ref() {
         let entity = QuotaEntityId::new();

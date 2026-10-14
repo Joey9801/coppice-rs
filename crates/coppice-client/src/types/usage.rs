@@ -1,11 +1,10 @@
 //! `GET /api/v1/jobs/{job}/usage` — best-effort job usage-metrics retrieval,
 //! the metrics twin of the job-logs pipeline (see [`super::logs`]).
 //!
-//! The response mirrors [`super::GetJobLogsResponse`] shape-for-shape — a
-//! samples list plus the same per-attempt `sources` availability accounting
-//! — because the underlying walk is identical: resolve the job's attempts,
-//! walk them under a bounded RPC budget, join "where it ran" with "what data
-//! survives" into a per-attempt verdict.
+//! The response has the same shape as [`super::GetJobLogsResponse`] — a
+//! samples list plus per-attempt `sources` availability accounting — and
+//! is built the same way: the job's attempts are resolved and each gets a
+//! verdict joining "where it ran" with "what data survives".
 
 use serde::{Deserialize, Serialize};
 
@@ -67,7 +66,7 @@ impl UsageAvailability {
     }
 }
 
-/// One resource sample, mirroring the agent's stored row field-for-field.
+/// One resource sample, as recorded on the node that ran the attempt.
 /// Counters are cumulative — derive a rate by differencing consecutive
 /// samples, so a dropped sample loses resolution, never mass.
 ///
@@ -114,7 +113,7 @@ pub struct UsageSourceRecord {
     /// The attempt this record covers.
     pub attempt: AttemptId,
     /// The node the attempt ran on; `null` only when the attempt record
-    /// itself is missing from replicated state, so no node is known.
+    /// itself is no longer recorded, so no node is known.
     pub node: Option<NodeId>,
     /// The verdict.
     pub availability: UsageAvailability,

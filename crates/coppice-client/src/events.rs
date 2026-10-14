@@ -1,6 +1,6 @@
 //! Subscribing to job events, and the list-then-subscribe loop built on it.
 //!
-//! `GET /api/v1/events` (ADR 0043) answers an open-ended `text/event-stream`
+//! `GET /api/v1/events` answers an open-ended `text/event-stream`
 //! carrying three named frames — a `batch` of one command's events, a
 //! `progress` bookmark, and a `gap` — and this module is the three layers a
 //! consumer wants over them:
@@ -10,9 +10,9 @@
 //!   reconnects nothing.
 //! - [`JobEventWatcher`] ([`Client::watch_job_events`]) keeps a stream open
 //!   across the endings that are routine — the credential expiring, the
-//!   replica draining, a connection dropping — resuming from the last id it
+//!   server draining, a connection dropping — resuming from the last id it
 //!   saw and discarding the replay that a resume can produce.
-//! - [`JobWatcher`] ([`Client::watch_jobs`]) is the loop ADR 0043 describes:
+//! - [`JobWatcher`] ([`Client::watch_jobs`]) is the list-then-subscribe loop:
 //!   list with the filter, subscribe from that read's applied index, and on a
 //!   `gap` do both again. Its snapshot arrives **page by page**
 //!   ([`JobWatchItem::SnapshotPage`]) and, by default, covers only the jobs
@@ -20,7 +20,7 @@
 //!
 //! ## What this actually guarantees
 //!
-//! Delivery is **at-least-once** (ADR 0008). Within one
+//! Delivery is **at-least-once**. Within one
 //! [`JobEventWatcher`] run the duplicates a reconnect produces are removed —
 //! the watcher tracks the cursor and drops anything at or below it — so a
 //! caller sees each batch once. Across a resync boundary it is genuinely
@@ -39,7 +39,7 @@
 //! **Payloads are thin.** An event carries identity, stamp, kind and scope
 //! ids, never a job snapshot. A consumer that needs more reads the job with
 //! [`ReadOptions::at_least`](crate::ReadOptions::at_least) set to the event's
-//! `index`, so a lagging replica cannot answer with state older than the
+//! `index`, so a lagging server cannot answer with state older than the
 //! event that prompted the read:
 //!
 //! ```no_run
@@ -109,20 +109,20 @@ pub const DEFAULT_MIN_RECONNECT_BACKOFF: Duration = Duration::from_millis(250);
 
 /// The ceiling the reconnect backoff doubles up to.
 ///
-/// Thirty seconds: long enough that a replica restarting under a thundering
-/// herd of its own subscribers is not made worse by them, short enough that a
-/// consumer of a quiet set is not left minutes behind once the replica is back.
+/// Thirty seconds: long enough that a server restarting under a thundering
+/// herd of subscribers is not made worse by them, short enough that a
+/// consumer of a quiet set is not left minutes behind once the server is back.
 pub const DEFAULT_MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(30);
 
 /// How long a [`JobEventStream`] may go without a single **complete frame**
 /// before it gives up on the connection.
 ///
-/// The server bookmarks progress every 15 s (`EVENT_PROGRESS_INTERVAL`, ADR
-/// 0043), and that bookmark doubles as the stream's keepalive — a healthy
-/// connection is never quiet for long. Four missed intervals is not "a quiet
-/// set", it is a connection nothing is coming down any more (a load balancer
-/// that dropped it silently, most often), so this is set well above one
-/// interval but nowhere near patient enough to mistake the two for each other.
+/// The server bookmarks progress about every 15 s, and that bookmark doubles as
+/// the stream's keepalive — a healthy connection is never quiet for long. Four
+/// missed intervals is not "a quiet set", it is a connection nothing is coming
+/// down any more (a load balancer that dropped it silently, most often), so
+/// this is set well above one interval but nowhere near patient enough to
+/// mistake the two for each other.
 ///
 /// Only a fully dispatched frame — one the parser has assembled end to end,
 /// whether or not this client acts on it — resets the clock. An SSE comment
@@ -131,7 +131,7 @@ pub const DEFAULT_MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(30);
 /// exactly the "not really there" connection this timeout exists to catch.
 pub const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// One item delivered by a job-event subscription — ADR 0043's three frames,
+/// One item delivered by a job-event subscription — the stream's three frames,
 /// with the SSE framing already gone.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
@@ -148,7 +148,7 @@ pub enum JobEventItem {
     /// what came before. The stream continues live; a consumer that tracks
     /// state owes a re-query (see [`JobWatcher`]).
     Gap {
-        /// The oldest index this replica could still have served.
+        /// The oldest index the server could still have served.
         earliest_available: u64,
     },
 }
@@ -158,13 +158,13 @@ pub enum JobEventItem {
 /// Built by [`Client::subscribe_job_events`]. Each
 /// [`next_item`](Self::next_item) reads as much of the response body as the
 /// next frame needs and returns it; `Ok(None)` is the server ending the stream
-/// cleanly, which it does when the credential that opened the stream expires,
-/// when the replica drains, or when its fanout stops (ADR 0043). None of those
-/// are errors, and all of them mean the same thing: reconnect with the cursor.
+/// cleanly, which it does when the credential that opened the stream expires
+/// or when the server is draining. Neither is an error, and both mean the
+/// same thing: reconnect with the cursor.
 /// [`JobEventWatcher`] is that, done for you.
 ///
-/// Dropping the stream is how a consumer unsubscribes; the replica notices the
-/// connection is gone and removes it from the fanout.
+/// Dropping the stream is how a consumer unsubscribes; the server notices the
+/// connection is gone and discards the subscription.
 #[derive(Debug)]
 pub struct JobEventStream {
     /// `None` once the body has ended — cleanly or not.
@@ -321,8 +321,7 @@ fn parse<T: serde::de::DeserializeOwned>(data: &str) -> Result<T> {
 /// is the caller's, untouched) delivers both — but its outcome is settled,
 /// and a consumer that needs it reads that one job. Listing every terminal
 /// job the cluster still retains would make the snapshot's size a function
-/// of retention — today the eviction horizon, tomorrow a durable history
-/// store — rather than of the working set.
+/// of how long the cluster retains finished jobs rather than of the working set.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SnapshotScope {
@@ -349,7 +348,7 @@ pub enum SnapshotScope {
 #[non_exhaustive]
 pub struct WatchOptions {
     /// Resume from just after this applied index. `None` starts the
-    /// subscription live — from whatever the replica has reached now.
+    /// subscription live — from whatever the server has reached now.
     ///
     /// Ignored by [`Client::watch_jobs`], which takes its first cursor from
     /// the list it does anyway.
@@ -422,7 +421,7 @@ impl WatchOptions {
 ///
 /// Built by [`Client::watch_job_events`]. It opens a [`JobEventStream`], and
 /// when that stream ends — cleanly, because the credential expired or the
-/// replica drained, or with a retryable failure — it opens another one from
+/// server drained, or with a retryable failure — it opens another one from
 /// the cursor it was holding, and drops the batches the resume replays. The
 /// caller sees one uninterrupted sequence.
 ///
@@ -471,7 +470,7 @@ impl JobEventWatcher {
 
     /// The next item, reconnecting as often as it takes.
     ///
-    /// Answers `Ok(None)` only once the watch is over, which today means only
+    /// Answers `Ok(None)` only once the watch is over, which means only
     /// after it has already returned the error that ended it: the error is
     /// reported once, and every call after that is `Ok(None)`.
     pub async fn next_item(&mut self) -> Result<Option<JobEventItem>> {
@@ -581,7 +580,7 @@ pub enum JobWatchItem {
         /// page in the middle of a run is never surfaced.
         jobs: Vec<JobSummary>,
         /// The applied index **this page** was served at. `None` in the one
-        /// case the replica reported no index; on the first page that also
+        /// case the server reported no index; on the first page that also
         /// means the subscription starts live, since there is no cursor to
         /// resume from.
         index: Option<u64>,
@@ -601,8 +600,8 @@ pub enum JobWatchItem {
     Batch(EventBatchFrame),
 }
 
-/// The ADR 0043 loop: list, subscribe from that read's index, and on a gap do
-/// both again.
+/// The list-then-subscribe loop: list, subscribe from that read's index, and on
+/// a gap do both again.
 ///
 /// Built by [`Client::watch_jobs`]. The snapshot arrives as a run of
 /// [`JobWatchItem::SnapshotPage`]s — one list request per item, so neither
@@ -629,7 +628,7 @@ pub enum JobWatchItem {
 ///   which, and cannot: it says only "not live now". Read it individually
 ///   ([`Client::job`]) if you need the outcome, passing
 ///   [`ReadOptions::at_least`](crate::ReadOptions::at_least) set to the page's
-///   `index` so a lagging replica cannot answer with state from before the
+///   `index` so a lagging server cannot answer with state from before the
 ///   list that omitted it.
 /// - **At startup, jobs whose state you do not know are your problem.** A
 ///   watch tells you about the live set and everything that happens next; a
@@ -666,8 +665,8 @@ pub enum JobWatchItem {
 ///
 /// ## Where it can still restart
 ///
-/// A long walk is time spent not subscribed. If it outlasts the replica's
-/// reconnection ring window, the subscription opened from the first page's
+/// A long walk is time spent not subscribed. If it outlasts the server's
+/// retained event window, the subscription opened from the first page's
 /// index meets a `gap` immediately and the whole snapshot starts over — with
 /// the resync read pinned to the gap's `earliest_available`. Under
 /// [`SnapshotScope::All`] over deep retention that is a real risk, and it is
@@ -698,7 +697,7 @@ pub struct JobWatcher {
     /// The `earliest_available` of the gap being answered, which the resync
     /// list must be read no older than. A gap raised by something that
     /// happened *at* an index — a quota entity moving under a subtree filter
-    /// (ADR 0043) — is only answered by a read that reflects that index; a
+    /// — is only answered by a read that reflects that index; a
     /// lagging replica's older list would walk the new subscription straight
     /// back into the same gap.
     resync_floor: Option<u64>,

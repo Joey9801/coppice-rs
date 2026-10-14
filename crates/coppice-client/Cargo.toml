@@ -65,7 +65,7 @@ governor = { version = "0.10", default-features = false, features = ["std"] }
 chrono = { version = "0.4.35", default-features = false, features = ["std", "now"] }
 
 # Declared locally: the workspace entry adds `v4`, which no id here mints.
-# Typed ids are UUIDv7 (ADR 0024).
+# Typed ids are UUIDv7.
 uuid = { version = "1", default-features = false, features = ["std", "v7"] }
 
 [dev-dependencies]

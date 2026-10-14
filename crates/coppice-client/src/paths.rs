@@ -48,7 +48,7 @@ pub const QUEUE_STATS: &str = "/queue/stats";
 /// `GET /jobs` (list) and `POST /jobs` (submit).
 pub const JOBS: &str = "/jobs";
 
-/// `GET /events` — the filtered job-event subscription (ADR 0043). The one
+/// `GET /events` — the filtered job-event subscription. The one
 /// long-lived response on this surface: it answers `text/event-stream` and
 /// stays open.
 pub const EVENTS: &str = "/events";
@@ -119,7 +119,7 @@ pub fn node_remove(node: NodeId) -> String {
 
 /// `GET /quota-entities/{entity}` — one entity's detail.
 ///
-/// `entity` is a ref (ADR 0045): an id or a path. Both are single URL path
+/// `entity` is a ref: an id or a path. Both are single URL path
 /// segments once encoded: an id's alphabet (`quota-<uuid>`) is all
 /// unreserved characters, and a path's grammar allows only
 /// `[A-Za-z0-9._-]` and `/` — so the only character that needs escaping is
@@ -154,7 +154,7 @@ mod tests {
     }
 
     /// An id ref needs no escaping; a path ref's `/` separators are
-    /// percent-encoded so the whole ref stays one path segment (ADR 0045).
+    /// percent-encoded so the whole ref stays one path segment.
     #[test]
     fn quota_entity_percent_encodes_a_path_ref_but_not_an_id_ref() {
         let id: crate::id::QuotaEntityId = "quota-00000000-0000-0000-0000-000000000003"

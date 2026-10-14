@@ -137,10 +137,11 @@
 //! ## Watching a set of jobs
 //!
 //! Polling every job a service owns is almost entirely redundant requests. The
-//! alternative is one connection: `GET /api/v1/events` (ADR 0043) subscribes
-//! to an **open set** — every job matching a filter, including jobs submitted
-//! after the subscription opened — and this crate provides the loop ADR 0008
-//! says a client library should.
+//! alternative is one connection: `GET /api/v1/events` subscribes to an
+//! **open set** — every job matching a filter, including jobs submitted after
+//! the subscription opened. Delivery is at-least-once and can be
+//! discontinuous, so this crate provides the list-subscribe-resync loop a
+//! client needs on top of it.
 //!
 //! [`Client::watch_jobs`] is that loop, and the one to reach for first. It
 //! lists with the filter — one [`JobWatchItem::SnapshotPage`] per page —
@@ -238,15 +239,10 @@
 //!
 //! ## How this crate tracks the server
 //!
-//! The wire types here are hand-written copies of the coordinator's own DTOs,
-//! which is what lets this crate publish with no `coppice-*` dependency. A
-//! contract test that lives inside the server — the one place that can see
-//! both crates at once — round-trips every server value through the copy here
-//! and compares the JSON on both sides as `serde_json::Value`s: every key,
-//! every value, every enum spelling, and every shared limit must match, while
-//! key order and whitespace are not compared.
+//! The wire types here are hand-written definitions of the HTTP API's JSON
+//! bodies, kept in step with the coordinator in each release.
 //!
-//! That copy is why tolerance runs one way: responses ignore fields this
+//! Tolerance runs one way: responses ignore fields this
 //! client is too old to know, and a string-valued enum keeps an unrecognized
 //! value verbatim ([`types`] explains the mechanism, and names the one
 //! tagged-union enum whose unknown payload is discarded instead), so an older

@@ -6,12 +6,12 @@ use serde::{Deserialize, Serialize};
 use crate::entity_ref::QuotaEntityRef;
 use crate::id::QuotaEntityId;
 
-/// The authentication posture a deployment runs under (`GetAuthConfigResponse::mode`).
+/// The authentication posture a deployment runs under
+/// (`GetAuthConfigResponse::mode`).
 ///
-/// Client-authored-closed on the server (`coppice_authn::AuthMode` has no
-/// third case today), but this client still carries `Unknown` — a future
-/// posture is exactly the kind of change an old client must degrade against
-/// rather than fail to decode `/auth/config` at all.
+/// The server currently defines only `oidc` and `open`, but this client
+/// still carries `Unknown` so that a posture added later degrades an old
+/// client gracefully rather than making `/auth/config` undecodable.
 #[derive(
     Debug,
     Clone,
@@ -128,12 +128,13 @@ pub struct SessionBinding {
     pub role: BindingRole,
     /// Subtree root the role is scoped to; `null` means cluster-wide.
     pub scope: Option<QuotaEntityId>,
-    /// The scope entity's path (ADR 0045); `null` when unscoped, or when
-    /// the scoped entity is (impossibly) absent from the tree.
+    /// The scope entity's path; `null` when unscoped, or in the
+    /// should-never-happen case that the server cannot resolve the entity.
     pub scope_path: Option<String>,
 }
 
-/// The mechanism that authenticated a request (`GetSessionResponse::auth_method`).
+/// The mechanism that authenticated a request
+/// (`GetSessionResponse::auth_method`).
 #[derive(
     Debug,
     Clone,
@@ -219,12 +220,9 @@ impl BindingRole {
 
 /// One role binding on the wire.
 ///
-/// Renamed from the server's `BindingDto`: `Dto` is server-internal jargon,
-/// and the wire shape is unchanged under the new name.
-///
 /// Flat subject: exactly one of `group`/`principal` must be present — serde
-/// cannot express "exactly one", so [`Binding::validate`] checks it, mirroring
-/// the server's own rejection.
+/// cannot express "exactly one", so [`Binding::validate`] checks it, with the
+/// same rule the server enforces.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Binding {
@@ -236,9 +234,9 @@ pub struct Binding {
     pub principal: Option<String>,
     /// The role this binding grants.
     pub role: BindingRole,
-    /// Subtree root the role is scoped to, by id or path (ADR 0045); absent
-    /// means unscoped (cluster-wide). A path is resolved by the leader, as a
-    /// submission's entity is.
+    /// Subtree root the role is scoped to, by id or path; absent
+    /// means unscoped (cluster-wide). A path is resolved by the server when
+    /// the request is handled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<QuotaEntityRef>,
 }
@@ -312,7 +310,7 @@ pub struct GetAuthorizationResponse {
 }
 
 /// One binding as read back on `GET /api/v1/authorization` — [`Binding`]
-/// plus the scope entity's path (ADR 0045).
+/// plus the scope entity's path.
 ///
 /// A separate type from [`Binding`], which is what a `PUT` sends: a read
 /// carries `scope_path` alongside the id, and `impl From<&BindingView> for
@@ -332,8 +330,8 @@ pub struct BindingView {
     /// (cluster-wide).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<QuotaEntityId>,
-    /// The scope entity's path (ADR 0045); absent when unscoped, or when
-    /// the scoped entity is (impossibly) absent from the tree.
+    /// The scope entity's path; absent when unscoped, or in the
+    /// should-never-happen case that the server cannot resolve the entity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope_path: Option<String>,
 }
@@ -382,8 +380,8 @@ impl UpdateAuthorizationRequest {
         self
     }
 
-    /// Validate every binding, prefixing each error the way the server's
-    /// handler does.
+    /// Validate every binding, prefixing each error with `binding N:` (the
+    /// binding's index), as the server does.
     pub fn validate(&self) -> Result<(), String> {
         for (i, binding) in self.bindings.iter().enumerate() {
             binding
@@ -398,8 +396,8 @@ impl UpdateAuthorizationRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct UpdateAuthorizationResponse {
-    /// Raft log index at which the update applied — bindings and any
-    /// `groups_claim` rename together, since one command carries both; pair
+    /// Raft log index at which the update took effect — bindings and any
+    /// `groups_claim` rename together, since they change together; pair
     /// with a subsequent read's minimum-index option for read-your-writes.
     pub log_index: u64,
 }
@@ -525,7 +523,7 @@ mod tests {
         );
     }
 
-    /// `with_scope` accepts a path as readily as an id (ADR 0045).
+    /// `with_scope` accepts a path as readily as an id.
     #[test]
     fn with_scope_accepts_a_path_ref() {
         let path: crate::entity_ref::QuotaEntityPath = "acme/eng".parse().unwrap();
