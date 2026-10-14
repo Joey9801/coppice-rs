@@ -590,11 +590,11 @@ async fn every_read_endpoint_hits_its_exact_path_and_method() {
             )
             .route("/api/v1/nodes", get(|| async { Json(list_nodes_json()) }))
             .route(
-                "/api/v1/nodes/:node",
+                "/api/v1/nodes/{node}",
                 get(move || async move { Json(node_json(node)) }),
             )
             .route(
-                "/api/v1/nodes/:node/utilization",
+                "/api/v1/nodes/{node}/utilization",
                 get(|| async { Json(node_utilization_json()) }),
             )
             .route(
@@ -602,7 +602,7 @@ async fn every_read_endpoint_hits_its_exact_path_and_method() {
                 get(|| async { Json(list_quota_entities_json()) }),
             )
             .route(
-                "/api/v1/quota-entities/:entity",
+                "/api/v1/quota-entities/{entity}",
                 get(move || async move { Json(quota_entity_response_json(entity)) }),
             )
             .route("/healthz", get(|| async { Json(healthz_json()) })),
@@ -666,24 +666,24 @@ async fn every_write_endpoint_hits_its_exact_path_method_and_body_shape() {
                 post(|| async { Json(job_write_response_json(JobId::new(), 1)) }),
             )
             .route(
-                "/api/v1/jobs/:job/abort",
+                "/api/v1/jobs/{job}/abort",
                 post(|| async { Json(empty_object()) }),
             )
             .route(
-                "/api/v1/jobs/:job/metadata",
+                "/api/v1/jobs/{job}/metadata",
                 put(|| async { Json(job_write_response_json(JobId::new(), 1)) })
                     .post(|| async { Json(job_write_response_json(JobId::new(), 1)) }),
             )
             .route(
-                "/api/v1/nodes/:node/drain",
+                "/api/v1/nodes/{node}/drain",
                 post(|| async { Json(empty_object()) }),
             )
             .route(
-                "/api/v1/nodes/:node/undrain",
+                "/api/v1/nodes/{node}/undrain",
                 post(|| async { Json(empty_object()) }),
             )
             .route(
-                "/api/v1/nodes/:node/remove",
+                "/api/v1/nodes/{node}/remove",
                 post(|| async { Json(empty_object()) }),
             )
             .route(
@@ -757,7 +757,7 @@ async fn a_deadline_drain_sends_its_deadline_as_a_json_body() {
     let store = capture_store();
     let router = with_capture(
         Router::new().route(
-            "/api/v1/nodes/:node/drain",
+            "/api/v1/nodes/{node}/drain",
             post(|| async { Json(empty_object()) }),
         ),
         store.clone(),
@@ -848,7 +848,7 @@ async fn job_logs_sends_every_parameter_under_its_exact_wire_key() {
 
     let store: QueryStore = Arc::new(Mutex::new(Vec::new()));
     let router = Router::new()
-        .route("/api/v1/jobs/:job/logs", get(handler))
+        .route("/api/v1/jobs/{job}/logs", get(handler))
         .with_state(store.clone());
     let base = spawn(router).await;
     let client = Client::new(&base).unwrap();
@@ -901,7 +901,7 @@ async fn job_usage_sends_every_parameter_under_its_exact_wire_key() {
 
     let store: QueryStore = Arc::new(Mutex::new(Vec::new()));
     let router = Router::new()
-        .route("/api/v1/jobs/:job/usage", get(handler))
+        .route("/api/v1/jobs/{job}/usage", get(handler))
         .with_state(store.clone());
     let base = spawn(router).await;
     let client = Client::new(&base).unwrap();
@@ -1031,7 +1031,7 @@ async fn missing_read_index_headers_leave_both_indexes_none() {
 async fn a_json_error_body_becomes_a_typed_api_error() {
     let job = JobId::new();
     let router = Router::new().route(
-        "/api/v1/jobs/:job",
+        "/api/v1/jobs/{job}",
         get(|| async {
             (
                 StatusCode::NOT_FOUND,
@@ -1064,7 +1064,7 @@ async fn a_json_error_body_becomes_a_typed_api_error() {
 #[tokio::test]
 async fn a_non_json_error_body_becomes_unexpected_status_with_its_text() {
     let router = Router::new().route(
-        "/api/v1/nodes/:node/drain",
+        "/api/v1/nodes/{node}/drain",
         post(|| async { status_with_body(502, "  bad gateway\n", &[]) }),
     );
     let base = spawn(router).await;
@@ -1079,7 +1079,7 @@ async fn a_non_json_error_body_becomes_unexpected_status_with_its_text() {
 #[tokio::test]
 async fn an_empty_error_body_has_no_trailing_colon() {
     let router = Router::new().route(
-        "/api/v1/nodes/:node/drain",
+        "/api/v1/nodes/{node}/drain",
         post(|| async { status_with_body(502, "", &[]) }),
     );
     let base = spawn(router).await;
@@ -1094,7 +1094,7 @@ async fn an_empty_error_body_has_no_trailing_colon() {
 #[tokio::test]
 async fn a_421_leader_hint_surfaces_on_the_error_and_its_display() {
     let router = Router::new().route(
-        "/api/v1/nodes/:node/drain",
+        "/api/v1/nodes/{node}/drain",
         post(|| async {
             status_with_body(
                 421,
@@ -1162,7 +1162,7 @@ async fn a_malformed_2xx_body_becomes_a_decode_error() {
 #[tokio::test]
 async fn is_not_found_recognizes_a_404_not_found_error() {
     let router = Router::new().route(
-        "/api/v1/jobs/:job",
+        "/api/v1/jobs/{job}",
         get(|| async { (StatusCode::NOT_FOUND, Json(error_body("NOT_FOUND", "gone"))) }),
     );
     let base = spawn(router).await;
@@ -1424,7 +1424,7 @@ async fn the_follower_walks_next_cursor_then_switches_to_resume_cursor() {
 
     let logs_router = with_capture(
         Router::new().route(
-            "/api/v1/jobs/:job/logs",
+            "/api/v1/jobs/{job}/logs",
             get(sequence(vec![
                 job_logs_response_json(vec![], vec![], Some("v1:n1"), None, true),
                 job_logs_response_json(vec![], vec![], None, Some("v1:r1"), true),
@@ -1434,7 +1434,7 @@ async fn the_follower_walks_next_cursor_then_switches_to_resume_cursor() {
         logs_store.clone(),
     );
     let job_router = Router::new().route(
-        "/api/v1/jobs/:job",
+        "/api/v1/jobs/{job}",
         get(move || {
             let body = job_detail_json(&job.to_string(), "attempting");
             async move { Json(body) }
@@ -1469,11 +1469,11 @@ async fn the_follower_stops_after_one_further_drain_past_terminal() {
 
     let caught_up = job_logs_response_json(vec![], vec![], None, None, true);
     let logs_router = with_capture(
-        Router::new().route("/api/v1/jobs/:job/logs", get(sequence(vec![caught_up]))),
+        Router::new().route("/api/v1/jobs/{job}/logs", get(sequence(vec![caught_up]))),
         logs_store.clone(),
     );
     let job_router = Router::new().route(
-        "/api/v1/jobs/:job",
+        "/api/v1/jobs/{job}",
         get(sequence(vec![
             job_detail_json(&job.to_string(), "attempting"),
             job_detail_json(&job.to_string(), "attempting"),
@@ -1507,7 +1507,7 @@ async fn a_page_with_neither_cursor_leaves_the_position_unchanged() {
     let logs_store = capture_store();
     let logs_router = with_capture(
         Router::new().route(
-            "/api/v1/jobs/:job/logs",
+            "/api/v1/jobs/{job}/logs",
             get(sequence(vec![
                 job_logs_response_json(vec![], vec![], Some("v1:n1"), None, true),
                 job_logs_response_json(vec![], vec![], None, None, true),
@@ -1517,7 +1517,7 @@ async fn a_page_with_neither_cursor_leaves_the_position_unchanged() {
         logs_store.clone(),
     );
     let job_router = Router::new().route(
-        "/api/v1/jobs/:job",
+        "/api/v1/jobs/{job}",
         get(move || {
             let body = job_detail_json(&job.to_string(), "attempting");
             async move { Json(body) }
@@ -1552,7 +1552,7 @@ async fn sources_merges_per_attempt_and_latches_truncated() {
     let attempt_a = AttemptId::new();
     let attempt_b = AttemptId::new();
     let logs_router = Router::new().route(
-        "/api/v1/jobs/:job/logs",
+        "/api/v1/jobs/{job}/logs",
         get(sequence(vec![
             job_logs_response_json(
                 vec![],
@@ -1574,7 +1574,7 @@ async fn sources_merges_per_attempt_and_latches_truncated() {
         ])),
     );
     let job_router = Router::new().route(
-        "/api/v1/jobs/:job",
+        "/api/v1/jobs/{job}",
         get(move || {
             let body = job_detail_json(&job.to_string(), "attempting");
             async move { Json(body) }

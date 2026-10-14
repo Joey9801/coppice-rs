@@ -936,7 +936,7 @@ mod tests {
         let router =
             Router::new()
                 .route(
-                    "/api/v1/nodes/:node",
+                    "/api/v1/nodes/{node}",
                     get(
                         |AxumPath(node): AxumPath<String>,
                          State((seen, body)): State<(
@@ -960,7 +960,7 @@ mod tests {
     #[tokio::test]
     async fn show_surfaces_a_not_found_body() {
         let router = Router::new().route(
-            "/api/v1/nodes/:node",
+            "/api/v1/nodes/{node}",
             get(|| async {
                 (
                     axum::http::StatusCode::NOT_FOUND,
@@ -1148,7 +1148,7 @@ mod tests {
         let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let router = Router::new()
             .route(
-                "/api/v1/nodes/:node/drain",
+                "/api/v1/nodes/{node}/drain",
                 post(
                     |AxumPath(node): AxumPath<String>,
                      State(seen): State<Arc<Mutex<Vec<String>>>>| async move {
@@ -1171,7 +1171,7 @@ mod tests {
         let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let router = Router::new()
             .route(
-                "/api/v1/nodes/:node/undrain",
+                "/api/v1/nodes/{node}/undrain",
                 post(
                     |AxumPath(node): AxumPath<String>,
                      State(seen): State<Arc<Mutex<Vec<String>>>>| async move {
@@ -1194,7 +1194,7 @@ mod tests {
         let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let router = Router::new()
             .route(
-                "/api/v1/nodes/:node/remove",
+                "/api/v1/nodes/{node}/remove",
                 post(
                     |AxumPath(node): AxumPath<String>,
                      State(seen): State<Arc<Mutex<Vec<String>>>>| async move {
@@ -1215,7 +1215,7 @@ mod tests {
     #[tokio::test]
     async fn drain_json_prints_the_servers_body_and_still_posts() {
         let router = Router::new().route(
-            "/api/v1/nodes/:node/drain",
+            "/api/v1/nodes/{node}/drain",
             post(|| async { Json(serde_json::json!({})) }),
         );
         let base = spawn(router).await;
@@ -1227,7 +1227,7 @@ mod tests {
     #[tokio::test]
     async fn an_error_body_surfaces_its_code_and_message() {
         let router = Router::new().route(
-            "/api/v1/nodes/:node/remove",
+            "/api/v1/nodes/{node}/remove",
             post(|| async {
                 (
                     axum::http::StatusCode::CONFLICT,
@@ -1249,7 +1249,7 @@ mod tests {
         let calls: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
         let router = Router::new()
             .route(
-                "/api/v1/nodes/:node",
+                "/api/v1/nodes/{node}",
                 get(|State(calls): State<Arc<Mutex<u32>>>| async move {
                     let mut calls = calls.lock().unwrap();
                     *calls += 1;
@@ -1280,7 +1280,7 @@ mod tests {
     #[tokio::test]
     async fn wait_for_drain_errors_naming_what_is_outstanding_when_the_deadline_elapses() {
         let router = Router::new().route(
-            "/api/v1/nodes/:node",
+            "/api/v1/nodes/{node}",
             get(|| async { Json(serde_json::to_value(get_node_response(1, 2)).unwrap()) }),
         );
         let base = spawn(router).await;

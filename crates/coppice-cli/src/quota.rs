@@ -802,7 +802,7 @@ mod tests {
             "stats": serde_json::to_value(sample_stats()).unwrap(),
         });
         let router = Router::new().route(
-            "/api/v1/quota-entities/:entity",
+            "/api/v1/quota-entities/{entity}",
             get({
                 let body = body.clone();
                 move |AxumPath(_entity): AxumPath<String>| {
@@ -903,7 +903,7 @@ mod tests {
         let router = {
             let captured = captured.clone();
             Router::new().route(
-                "/api/v1/quota-entities/:entity",
+                "/api/v1/quota-entities/{entity}",
                 get(move |AxumPath(entity): AxumPath<String>| {
                     let captured = captured.clone();
                     let response = response.clone();
@@ -942,7 +942,7 @@ mod tests {
     #[tokio::test]
     async fn show_surfaces_not_found() {
         let router = Router::new().route(
-            "/api/v1/quota-entities/:entity",
+            "/api/v1/quota-entities/{entity}",
             get(|| async {
                 (
                     StatusCode::NOT_FOUND,
@@ -1063,7 +1063,7 @@ mod tests {
     ) -> Router {
         Router::new()
             .route(
-                "/api/v1/quota-entities/:entity",
+                "/api/v1/quota-entities/{entity}",
                 get(move |AxumPath(_entity): AxumPath<String>| {
                     let lookup = lookup.clone();
                     async move {
@@ -1283,7 +1283,7 @@ mod tests {
             }
         };
         let router = Router::new()
-            .route("/api/v1/quota-entities/:entity", get(lookup))
+            .route("/api/v1/quota-entities/{entity}", get(lookup))
             .route("/api/v1/quota-entities", post(upsert));
         let base = spawn(router).await;
 
@@ -1311,7 +1311,7 @@ mod tests {
     async fn configure_surfaces_the_leader_hint_on_421() {
         let router = Router::new()
             .route(
-                "/api/v1/quota-entities/:entity",
+                "/api/v1/quota-entities/{entity}",
                 get(|AxumPath(_entity): AxumPath<String>| async {
                     (
                         StatusCode::NOT_FOUND,

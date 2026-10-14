@@ -109,8 +109,8 @@ jsonwebtoken = "9"
 openraft = { version = "0.9", features = ["storage-v2", "generic-snapshot-data"] }
 # The public client listener (ADR 0031): JSON-over-HTTP on
 # `listen.client_addr`, serving proto3-JSON bodies of `coppice.api.v1`
-# messages. 0.7 rides the same hyper-1 stack tonic already pulls in.
-axum = "0.7"
+# messages. It rides the same hyper-1 stack tonic already pulls in.
+axum = "0.8"
 # Embeds `web/dist` into the coordinator so the same client listener serves
 # the UI (ADR 0031, "Serving the UI"): release builds carry the assets in
 # the binary; debug builds read them live from disk so `coppice dev` picks
@@ -120,13 +120,13 @@ mime_guess = "2"
 # `ServiceExt::oneshot` drives the axum router: in tests without a listener,
 # and in the coordinator's own TLS serving path, where each accepted connection
 # hands hyper a service over the shared router. Version tracks what axum
-# 0.7 and tonic already depend on.
+# and tonic already depend on.
 tower = { version = "0.5", features = ["util"] }
 # The HTTP/1+2 server behind the client listener's TLS posture (ADR 0037 §4).
 # `axum::serve` only accepts a bare `TcpListener`, so a listener that terminates
 # TLS itself must drive hyper directly: `hyper-util`'s auto builder negotiates
 # h2/http1 per connection and `TokioIo` adapts the rustls stream. Same hyper-1
-# stack axum 0.7 and tonic already resolve — no second HTTP
+# stack axum and tonic already resolve — no second HTTP
 # implementation enters the tree.
 hyper = { version = "1", default-features = false, features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", default-features = false, features = ["server-auto", "tokio"] }
