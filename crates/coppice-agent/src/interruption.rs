@@ -92,6 +92,7 @@ pub fn spawn(
         InterruptionSource::None => Ok(None),
         InterruptionSource::AwsImds => {
             let mut builder = aws_config::imds::Client::builder()
+                .configure(&coppice_discovery::aws::provider_config())
                 // One retry inside a poll is enough: the next poll is seconds
                 // away, and the backoff below handles a sustained outage.
                 .max_attempts(2)

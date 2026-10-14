@@ -258,7 +258,9 @@ async fn build_aws_api(region_override: Option<String>) -> Result<Arc<dyn AsgApi
     use anyhow::Context;
 
     // IMDSv2 needs no region and no credentials; it is link-local.
-    let imds = aws_config::imds::Client::builder().build();
+    let imds = aws_config::imds::Client::builder()
+        .configure(&crate::aws::provider_config())
+        .build();
     let instance_id = imds
         .get("/latest/meta-data/instance-id")
         .await
@@ -276,6 +278,7 @@ async fn build_aws_api(region_override: Option<String>) -> Result<Arc<dyn AsgApi
     };
 
     let sdk_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .http_client(crate::aws::http_client())
         .region(aws_config::Region::new(region.clone()))
         .load()
         .await;

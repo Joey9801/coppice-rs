@@ -36,6 +36,10 @@ uuid.workspace = true
 aws-config.workspace = true
 aws-sdk-ec2.workspace = true
 aws-sdk-autoscaling.workspace = true
+# The SDK's HTTP client on the ring provider (`aws::http_client`), and the
+# runtime-API type it is shared as.
+aws-smithy-http-client.workspace = true
+aws-smithy-runtime-api.workspace = true
 
 [dev-dependencies]
 # The `file` backend's tests drive a real registration directory.
