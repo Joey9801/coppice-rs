@@ -172,7 +172,7 @@ strum = { version = "0.27", features = ["derive"] }
 # TLS/native drivers; `sqlite` bundles SQLite itself (no system libsqlite),
 # `migrate` embeds the schema migrations, `macros` provides the checked
 # `query!`/`migrate!` macros over the tokio runtime.
-sqlx = { version = "0.8", default-features = false, features = [
+sqlx = { version = "0.9", default-features = false, features = [
     "runtime-tokio",
     "sqlite",
     "migrate",
