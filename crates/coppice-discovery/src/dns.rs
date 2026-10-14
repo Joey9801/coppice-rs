@@ -11,8 +11,10 @@ use std::collections::BTreeSet;
 use std::net::SocketAddr;
 
 use anyhow::Result;
-use hickory_resolver::config::{ResolverConfig, ResolverOpts};
-use hickory_resolver::TokioAsyncResolver;
+use hickory_resolver::config::{ResolverConfig, GOOGLE};
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
+use hickory_resolver::proto::rr::RData;
+use hickory_resolver::TokioResolver;
 
 use super::Discovery;
 
@@ -24,26 +26,32 @@ pub(crate) struct DnsDiscovery {
     /// Fallback port applied to A/AAAA records (SRV records carry their own).
     port: u16,
     /// System-configured async resolver, built once at construction.
-    resolver: TokioAsyncResolver,
+    resolver: TokioResolver,
 }
 
 impl DnsDiscovery {
     /// Build the backend, initializing the async resolver from system config
     /// (`/etc/resolv.conf` and equivalents). Falls back to a default resolver
     /// configuration if the system configuration cannot be read, so a missing
-    /// `resolv.conf` degrades rather than fails at startup.
+    /// `resolv.conf` degrades rather than fails at startup. The fallback names
+    /// Google's public resolvers explicitly: hickory's `ResolverConfig::default()`
+    /// carries no nameservers at all, so it would build and then never resolve.
     pub(crate) fn new(name: String, port: u16) -> Result<Self> {
-        let resolver = match TokioAsyncResolver::tokio_from_system_conf() {
-            Ok(resolver) => resolver,
+        let builder = match TokioResolver::builder_tokio() {
+            Ok(builder) => builder,
             Err(err) => {
                 tracing::warn!(
                     error = %err,
                     "dns discovery: reading system resolver config failed; \
                      falling back to default resolver configuration"
                 );
-                TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default())
+                TokioResolver::builder_with_config(
+                    ResolverConfig::udp_and_tcp(&GOOGLE),
+                    TokioRuntimeProvider::default(),
+                )
             }
         };
+        let resolver = builder.build()?;
         // Reject an empty name early; the resolver would otherwise error on
         // every consultation, which discovery would silently swallow.
         anyhow::ensure!(
@@ -63,11 +71,16 @@ impl DnsDiscovery {
     async fn srv_candidates(&self) -> Vec<String> {
         match self.resolver.srv_lookup(&self.name).await {
             Ok(lookup) => lookup
+                .answers()
                 .iter()
+                .filter_map(|record| match &record.data {
+                    RData::SRV(srv) => Some(srv),
+                    _ => None,
+                })
                 .map(|srv| {
-                    let target = srv.target().to_utf8();
+                    let target = srv.target.to_utf8();
                     let host = target.strip_suffix('.').unwrap_or(&target);
-                    format!("{}:{}", host, srv.port())
+                    format!("{}:{}", host, srv.port)
                 })
                 .collect(),
             Err(err) => {
