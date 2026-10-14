@@ -44,7 +44,7 @@ coppice-api = { path = "crates/coppice-api" }
 # The published client library. `version` alongside `path` because this is the
 # one crate in the workspace meant to be released to crates.io: a dependent
 # resolves it by path here and by version anywhere else.
-coppice-client = { path = "crates/coppice-client", version = "0.0.1" }
+coppice-client = { path = "crates/coppice-client", version = "0.0.2" }
 coppice-coordinator = { path = "crates/coppice-coordinator" }
 # Test and bench infrastructure only — always a dev-dependency, never shipped.
 coppice-testkit = { path = "crates/coppice-testkit" }

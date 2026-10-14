@@ -5,7 +5,9 @@ readme = "README.md"
 keywords = ["coppice", "scheduler", "batch", "client", "api"]
 categories = ["api-bindings", "asynchronous"]
 documentation = "https://docs.rs/coppice-client"
-version.workspace = true
+# Not inherited: this is the one crate released to crates.io, so it versions
+# on its own release cadence rather than the workspace's.
+version = "0.0.2"
 edition.workspace = true
 # Not inherited: this is the one crate whose `rust-version` strangers rely on,
 # so it states what CI actually proves (the `client-msrv` job) rather than the
