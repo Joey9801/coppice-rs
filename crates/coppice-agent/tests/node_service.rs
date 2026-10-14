@@ -68,7 +68,7 @@ fn mint_pki(node_id: NodeId) -> Pki {
             KeyUsagePurpose::KeyEncipherment,
         ];
         let cert = params
-            .signed_by(&key, &ca_cert, &ca_key)
+            .signed_by(&key, &rcgen::Issuer::from_params(&ca_params, &ca_key))
             .expect("sign leaf");
         CertKey {
             cert: cert.pem().into_bytes(),

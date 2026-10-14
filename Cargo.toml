@@ -160,7 +160,7 @@ protox = "0.10"
 # leaf issuer (ADR 0037 §4). The `x509-parser` feature is what unseals
 # `CertificateSigningRequestParams::from_pem`/`CertificateParams::from_ca_cert_pem`,
 # i.e. parsing a submitted CSR and loading a CA to sign under.
-rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring", "x509-parser"] }
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring", "x509-parser"] }
 thiserror = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

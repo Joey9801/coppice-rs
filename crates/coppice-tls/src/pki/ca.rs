@@ -1,7 +1,7 @@
 //! The cluster root CA: minting it, and signing under a loaded one (ADR 0037 §4).
 
 use rcgen::{
-    BasicConstraints, Certificate, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose,
+    BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, KeyUsagePurpose,
     PublicKeyData,
 };
 
@@ -93,12 +93,11 @@ pub fn mint_root_ca() -> Result<CaMaterial, CaError> {
 /// only coordinator code paths, running on the leader that holds the CA key,
 /// construct and use it.
 pub struct CaSigner {
-    /// The issuer certificate rcgen signs against — reconstructed from the
-    /// loaded CA's parsed parameters, so leaves carry the loaded CA's subject as
-    /// their issuer and its subject-key-id as their authority-key-id.
-    issuer: Certificate,
-    /// The CA private key that signs.
-    key: KeyPair,
+    /// The issuer rcgen signs as — parsed from the loaded CA certificate, so
+    /// leaves carry the loaded CA's subject as their issuer and its
+    /// subject-key-id as their authority-key-id — holding the CA private key
+    /// that signs.
+    issuer: Issuer<'static, KeyPair>,
     /// The loaded CA certificate PEM, handed back to enrollees with their leaf
     /// (ADR 0037 §4: the enrollment response is the leaf plus the CA bundle).
     ca_cert_pem: Vec<u8>,
@@ -126,21 +125,17 @@ impl CaSigner {
         let key = KeyPair::from_pem(key_str).map_err(|e| CaError::BadKey(e.to_string()))?;
 
         let ca_spki = ca_public_key_der(ca_cert_pem).map_err(CaError::BadCaCert)?;
-        if ca_spki != key.public_key_der() {
+        if ca_spki != key.subject_public_key_info() {
             return Err(CaError::KeyMismatch);
         }
 
         let cert_str = std::str::from_utf8(ca_cert_pem)
             .map_err(|_| CaError::BadCaCert("not UTF-8".to_string()))?;
-        let params = CertificateParams::from_ca_cert_pem(cert_str)
-            .map_err(|e| CaError::BadCaCert(e.to_string()))?;
-        let issuer = params
-            .self_signed(&key)
+        let issuer = Issuer::from_ca_cert_pem(cert_str, key)
             .map_err(|e| CaError::BadCaCert(e.to_string()))?;
 
         Ok(CaSigner {
             issuer,
-            key,
             ca_cert_pem: ca_cert_pem.to_vec(),
         })
     }
@@ -160,7 +155,7 @@ impl CaSigner {
         public_key: &impl PublicKeyData,
     ) -> Result<Vec<u8>, CaError> {
         let cert = params
-            .signed_by(public_key, &self.issuer, &self.key)
+            .signed_by(public_key, &self.issuer)
             .map_err(|e| CaError::Sign(e.to_string()))?;
         Ok(cert.pem().into_bytes())
     }
