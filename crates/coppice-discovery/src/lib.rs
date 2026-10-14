@@ -30,6 +30,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
+pub mod aws;
 pub mod config;
 
 mod dns;
