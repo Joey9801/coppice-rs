@@ -246,12 +246,13 @@ nix = { version = "0.30", features = ["fs", "user"] }
 toml = "0.8"
 humantime-serde = "1"
 # Seed discovery (ADR 0037 §2): the `dns` backend resolves one name per
-# consultation. `system-config` reads `/etc/resolv.conf`; `tokio-runtime` runs
-# the async resolver on the workspace runtime. Default features are off to keep
-# the tree minimal — no DNSSEC, no bundled root hints.
-hickory-resolver = { version = "0.24", default-features = false, features = [
+# consultation. `system-config` reads `/etc/resolv.conf`; `tokio` runs the
+# async resolver on the workspace runtime. Default features are off to keep
+# the tree minimal — no DNSSEC, no DNS-over-TLS (so no second rustls provider
+# choice to make), no bundled root hints.
+hickory-resolver = { version = "0.26", default-features = false, features = [
     "system-config",
-    "tokio-runtime",
+    "tokio",
 ] }
 # The `advertise_host` fallback chain (ADR 0037 §2) reads the OS-reported
 # hostname when no explicit value is configured. Tiny, cross-platform.
