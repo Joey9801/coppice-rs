@@ -83,7 +83,7 @@ chrono = { version = "0.4", features = ["serde"] }
 # ADR 0002 and ADR 0018.
 crc32c = "0.6"
 # Benchmark harness for the ADR 0018 storage benchmark suite.
-criterion = "0.5"
+criterion = "0.8"
 # Immutable ordered maps with structural sharing (KOI-5): the job-scaled maps
 # in the replicated `StateMachine` use `imbl::OrdMap` so view publication and
 # snapshot capture clone the whole state in O(1) instead of deep-copying
@@ -167,7 +167,7 @@ serde_json = "1"
 # `Display`/`EnumString` derives for the closed and forward-compatible wire
 # vocabularies in `coppice-client` (ADR-free: a localized library choice, not
 # a wire-format change) — replaces a hand-rolled macro with ordinary derives.
-strum = { version = "0.27", features = ["derive"] }
+strum = { version = "0.28", features = ["derive"] }
 # The telemetry segment store (docker-executor.md §8.4), and the convention for
 # all SQL in the repo: queries are compile-time-checked against the schema in
 # `migrations/`, verified offline through the checked-in `.sqlx/` prepare cache
@@ -230,20 +230,20 @@ metrics = "0.24"
 # The production Prometheus recorder behind `/metrics` (issue #46). Only the
 # recorder + `PrometheusHandle::render` are used — `default-features = false`
 # drops the crate's bundled hyper HTTP listener and push-gateway machinery, as
-# the endpoint rides the crate's own axum routers. 0.16 tracks the `metrics`
+# the endpoint rides the crate's own axum routers. 0.18 tracks the `metrics`
 # 0.24 pin above (a mismatched pair would install a recorder the facade's
 # global slot cannot see).
-metrics-exporter-prometheus = { version = "0.16", default-features = false }
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
 # Test-only: a thread-local `DebuggingRecorder` so unit tests can assert exact
 # counter values (`agent_telemetry_*`) without a global exporter. Only the
 # `debugging` feature is needed; kept in lockstep with the `metrics` pin above.
-metrics-util = { version = "0.19", default-features = false, features = [
+metrics-util = { version = "0.20", default-features = false, features = [
     "debugging",
 ] }
 # Safe statvfs for the agent's host disk-pressure monitor
 # (docker-executor.md §9). The workspace forbids `unsafe_code`, so the raw
 # libc call is not an option; nix wraps it in a safe API.
-nix = { version = "0.30", features = ["fs", "user"] }
+nix = { version = "0.31", features = ["fs", "user"] }
 # Node configuration is one TOML file per process (ADR 0020), with humane
 # duration strings ("1500ms") parsed at load.
 toml = "1"
@@ -259,7 +259,7 @@ hickory-resolver = { version = "0.26", default-features = false, features = [
 ] }
 # The `advertise_host` fallback chain (ADR 0037 §2) reads the OS-reported
 # hostname when no explicit value is configured. Tiny, cross-platform.
-gethostname = "0.4"
+gethostname = "1"
 # The `ec2-asg` discovery backend (ADR 0037 §2): read this instance's id and
 # region from IMDSv2, then list its Auto Scaling group's members and resolve
 # their private IPs. A deliberately heavy dep tree (accepted in review) confined
@@ -311,11 +311,14 @@ time = "0.3"
 # Enrollment-token secret hashing for `coppice-tls::pki::token` (ADR 0037 §5):
 # argon2id in PHC-string form with a random salt, stored as replicated policy.
 # Default features give the `password-hash` traits plus an OS-CSPRNG salt.
-argon2 = "0.5"
+argon2 = "0.6"
 # URL-safe base64 for the high-entropy enrollment-token secret
-# (`coppice-tls::pki::token`, ADR 0037 §5). Already in the tree via `pem`; pinned
-# here for a direct, minimal use of the `URL_SAFE_NO_PAD` engine.
-base64 = "0.22"
+# (`coppice-tls::pki::token`, ADR 0037 §5): a direct, minimal use of the
+# `URL_SAFE_NO_PAD` engine.
+base64 = "0.23"
+# The OS CSPRNG for the enrollment-token secret (`coppice-tls::pki::token`):
+# the same crate argon2 draws its salts from.
+getrandom = "0.4"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

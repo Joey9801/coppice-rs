@@ -458,6 +458,7 @@ mod tests {
     }
 
     /// The value of a counter in a debugging snapshot, or 0 if never touched.
+    /// Taking the snapshot consumes it: the next read counts from zero.
     fn counter_value(snapshotter: &Snapshotter, name: &str) -> u64 {
         snapshotter
             .snapshot()
@@ -739,9 +740,11 @@ mod tests {
             hub.append_metrics(vec![metric(at(101))]);
             hub.append_metrics(vec![metric(at(102))]);
         });
+        // A snapshot consumes the counters it reads, so this one sees only the
+        // drops since the first.
         assert_eq!(
             counter_value(&snapshotter, AGENT_TELEMETRY_SINK_DROPPED_BATCHES),
-            3,
+            1,
             "the second full-queue episode counts one more drop after the reset"
         );
     }

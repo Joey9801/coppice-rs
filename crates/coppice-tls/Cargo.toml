@@ -47,9 +47,10 @@ coppice-core.workspace = true
 uuid.workspace = true
 # `pki::token` (ADR 0037 §5): argon2id hashing of enrollment-token secrets and
 # URL-safe base64 for the high-entropy secret itself.
-# `std` propagates through `password-hash` to `rand_core/getrandom`, which is
-# what supplies the OS CSPRNG (`OsRng`) for the token secret and salt.
-argon2 = { workspace = true, features = ["std"] }
+# argon2's default `getrandom` feature supplies the OS CSPRNG for the salt;
+# `getrandom` directly for the token secret itself.
+argon2.workspace = true
+getrandom.workspace = true
 base64.workspace = true
 
 [dev-dependencies]
