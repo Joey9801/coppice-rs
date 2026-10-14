@@ -150,12 +150,11 @@ fn unclassifiable_leaf(daemon: &Daemon) -> (Vec<u8>, Vec<u8>) {
     let key = pki::load_ca_key(&daemon.data_dir(), &ca_pem).expect("load the CA key");
     let ca_key = KeyPair::from_pem(std::str::from_utf8(&key).expect("CA key is UTF-8"))
         .expect("parse the CA key");
-    let issuer = CertificateParams::from_ca_cert_pem(
+    let issuer = rcgen::Issuer::from_ca_cert_pem(
         std::str::from_utf8(&ca_pem).expect("CA cert is UTF-8"),
+        ca_key,
     )
-    .expect("parse the CA cert")
-    .self_signed(&ca_key)
-    .expect("reconstruct the issuer");
+    .expect("parse the CA cert");
 
     let leaf_key = KeyPair::generate().expect("generate leaf key");
     let mut params = CertificateParams::new(vec!["localhost".to_string(), "127.0.0.1".to_string()])
@@ -172,7 +171,7 @@ fn unclassifiable_leaf(daemon: &Daemon) -> (Vec<u8>, Vec<u8>) {
         KeyUsagePurpose::KeyEncipherment,
     ];
     let cert = params
-        .signed_by(&leaf_key, &issuer, &ca_key)
+        .signed_by(&leaf_key, &issuer)
         .expect("sign the unclassifiable leaf");
     (
         cert.pem().into_bytes(),

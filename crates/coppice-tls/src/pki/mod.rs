@@ -166,7 +166,7 @@ pub(crate) fn ca_public_key_der(ca_cert_pem: &[u8]) -> Result<Vec<u8>, String> {
 pub(crate) fn key_public_key_der(key_pem: &[u8]) -> Result<Vec<u8>, String> {
     let s = std::str::from_utf8(key_pem).map_err(|_| "key PEM is not UTF-8".to_string())?;
     let key = rcgen::KeyPair::from_pem(s).map_err(|e| format!("parsing private key: {e}"))?;
-    Ok(key.public_key_der())
+    Ok(rcgen::PublicKeyData::subject_public_key_info(&key))
 }
 
 /// Durable, owner-only (`0600`) write with `tmp + fsync + rename + dir fsync`

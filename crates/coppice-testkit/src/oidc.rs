@@ -86,7 +86,7 @@ fn generate_es256_key(kid: String) -> (EncodingKey, Value) {
     // 0x04 || x(32) || y(32). Everything before that is the SPKI
     // AlgorithmIdentifier, whose length varies by encoder, so anchor on
     // the fixed-size point from the end rather than parsing ASN.1.
-    let spki = key_pair.public_key_der();
+    let spki = rcgen::PublicKeyData::subject_public_key_info(&key_pair);
     assert!(
         spki.len() >= 65,
         "SPKI DER for a P-256 key must be at least 65 bytes, got {}",

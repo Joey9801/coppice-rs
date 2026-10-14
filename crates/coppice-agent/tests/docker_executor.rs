@@ -3728,7 +3728,7 @@ fn mint_service_pki(node_id: NodeId) -> ServicePki {
             KeyUsagePurpose::KeyEncipherment,
         ];
         let cert = params
-            .signed_by(&key, &ca_cert, &ca_key)
+            .signed_by(&key, &rcgen::Issuer::from_params(&ca_params, &ca_key))
             .expect("sign leaf");
         (cert.pem().into_bytes(), key.serialize_pem().into_bytes())
     };

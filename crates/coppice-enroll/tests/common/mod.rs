@@ -76,7 +76,10 @@ impl TestCa {
             KeyUsagePurpose::KeyEncipherment,
         ];
         let cert = params
-            .signed_by(&key, &self.cert, &self.key)
+            .signed_by(
+                &key,
+                &rcgen::Issuer::from_ca_cert_der(self.cert.der(), &self.key).expect("ca issuer"),
+            )
             .expect("sign leaf");
         (cert.pem().into_bytes(), key.serialize_pem().into_bytes())
     }

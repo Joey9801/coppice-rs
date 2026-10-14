@@ -1373,7 +1373,7 @@ mod tests {
         ];
         let leaf_key = KeyPair::generate().expect("leaf key");
         let leaf = leaf_params
-            .signed_by(&leaf_key, &ca_cert, &ca_key)
+            .signed_by(&leaf_key, &rcgen::Issuer::from_params(&ca_params, &ca_key))
             .expect("sign leaf");
 
         let paths = TlsPaths::cluster_managed(data_dir);
