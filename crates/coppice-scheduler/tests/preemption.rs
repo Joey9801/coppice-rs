@@ -1,5 +1,6 @@
 //! Priority preemption in the scheduler pass (ADR 0044 §4): victim
-//! eligibility (class and score rules), victim order, the smallest-prefix
+//! eligibility (class and score rules, and relocation) and the rule each
+//! victim is named under, victim order, the smallest-prefix
 //! rule, node choice, the per-cycle cap, the per-node guard, the cooldown,
 //! the minimum-improvement threshold, spot-only and draining gates, the
 //! revoke-and-reseat path and the accrual cap. Every proposal is committed
@@ -17,7 +18,7 @@ use coppice_core::time::{Duration, Timestamp};
 use coppice_scheduler::{
     HeuristicScheduler, PlacementProposal, ProposedPlacement, Scheduler, SchedulerConfig,
 };
-use coppice_state::command::RecordAttemptOutcome;
+use coppice_state::command::{Eviction, EvictionRule, RecordAttemptOutcome};
 use coppice_state::{Command, StateMachine};
 
 /// The class of every beneficiary here; victims run at class 0 unless a test
@@ -72,6 +73,26 @@ fn placement_of(p: &PlacementProposal, n: u128) -> &ProposedPlacement {
         .unwrap_or_else(|| panic!("no placement for job {n}: {p:?}"))
 }
 
+/// The eviction group naming each of `victims` under the priority rule.
+fn by_priority(victims: &[u128]) -> Vec<Eviction> {
+    named(victims, EvictionRule::Priority)
+}
+
+/// The eviction group naming each of `victims` under the relocation rule.
+fn by_relocation(victims: &[u128]) -> Vec<Eviction> {
+    named(victims, EvictionRule::Relocation)
+}
+
+fn named(victims: &[u128], rule: EvictionRule) -> Vec<Eviction> {
+    victims
+        .iter()
+        .map(|n| Eviction {
+            allocation: alid(*n),
+            rule,
+        })
+        .collect()
+}
+
 fn preempting(p: &PlacementProposal) -> Vec<&ProposedPlacement> {
     p.placements
         .iter()
@@ -105,7 +126,7 @@ fn a_higher_class_job_preempts_lower_class_work_on_a_full_node() {
     assert_eq!(p.node, nid(1));
     assert!(!p.expect_funded, "a preemption always accrues");
     // Equal class, score and work at risk: the AllocationId breaks the tie.
-    assert_eq!(p.preemptions, vec![alid(1)]);
+    assert_eq!(p.preemptions, by_priority(&[1]));
 
     let minted = commit(&mut sm, &proposal);
     assert_eq!(
@@ -144,7 +165,11 @@ fn a_victim_with_a_higher_score_is_not_chosen() {
 
     let proposal = schedule(&sm);
     let p = placement_of(&proposal, 10);
-    assert_eq!(p.preemptions, vec![alid(2)], "the high-score job is spared");
+    assert_eq!(
+        p.preemptions,
+        by_priority(&[2]),
+        "the high-score job is spared"
+    );
     commit(&mut sm, &proposal);
     assert_eq!(priority_record(&sm, 1), None);
     assert_eq!(priority_record(&sm, 2), Some(jid(10)));
@@ -174,7 +199,7 @@ fn a_lower_class_victim_goes_first_whatever_its_work_at_risk() {
     beneficiary(&mut sm, 10, cpu(2_000));
 
     let proposal = schedule_at(&sm, now);
-    assert_eq!(placement_of(&proposal, 10).preemptions, vec![alid(2)]);
+    assert_eq!(placement_of(&proposal, 10).preemptions, by_priority(&[2]));
     commit(&mut sm, &proposal);
     assert_eq!(priority_record(&sm, 2), Some(jid(10)));
     assert_eq!(priority_record(&sm, 1), None);
@@ -192,7 +217,7 @@ fn among_equals_the_victim_with_less_work_at_risk_goes_first() {
     beneficiary(&mut sm, 10, cpu(2_000));
 
     let proposal = schedule_at(&sm, now);
-    assert_eq!(placement_of(&proposal, 10).preemptions, vec![alid(2)]);
+    assert_eq!(placement_of(&proposal, 10).preemptions, by_priority(&[2]));
     commit(&mut sm, &proposal);
 }
 
@@ -211,7 +236,7 @@ fn only_the_smallest_fitting_prefix_of_victims_is_evicted() {
     let proposal = schedule_at(&sm, now);
     assert_eq!(
         placement_of(&proposal, 10).preemptions,
-        vec![alid(3), alid(2)]
+        by_priority(&[3, 2])
     );
     commit(&mut sm, &proposal);
     assert_eq!(priority_record(&sm, 1), None);
@@ -237,7 +262,7 @@ fn a_node_that_cannot_fit_even_with_every_victim_is_skipped() {
     let proposal = schedule(&sm);
     let p = placement_of(&proposal, 10);
     assert_eq!(p.node, nid(2));
-    assert_eq!(p.preemptions, vec![alid(3)]);
+    assert_eq!(p.preemptions, by_priority(&[3]));
     commit(&mut sm, &proposal);
     assert_eq!(priority_record(&sm, 2), None);
 }
@@ -320,7 +345,7 @@ fn the_cooldown_holds_a_node_after_its_victims_have_ended() {
     victim(&mut sm, 3, nid(1), cpu(2_000), base_ts());
     beneficiary(&mut sm, 10, cpu(2_000));
     let proposal = schedule(&sm);
-    assert_eq!(placement_of(&proposal, 10).preemptions, vec![alid(1)]);
+    assert_eq!(placement_of(&proposal, 10).preemptions, by_priority(&[1]));
     commit(&mut sm, &proposal);
     apply_ok(
         &mut sm,
@@ -378,7 +403,7 @@ fn a_distant_natural_start_is_worth_a_preemption() {
     let (mut sm, proposal) = natural_vs_preemption(3 * 3600);
     let p = placement_of(&proposal, 10);
     assert_eq!(p.node, nid(2));
-    assert_eq!(p.preemptions, vec![alid(2)]);
+    assert_eq!(p.preemptions, by_priority(&[2]));
     commit(&mut sm, &proposal);
     assert_eq!(priority_record(&sm, 2), Some(jid(10)));
 }
@@ -406,7 +431,7 @@ fn a_non_preemptible_job_cannot_preempt_onto_a_spot_node() {
 
     let mut sm = build(true);
     let proposal = schedule(&sm);
-    assert_eq!(placement_of(&proposal, 10).preemptions, vec![alid(1)]);
+    assert_eq!(placement_of(&proposal, 10).preemptions, by_priority(&[1]));
     commit(&mut sm, &proposal);
     assert_eq!(priority_record(&sm, 1), Some(jid(10)));
 }
@@ -428,7 +453,7 @@ fn victims_on_a_draining_node_are_never_chosen() {
     let proposal = schedule(&sm);
     let p = placement_of(&proposal, 10);
     assert_eq!(p.node, nid(2));
-    assert_eq!(p.preemptions, vec![alid(2)]);
+    assert_eq!(p.preemptions, by_priority(&[2]));
     commit(&mut sm, &proposal);
     assert_eq!(priority_record(&sm, 1), None);
 }
@@ -458,7 +483,7 @@ fn an_indefinitely_accruing_job_is_reseated_onto_an_eviction_group() {
     assert_eq!(proposal.revocations, vec![old], "{proposal:?}");
     let p = placement_of(&proposal, 10);
     assert_eq!(p.node, nid(2));
-    assert_eq!(p.preemptions, vec![alid(2)]);
+    assert_eq!(p.preemptions, by_priority(&[2]));
     let minted = commit(&mut sm, &proposal);
     assert_ne!(
         sm.allocations[&old].allocation.state,
@@ -482,7 +507,7 @@ fn a_guarded_accrual_on_a_draining_node_is_re_planned_off_it() {
     victim(&mut sm, 1, nid(1), cpu(2_000), base_ts());
     beneficiary(&mut sm, 10, cpu(2_000));
     let proposal = schedule(&sm);
-    assert_eq!(placement_of(&proposal, 10).preemptions, vec![alid(1)]);
+    assert_eq!(placement_of(&proposal, 10).preemptions, by_priority(&[1]));
     let minted = commit(&mut sm, &proposal);
     let accrual = minted[0];
 
@@ -546,7 +571,7 @@ fn no_preemption_is_proposed_past_the_accrual_cap() {
 
     let mut sm = build(2);
     let proposal = schedule(&sm);
-    assert_eq!(placement_of(&proposal, 10).preemptions, vec![alid(1)]);
+    assert_eq!(placement_of(&proposal, 10).preemptions, by_priority(&[1]));
     commit(&mut sm, &proposal);
 }
 
@@ -588,7 +613,7 @@ fn relocation_moves_preemptible_work_off_a_persistent_node() {
     let proposal = schedule(&sm);
     let p = placement_of(&proposal, 10);
     assert_eq!(p.node, nid(1));
-    assert_eq!(p.preemptions, vec![alid(1), alid(2)]);
+    assert_eq!(p.preemptions, by_relocation(&[1, 2]));
     commit(&mut sm, &proposal);
     assert_eq!(relocation_reason(&sm, 1), Some(jid(10)));
     assert_eq!(relocation_reason(&sm, 2), Some(jid(10)));
@@ -629,11 +654,12 @@ fn relocation_counts_against_the_per_cycle_cap() {
     assert!(preempting(&proposal).is_empty(), "{proposal:?}");
 }
 
-/// Relocated victims never share a spot slot, even those apply records
-/// `Priority` (class rule holds, score rule does not), whose spot room apply
-/// does not count: two 2-core victims need 4 free spot cores, not 2.
+/// A victim of lower class than the beneficiary but a higher score fails the
+/// priority rule, so the pass names it for relocation, and apply records it
+/// `Relocation` and counts its spot room: two 2-core victims need 4 free
+/// spot cores, not 2.
 #[test]
-fn outranked_relocations_do_not_share_a_spot_slot() {
+fn an_outranked_victim_failing_the_score_rule_is_proposed_for_relocation() {
     let build = |spot_millis: u64| {
         let mut sm = setup(cpu(4_000), 4);
         apply_ok(
@@ -658,10 +684,10 @@ fn outranked_relocations_do_not_share_a_spot_slot() {
     let proposal = schedule(&sm);
     assert_eq!(
         placement_of(&proposal, 10).preemptions,
-        vec![alid(1), alid(2)]
+        by_relocation(&[1, 2])
     );
     commit(&mut sm, &proposal);
-    // The class rule covers both, so apply records them `Priority`.
-    assert_eq!(priority_record(&sm, 1), Some(jid(10)));
-    assert_eq!(priority_record(&sm, 2), Some(jid(10)));
+    // Recorded as named, though the class rule alone would cover both.
+    assert_eq!(relocation_reason(&sm, 1), Some(jid(10)));
+    assert_eq!(relocation_reason(&sm, 2), Some(jid(10)));
 }

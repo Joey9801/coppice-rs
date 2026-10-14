@@ -239,11 +239,34 @@ pub struct Placement {
     pub group: GroupId,
     pub allocations: Vec<AllocationSpec>,
     /// Running allocations on the placement's node to terminate so this job
-    /// can run there (ADR 0044 §4): the eviction group the placement enables.
+    /// can run there (ADR 0044 §4): the eviction group the placement enables,
+    /// each victim named with the rule the scheduler's pass chose it under.
     /// Empty for every placement but a scheduler preemption. The job is then
     /// committed accruing, and each victim's attempt gets a termination
-    /// record that dispatch turns into `PreemptJob`.
-    pub preemptions: Vec<AllocationId>,
+    /// record — carrying the named rule as its reason — that dispatch turns
+    /// into `PreemptJob`.
+    pub preemptions: Vec<Eviction>,
+}
+
+/// One victim of a preempting placement, and the rule it is evicted under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Eviction {
+    pub allocation: AllocationId,
+    pub rule: EvictionRule,
+}
+
+/// The rule a preempting placement names a victim under (ADR 0044 §4).
+/// Apply validates the named rule and records it as the victim's
+/// `PreemptReason`; it never substitutes the other one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvictionRule {
+    /// The beneficiary outranks the victim: the class rule (apply's check)
+    /// and the score rule (the proposer's alone — it depends on the
+    /// scheduler-local `w_age`).
+    Priority,
+    /// The victim moves off a persistent node to make room for a
+    /// non-preemptible beneficiary, and spot capacity is free for it now.
+    Relocation,
 }
 
 /// The allocation a placement creates.

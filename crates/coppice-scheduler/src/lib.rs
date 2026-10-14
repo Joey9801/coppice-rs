@@ -30,7 +30,7 @@
 use coppice_core::id::{AllocationId, AttemptId, GroupId, JobId, NodeId};
 use coppice_core::resource::Resources;
 use coppice_core::time::{Duration, Timestamp};
-use coppice_state::command::{AllocationSpec, CommitPlacements, Placement};
+use coppice_state::command::{AllocationSpec, CommitPlacements, Eviction, Placement};
 use coppice_state::StateMachine;
 
 mod engine;
@@ -102,10 +102,11 @@ pub struct ProposedPlacement {
     pub node: NodeId,
     pub requested: Resources,
     pub expect_funded: bool,
-    /// Running allocations on `node` this placement preempts (ADR 0044 §4):
-    /// the victims whose release funds it, proposed whole or not at all.
-    /// Empty for every placement but a preemption, which always accrues.
-    pub preemptions: Vec<AllocationId>,
+    /// Running allocations on `node` this placement preempts (ADR 0044 §4),
+    /// each named with the rule the pass chose it under: the victims whose
+    /// release funds it, proposed whole or not at all. Empty for every
+    /// placement but a preemption, which always accrues.
+    pub preemptions: Vec<Eviction>,
 }
 
 /// A batch of proposed placements and accrual revocations, valid against a

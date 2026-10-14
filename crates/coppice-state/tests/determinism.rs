@@ -34,9 +34,9 @@ use coppice_proto::convert::{state_from_records, state_to_records, StateRecords}
 use coppice_state::authz::{Binding, Role, Subject};
 use coppice_state::command::{
     BumpClusterVersion, ConfigureQuotaEntity, DeclareNodeLost, EvictNodes, EvictTerminalJobs,
-    IntervalRenewal, JobMetadataUpdate, LostAttempt, ReconcileNode, RecordAttemptNotified,
-    RegisterNode, RenewIntervalCharges, SetNodeDrain, SetNodeDraining, UpdateAuthorization,
-    UpdateJobMetadata,
+    Eviction, EvictionRule, IntervalRenewal, JobMetadataUpdate, LostAttempt, ReconcileNode,
+    RecordAttemptNotified, RegisterNode, RenewIntervalCharges, SetNodeDrain, SetNodeDraining,
+    UpdateAuthorization, UpdateJobMetadata,
 };
 use coppice_state::{Command, StateMachine};
 use proptest::prelude::*;
@@ -393,17 +393,19 @@ fn arb_global() -> impl Strategy<Value = Command> {
         ),
         // A preempting placement (ADR 0044 §4): a job from the pool seated
         // on a node with an eviction group drawn from the pool's
-        // allocations. Most are refused (the job is not queued, a victim is
-        // not running, not outranked, on another node, already terminating),
+        // allocations, each victim named under a drawn rule. Most are
+        // refused (the job is not queued, a victim is not running, not
+        // outranked, not relocatable, on another node, already terminating),
         // some land and create termination records — both deterministically.
         (
             0u128..MAX_JOBS as u128,
             0u128..4,
             0usize..NODES as usize,
             any::<u8>(),
+            any::<u8>(),
             arb_ts()
         )
-            .prop_map(|(b, n, node_ix, mask, ts)| {
+            .prop_map(|(b, n, node_ix, mask, rules, ts)| {
                 let mut p = placement(
                     jid(1_000 + b),
                     aid(7_000 + n),
@@ -413,7 +415,14 @@ fn arb_global() -> impl Strategy<Value = Command> {
                 );
                 p.preemptions = (0..MAX_JOBS)
                     .filter(|k| mask & (1 << k) != 0)
-                    .map(|k| alid(3_000 + k as u128))
+                    .map(|k| Eviction {
+                        allocation: alid(3_000 + k as u128),
+                        rule: if rules & (1 << k) != 0 {
+                            EvictionRule::Relocation
+                        } else {
+                            EvictionRule::Priority
+                        },
+                    })
                     .collect();
                 place_cmd(p, ts)
             }),

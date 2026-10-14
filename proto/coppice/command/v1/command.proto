@@ -177,11 +177,36 @@ message Placement {
   coppice.core.v1.AttemptId attempt = 2;
   coppice.core.v1.GroupId group = 3;
   repeated AllocationSpec allocations = 4;
+  // Was the eviction group as bare allocation ids; replaced by `evictions`,
+  // which names each victim's rule.
+  reserved 5;
+  reserved "preemptions";
   // Running allocations on the placement's node to terminate so this job can
-  // run there (ADR 0044 §4): the eviction group the placement enables. Empty
-  // for every placement but a scheduler preemption, whose job is committed
-  // accruing; apply re-validates each victim and records its termination.
-  repeated coppice.core.v1.AllocationId preemptions = 5;
+  // run there (ADR 0044 §4): the eviction group the placement enables, each
+  // victim named with the rule the scheduler's pass chose it under. Empty for
+  // every placement but a scheduler preemption, whose job is committed
+  // accruing; apply re-validates each victim against its named rule and
+  // records that rule as its termination reason.
+  repeated Eviction evictions = 6;
+}
+
+// One victim of a preempting placement and the rule it is evicted under.
+message Eviction {
+  coppice.core.v1.AllocationId allocation = 1;
+  EvictionRule rule = 2;
+}
+
+// The rule a preempting placement names a victim under (ADR 0044 §4). Closed
+// at the boundary: an unspecified or unknown value in a committed payload is
+// a decode failure, not a silent default.
+enum EvictionRule {
+  EVICTION_RULE_UNSPECIFIED = 0;
+  // The beneficiary outranks the victim: apply checks the class rule; the
+  // score rule is the proposer's alone.
+  EVICTION_RULE_PRIORITY = 1;
+  // The victim moves to spot capacity to make room for a non-preemptible
+  // beneficiary on a persistent node; apply checks the spot room.
+  EVICTION_RULE_RELOCATION = 2;
 }
 
 // The allocation a placement creates. Whether it starts Funded or Accruing

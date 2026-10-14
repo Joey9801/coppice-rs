@@ -11,9 +11,13 @@
 //! `engine` place it there.
 //!
 //! The beneficiary is committed **accruing** on the victims' node, and the
-//! victims ride its placement as `preemptions`: apply re-validates each one
-//! and creates its termination record, and the release the acknowledged
-//! notice manufactures funds the accrual through the ordinary pledge path.
+//! victims ride its placement as `preemptions`, each named with the rule the
+//! pass chose it under: `Priority` when the class and score rules both hold,
+//! else `Relocation`. Apply re-validates each victim against its named rule
+//! — the class rule, or the relocation condition with its spot room — and
+//! records that rule on the victim's termination record; the release the
+//! acknowledged notice manufactures funds the accrual through the ordinary
+//! pledge path.
 //! Everything here reads the pass's working model and the pass-scoped
 //! [`PreemptionLedger`](coppice_state::PreemptionLedger); nothing is stored.
 
@@ -25,6 +29,7 @@ use coppice_core::id::{AllocationId, JobId, NodeId, QuotaEntityId};
 use coppice_core::job::Job;
 use coppice_core::resource::Resources;
 use coppice_core::time::{Duration, Timestamp};
+use coppice_state::command::{Eviction, EvictionRule};
 use coppice_state::StateMachine;
 
 use super::{entity_penalty, node_admits, node_satisfies_labels, simulate_batch, Pass};
@@ -133,46 +138,17 @@ struct Plan {
     bound: Timestamp,
     /// Total work at risk across the victims.
     risk: u128,
-    victims: Vec<AllocationId>,
+    /// Each victim, named with the rule it is evicted under.
+    victims: Vec<Eviction>,
     /// The pass's spot tally with this plan's relocations added.
     spot: SpotTally,
 }
 
 /// Spot capacity the pass's relocations count on, per `preemptible_only`
-/// node (ADR 0044 §4). Two tallies, because apply sees only part of it.
-#[derive(Debug, Clone, Default)]
-pub(super) struct SpotTally {
-    /// Victims apply records `Relocation`: the first-fit tally apply keeps,
-    /// replayed exactly, so the pass picks the node apply will.
-    apply: BTreeMap<NodeId, Resources>,
-    /// Every relocated victim, including those apply records `Priority`
-    /// and so never counts: what actually stops two victims relying on one
-    /// slot. Always at least `apply`.
-    all: BTreeMap<NodeId, Resources>,
-}
-
-impl SpotTally {
-    fn add(map: &mut BTreeMap<NodeId, Resources>, node: NodeId, amount: &Resources) {
-        let taken = map.entry(node).or_insert(Resources::ZERO);
-        *taken = taken.saturating_add(amount);
-    }
-}
-
-/// Why a victim is eligible for one beneficiary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Rule {
-    /// Class and score rules both hold: apply records `Priority`.
-    Priority,
-    /// Relocation, with the class rule holding but not the score rule: apply
-    /// still records `Priority` (it checks only the class rule), so the spot
-    /// capacity is a proposal-side precondition. The pass still reserves it
-    /// — in its own tally only — so no two victims rely on one slot.
-    RelocationOutranked,
-    /// Relocation of a victim the class rule does not cover: apply records
-    /// `Relocation` and checks the spot capacity, first fit, so the pass
-    /// reserves exactly as apply will count, and in its own tally too.
-    Relocation,
-}
+/// node (ADR 0044 §4): the first-fit tally apply keeps for the batch's
+/// `Relocation` victims, replayed exactly, so the pass picks the node apply
+/// will and no two victims rely on one slot.
+pub(super) type SpotTally = BTreeMap<NodeId, Resources>;
 
 impl Pass<'_> {
     /// Try to place `b` by preemption against its `natural` bound (`None`
@@ -258,54 +234,42 @@ impl Pass<'_> {
     /// The relocation condition's spot capacity (ADR 0044 §4) for victim
     /// `v`, reserved in `spot` on success.
     ///
-    /// A victim apply will record `Relocation` (`faithful`) gets the node
-    /// apply's own first fit picks: the first open `preemptible_only` node,
-    /// in `NodeId` order, whose free capacity before the batch less the
-    /// apply-visible tally holds it. Every relocated victim must also fit
-    /// that node's room net of *all* this pass's relocations, and the pass's
-    /// own simulated free capacity there — capacity this pass has already
-    /// seated is not there to relocate onto. When the faithful node fails
-    /// those, the victim is treated as not relocatable rather than counted
-    /// against a node apply would not pick. A victim apply records
-    /// `Priority` takes the first node passing the strict test.
-    fn reserve_spot_room(&self, v: &Victim, faithful: bool, spot: &mut SpotTally) -> bool {
+    /// The victim gets the node apply's own first fit picks: the first open
+    /// `preemptible_only` node, in `NodeId` order, whose free capacity before
+    /// the batch less the tally holds it. That node must also hold it in the
+    /// pass's own simulated free capacity less the tally — capacity this
+    /// pass has already seated is not there to relocate onto. When it does
+    /// not, the victim is treated as not relocatable rather than counted
+    /// against a node apply would not pick.
+    fn reserve_spot_room(&self, v: &Victim, spot: &mut SpotTally) -> bool {
         if !v.preemptible_now {
             return false;
         }
-        let room = |nm: &super::NodeModel, tally: &BTreeMap<NodeId, Resources>| {
-            let id = nm.node.id;
-            let base = self.base_free.get(&id).copied().unwrap_or(Resources::ZERO);
-            let taken = tally.get(&id).copied().unwrap_or(Resources::ZERO);
-            v.requested.fits_within(&base.saturating_sub(&taken))
-        };
-        let strict = |nm: &super::NodeModel| {
-            let taken = spot
-                .all
-                .get(&nm.node.id)
-                .copied()
-                .unwrap_or(Resources::ZERO);
-            room(nm, &spot.all) && v.requested.fits_within(&nm.sim_free.saturating_sub(&taken))
-        };
-        let mut candidates = self.nodes.iter().filter(|nm| {
-            nm.node.preemptible_only
-                && nm.admission == coppice_state::NodeAdmission::Open
-                && v.requested.fits_within(&nm.node.capacity)
-        });
-        let chosen = if faithful {
-            candidates
-                .find(|nm| room(nm, &spot.apply))
-                .filter(|nm| strict(nm))
-        } else {
-            candidates.find(|nm| strict(nm))
-        };
+        let taken =
+            |nm: &super::NodeModel| spot.get(&nm.node.id).copied().unwrap_or(Resources::ZERO);
+        let chosen = self
+            .nodes
+            .iter()
+            .find(|nm| {
+                let base = self
+                    .base_free
+                    .get(&nm.node.id)
+                    .copied()
+                    .unwrap_or(Resources::ZERO);
+                nm.node.preemptible_only
+                    && nm.admission == coppice_state::NodeAdmission::Open
+                    && v.requested.fits_within(&nm.node.capacity)
+                    && v.requested.fits_within(&base.saturating_sub(&taken(nm)))
+            })
+            .filter(|nm| {
+                v.requested
+                    .fits_within(&nm.sim_free.saturating_sub(&taken(nm)))
+            });
         let Some(nm) = chosen else {
             return false;
         };
-        let node = nm.node.id;
-        if faithful {
-            SpotTally::add(&mut spot.apply, node, &v.requested);
-        }
-        SpotTally::add(&mut spot.all, node, &v.requested);
+        let reserved = spot.entry(nm.node.id).or_insert(Resources::ZERO);
+        *reserved = reserved.saturating_add(&v.requested);
         true
     }
 
@@ -357,27 +321,19 @@ impl Pass<'_> {
             available = available.saturating_add(&a.funded);
         }
 
-        // Eligibility: the class and score rules — or, for a beneficiary
-        // that cannot go to spot capacity, relocation off this persistent
-        // node regardless of both (its spot room is checked per victim
-        // below).
+        // Eligibility: the class and score rules both holding name a victim
+        // `Priority`. Failing either, a beneficiary that cannot go to spot
+        // capacity may still relocate it off this persistent node, named
+        // `Relocation` (its spot room is checked per victim below).
         let relocating = !b.preemptible && !nm.node.preemptible_only;
-        let mut eligible: Vec<(&Victim, Rule)> = nm
+        let mut eligible: Vec<(&Victim, EvictionRule)> = nm
             .victims
             .iter()
             .filter_map(|v| {
-                let outranked = v.priority < b.job.priority;
-                if outranked && v.score < b.score {
-                    Some((v, Rule::Priority))
+                if v.priority < b.job.priority && v.score < b.score {
+                    Some((v, EvictionRule::Priority))
                 } else if relocating && v.preemptible_now {
-                    Some((
-                        v,
-                        if outranked {
-                            Rule::RelocationOutranked
-                        } else {
-                            Rule::Relocation
-                        },
-                    ))
+                    Some((v, EvictionRule::Relocation))
                 } else {
                     None
                 }
@@ -394,21 +350,23 @@ impl Pass<'_> {
         });
 
         let abort_grace = self.snapshot.policy.abort_grace;
-        let mut chosen: Vec<AllocationId> = Vec::new();
+        let mut chosen: Vec<Eviction> = Vec::new();
         let mut chosen_seqs: BTreeSet<u64> = BTreeSet::new();
         let mut max_notice = Duration::ZERO;
         let mut risk: u128 = 0;
         let mut spot = self.spot.clone();
         for (v, rule) in eligible {
             let admitted = match rule {
-                Rule::Priority => true,
-                Rule::RelocationOutranked => self.reserve_spot_room(v, false, &mut spot),
-                Rule::Relocation => self.reserve_spot_room(v, true, &mut spot),
+                EvictionRule::Priority => true,
+                EvictionRule::Relocation => self.reserve_spot_room(v, &mut spot),
             };
             if !admitted {
                 continue;
             }
-            chosen.push(v.alloc);
+            chosen.push(Eviction {
+                allocation: v.alloc,
+                rule,
+            });
             chosen_seqs.insert(v.seq);
             available = available.saturating_add(&v.funded);
             max_notice = max_notice.max(v.notice);

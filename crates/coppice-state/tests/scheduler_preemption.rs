@@ -1,8 +1,8 @@
 //! ADR 0044 §4 at apply: a preempting placement's eviction group. Every
-//! victim is re-validated (a refusal is a proposer bug, rejecting the whole
-//! batch), the beneficiary is committed accruing, and each victim's attempt
-//! gets an unacknowledged `Priority` termination record and a
-//! `PreemptRequested` event.
+//! victim is re-validated against the rule the placement names it under (a
+//! refusal is a proposer bug, rejecting the whole batch), the beneficiary is
+//! committed accruing, and each victim's attempt gets an unacknowledged
+//! termination record carrying that rule and a `PreemptRequested` event.
 
 mod common;
 
@@ -13,7 +13,9 @@ use coppice_core::id::{AllocationId, JobId, NodeId};
 use coppice_core::job::{JobState, RetryPolicy};
 use coppice_core::preemption::PreemptionSpec;
 use coppice_core::time::{Duration, Timestamp};
-use coppice_state::command::{CommitPlacements, Placement, RecordAttemptNotified};
+use coppice_state::command::{
+    CommitPlacements, Eviction, EvictionRule, Placement, RecordAttemptNotified,
+};
 use coppice_state::{Command, Event, PreemptionRefusal, RejectionReason, StateMachine};
 
 /// The beneficiary every test places.
@@ -79,19 +81,45 @@ fn full_node() -> StateMachine {
     sm
 }
 
+/// The beneficiary's placement on node 1, naming every victim under the
+/// priority rule.
 fn preempting(victims: &[u128]) -> Placement {
-    preempting_on(nid(1), victims)
+    evicting(
+        &victims
+            .iter()
+            .map(|n| (*n, EvictionRule::Priority))
+            .collect::<Vec<_>>(),
+    )
 }
 
-fn preempting_on(node: NodeId, victims: &[u128]) -> Placement {
+/// The beneficiary's placement on node 1, naming every victim under the
+/// relocation rule.
+fn relocating(victims: &[u128]) -> Placement {
+    evicting(
+        &victims
+            .iter()
+            .map(|n| (*n, EvictionRule::Relocation))
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// The beneficiary's placement on node 1, naming each victim under its own
+/// rule.
+fn evicting(victims: &[(u128, EvictionRule)]) -> Placement {
     let mut p = placement(
         jid(BENEFICIARY),
         aid(BENEFICIARY),
         alid(BENEFICIARY),
-        node,
+        nid(1),
         cpu(8_000),
     );
-    p.preemptions = victims.iter().map(|n| alid(*n)).collect();
+    p.preemptions = victims
+        .iter()
+        .map(|(n, rule)| Eviction {
+            allocation: alid(*n),
+            rule: *rule,
+        })
+        .collect();
     p
 }
 
@@ -360,7 +388,10 @@ fn the_per_node_guard_holds_while_victims_are_outstanding() {
     // outstanding: refused, even naming a fresh victim.
     submit(&mut sm, jid(200), 1_000, 9, false);
     let mut p = placement(jid(200), aid(200), alid(200), nid(1), cpu(1_000));
-    p.preemptions = vec![alid(1)];
+    p.preemptions = vec![Eviction {
+        allocation: alid(1),
+        rule: EvictionRule::Priority,
+    }];
     let err = sm.apply(&place_cmd(p, secs(20))).unwrap_err();
     assert_eq!(refusal(err), (alid(1), PreemptionRefusal::Guarded));
 
@@ -393,7 +424,10 @@ fn one_eviction_group_per_node_per_batch() {
     let mut sm = full_node();
     submit(&mut sm, jid(200), 1_000, 9, false);
     let mut other = placement(jid(200), aid(200), alid(200), nid(1), cpu(1_000));
-    other.preemptions = vec![alid(2)];
+    other.preemptions = vec![Eviction {
+        allocation: alid(2),
+        rule: EvictionRule::Priority,
+    }];
     let err = sm
         .apply(&Command::CommitPlacements(CommitPlacements {
             expected_version: 0,
@@ -482,7 +516,7 @@ fn outranking_victims() -> StateMachine {
 fn relocation_evicts_outranking_preemptible_work_when_spot_capacity_is_free() {
     let mut sm = outranking_victims();
     register_spot(&mut sm, nid(2), 10_000);
-    let applied = apply_ok(&mut sm, place_cmd(preempting(&[1, 2]), secs(10)));
+    let applied = apply_ok(&mut sm, place_cmd(relocating(&[1, 2]), secs(10)));
     let reason = PreemptReason::Relocation {
         for_job: jid(BENEFICIARY),
     };
@@ -508,20 +542,20 @@ fn relocation_needs_free_spot_capacity_for_every_victim() {
     // victim counts on it, the second finds it taken.
     let mut sm = outranking_victims();
     register_spot(&mut sm, nid(2), 8_000);
-    let err = commit(&mut sm, preempting(&[1, 2])).unwrap_err();
-    assert_eq!(refusal(err), (alid(2), PreemptionRefusal::NotOutranked));
+    let err = commit(&mut sm, relocating(&[1, 2])).unwrap_err();
+    assert_eq!(refusal(err), (alid(2), PreemptionRefusal::NotRelocatable));
 
     // No spot node at all.
     let mut sm = outranking_victims();
-    let err = commit(&mut sm, preempting(&[1, 2])).unwrap_err();
-    assert_eq!(refusal(err), (alid(1), PreemptionRefusal::NotOutranked));
+    let err = commit(&mut sm, relocating(&[1, 2])).unwrap_err();
+    assert_eq!(refusal(err), (alid(1), PreemptionRefusal::NotRelocatable));
 
     // A draining spot node is not capacity.
     let mut sm = outranking_victims();
     register_spot(&mut sm, nid(2), 10_000);
     apply_ok(&mut sm, set_draining_cmd(nid(2), true));
-    let err = commit(&mut sm, preempting(&[1, 2])).unwrap_err();
-    assert_eq!(refusal(err), (alid(1), PreemptionRefusal::NotOutranked));
+    let err = commit(&mut sm, relocating(&[1, 2])).unwrap_err();
+    assert_eq!(refusal(err), (alid(1), PreemptionRefusal::NotRelocatable));
 }
 
 #[test]
@@ -534,8 +568,45 @@ fn relocation_is_only_for_a_beneficiary_that_cannot_go_to_spot_capacity() {
     // Preemptible itself: it should go to the spot node, not evict.
     submit(&mut sm, jid(BENEFICIARY), 8_000, 5, true);
     register_spot(&mut sm, nid(2), 20_000);
+    let err = commit(&mut sm, relocating(&[1, 2])).unwrap_err();
+    assert_eq!(refusal(err), (alid(1), PreemptionRefusal::NotRelocatable));
+}
+
+#[test]
+fn a_victim_named_for_priority_is_never_relocated_instead() {
+    // Spot capacity is free and the relocation condition holds, but the
+    // victims are named under the priority rule, which their class fails:
+    // apply validates the named rule, it does not substitute the other.
+    let mut sm = outranking_victims();
+    register_spot(&mut sm, nid(2), 10_000);
     let err = commit(&mut sm, preempting(&[1, 2])).unwrap_err();
     assert_eq!(refusal(err), (alid(1), PreemptionRefusal::NotOutranked));
+}
+
+#[test]
+fn an_outranked_victim_named_for_relocation_is_relocated_and_counts_on_spot_room() {
+    // Both victims are of a lower class than the beneficiary, but the pass
+    // named them under relocation (it does so when the score rule fails).
+    // Apply records `Relocation` and checks the spot room: 6 free cores take
+    // the first victim, not the second.
+    let mut sm = full_node();
+    register_spot(&mut sm, nid(2), 6_000);
+    let err = commit(&mut sm, relocating(&[1, 2])).unwrap_err();
+    assert_eq!(refusal(err), (alid(2), PreemptionRefusal::NotRelocatable));
+
+    let mut sm = full_node();
+    register_spot(&mut sm, nid(2), 10_000);
+    apply_ok(&mut sm, place_cmd(relocating(&[1, 2]), secs(10)));
+    let reason = Some(PreemptReason::Relocation {
+        for_job: jid(BENEFICIARY),
+    });
+    for n in [1, 2] {
+        assert_eq!(
+            sm.attempts[&aid(n)].preemption.map(|p| p.reason),
+            reason,
+            "victim {n}"
+        );
+    }
 }
 
 #[test]
@@ -549,7 +620,13 @@ fn a_mixed_group_records_each_victims_own_reason() {
     run(&mut sm, 2, nid(1), 4_000);
     submit(&mut sm, jid(BENEFICIARY), 8_000, 5, false);
     register_spot(&mut sm, nid(2), 4_000);
-    apply_ok(&mut sm, place_cmd(preempting(&[1, 2]), secs(10)));
+    apply_ok(
+        &mut sm,
+        place_cmd(
+            evicting(&[(1, EvictionRule::Priority), (2, EvictionRule::Relocation)]),
+            secs(10),
+        ),
+    );
     let for_job = jid(BENEFICIARY);
     assert_eq!(
         sm.attempts[&aid(1)].preemption.map(|p| p.reason),

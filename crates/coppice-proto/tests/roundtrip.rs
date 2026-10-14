@@ -168,8 +168,14 @@ fn every_command() -> Vec<Command> {
                     },
                 }],
                 preemptions: vec![
-                    AllocationId(Uuid::from_u128(10)),
-                    AllocationId(Uuid::from_u128(11)),
+                    Eviction {
+                        allocation: AllocationId(Uuid::from_u128(10)),
+                        rule: EvictionRule::Priority,
+                    },
+                    Eviction {
+                        allocation: AllocationId(Uuid::from_u128(11)),
+                        rule: EvictionRule::Relocation,
+                    },
                 ],
             }],
             proposed_at: ts(),
@@ -974,6 +980,26 @@ fn preemption_spec_absent_is_defaults_and_signal_is_closed() {
         Job::try_from(encoded),
         Err(ConvertError::UnknownEnum { .. })
     ));
+}
+
+#[test]
+fn eviction_rule_is_closed() {
+    // A victim's rule decides what apply validates and records: the zero
+    // (UNSPECIFIED) value and any unknown value are decode failures, never a
+    // silent default.
+    for value in [0, 3] {
+        let encoded = pb::command::v1::Eviction {
+            allocation: Some(AllocationId(Uuid::from_u128(10)).into()),
+            rule: value,
+        };
+        assert_eq!(
+            Eviction::try_from(encoded),
+            Err(ConvertError::UnknownEnum {
+                field: "Eviction.rule",
+                value,
+            })
+        );
+    }
 }
 
 #[test]
