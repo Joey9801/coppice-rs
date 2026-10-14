@@ -92,11 +92,14 @@ imbl = "7"
 # Offline JWT validation for the OIDC bearer path (ADR 0022): decode a JWKS
 # into per-`kid` verification keys and check signature, `iss`, `aud`, `exp`
 # and `nbf` on every request without ever calling the IdP. Confined to
-# `coppice-authn`. Its default backend is `ring`, which is the same provider
-# the workspace's rustls 0.23 pin uses — the alternative resource-server
-# stacks (`openidconnect`, anything on `aws-lc-rs`) would put a second crypto
-# toolchain in the tree for no validation we cannot do here.
-jsonwebtoken = "9"
+# `coppice-authn` (and `coppice-testkit`'s token minting). Since 10.0 it
+# requires choosing a crypto backend, and offers only `aws_lc_rs` or
+# `rust_crypto`: `rust_crypto` (pure-Rust RSA/ECDSA/EdDSA/HMAC) keeps the
+# aws-lc build toolchain out of the tree, as everywhere else in the workspace.
+# Only signature *verification* runs in production, which is a public-key
+# operation. The alternative resource-server stacks (`openidconnect`) would
+# add far more for no validation we cannot do here.
+jsonwebtoken = { version = "11", features = ["rust_crypto"] }
 # openraft drives election, replication, and membership; the app data types
 # (`Command`, `Applied`, `RejectionReason`) do not implement serde, so the
 # "serde" feature is deliberately left off (ADR 0002). Default features cover
