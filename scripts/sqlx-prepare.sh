@@ -17,8 +17,8 @@ fi
 
 if ! cargo sqlx --version >/dev/null 2>&1; then
     echo "error: sqlx-cli is not installed (cargo sqlx not found)" >&2
-    echo "install it with (0.8.x, matching the workspace's sqlx minor):" >&2
-    echo "  cargo install sqlx-cli --version '^0.8' --no-default-features --features rustls,sqlite --locked" >&2
+    echo "install it with (0.9.x, matching the workspace's sqlx minor):" >&2
+    echo "  cargo install sqlx-cli --version '^0.9' --no-default-features --features rustls,sqlite --locked" >&2
     exit 1
 fi
 
