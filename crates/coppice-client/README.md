@@ -262,10 +262,12 @@ Either way the token is held as a `BearerToken`, which redacts itself in
 
 ## Feature flags
 
-- **`rustls-tls-native-roots`** *(default)* — enables `reqwest`'s `rustls-tls`
-  and `rustls-tls-native-roots`, so both the Mozilla bundle and the platform
-  trust store are trusted. Turn default features off for a plain-HTTP
-  coordinator, or when supplying your own `reqwest::Client`.
+- **`rustls-tls-native-roots`** *(default)* — HTTPS over rustls with the
+  `ring` provider, trusting both the Mozilla bundle and the platform trust
+  store. The client builds this rustls config itself, so it needs no
+  aws-lc-rs toolchain and never installs a process-wide rustls provider.
+  Turn default features off for a plain-HTTP coordinator, or when supplying
+  your own `reqwest::Client`.
 
 ## Minimum supported Rust version
 

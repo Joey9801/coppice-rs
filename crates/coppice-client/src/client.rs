@@ -298,12 +298,18 @@ fn normalize_base_url(raw: &str) -> String {
 /// A `reqwest::ClientBuilder` for a *normalized* base, skipping the platform's
 /// native root store when the base is not `https://`.
 ///
-/// Loading native roots enumerates the macOS keychain eagerly inside
-/// `ClientBuilder::build` — seconds, before any request is made — even for a
-/// plain `http://127.0.0.1` base that will never touch TLS. This is the one
-/// trick worth keeping: a plain-HTTP base pays nothing,
-/// and an `https://` base keeps the platform trust store automatically under
-/// the same scheme check.
+/// Loading native roots enumerates the macOS keychain eagerly — seconds,
+/// before any request is made — even for a plain `http://127.0.0.1` base that
+/// will never touch TLS. This is the one trick worth keeping: a plain-HTTP
+/// base pays nothing, and an `https://` base keeps the platform trust store
+/// automatically under the same scheme check.
+///
+/// With the `rustls-tls-native-roots` feature the builder carries a
+/// preconfigured rustls config (ring provider; the Mozilla bundle, plus the
+/// platform store for an `https://` base), so reqwest's own TLS builder
+/// methods do not apply to it; a program that needs a different trust store
+/// builds its own `reqwest::Client` and hands it to
+/// [`ClientBuilder::http_client`].
 ///
 /// Exposed because a program that builds its own `reqwest::Client` — a
 /// readiness poller, say — wants the same behaviour without reimplementing it.
@@ -315,17 +321,33 @@ pub fn plain_http_builder(base: &str) -> reqwest::ClientBuilder {
         .as_bytes()
         .get(..8)
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"https://"));
-    // The toggle only exists when a TLS backend is compiled in; without one
-    // there are no roots to load, and every builder is already "plain".
+    // Without a TLS backend compiled in there are no roots to load, and every
+    // builder is already "plain".
     #[cfg(feature = "rustls-tls-native-roots")]
-    let builder = if is_https {
-        builder
-    } else {
-        builder.tls_built_in_native_certs(false)
-    };
+    let builder = builder.tls_backend_preconfigured(rustls_config(is_https));
     #[cfg(not(feature = "rustls-tls-native-roots"))]
     let _ = is_https;
     builder
+}
+
+/// The rustls config behind the default TLS backend: ring provider, the
+/// Mozilla bundle, and — when `native_roots` — the platform trust store. An
+/// unreadable or partly unparsable platform store degrades to whatever did
+/// load, as reqwest's own loader does.
+#[cfg(feature = "rustls-tls-native-roots")]
+fn rustls_config(native_roots: bool) -> rustls::ClientConfig {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    if native_roots {
+        roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
+    }
+    rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("the ring provider supports the default protocol versions")
+    .with_root_certificates(roots)
+    .with_no_client_auth()
 }
 
 /// Everything a [`Client`] shares between its scoped clones.

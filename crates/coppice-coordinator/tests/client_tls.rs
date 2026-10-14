@@ -94,15 +94,12 @@ async fn a_client_certificate_is_requested_not_required_and_reaches_handlers() {
     // A caller that presents an operator-style client certificate: the
     // handler sees the chain.
     let operator = ca.leaf_with_cn("operator@example.com");
-    let with_cert = reqwest::Client::builder()
-        .add_root_certificate(reqwest::Certificate::from_pem(&ca.pem).expect("root"))
-        .identity({
-            // reqwest's rustls identity takes one PEM blob: key then chain.
-            let mut pem = operator.key_pem.clone();
-            pem.extend_from_slice(&operator.cert_pem);
-            reqwest::Identity::from_pem(&pem).expect("client identity")
-        })
-        .build()
+    let with_cert = coppice_tls::HttpTls::no_roots()
+        .extra_roots_pem(&ca.pem)
+        .expect("root")
+        .identity_pem(&[operator.key_pem.as_slice(), &operator.cert_pem].concat())
+        .expect("client identity")
+        .reqwest_client()
         .expect("build the client-cert http client");
     let body = with_cert
         .get(format!("{}/peer", serving.url))
@@ -120,9 +117,10 @@ async fn a_client_certificate_is_requested_not_required_and_reaches_handlers() {
     // And a caller with no certificate at all is served just the same — this
     // listener never *requires* one, which is what keeps it usable by browsers,
     // CLIs, and enrolling machines.
-    let certless = reqwest::Client::builder()
-        .add_root_certificate(reqwest::Certificate::from_pem(&ca.pem).expect("root"))
-        .build()
+    let certless = coppice_tls::HttpTls::no_roots()
+        .extra_roots_pem(&ca.pem)
+        .expect("root")
+        .reqwest_client()
         .expect("build the certless http client");
     let body = certless
         .get(format!("{}/peer", serving.url))
@@ -140,7 +138,11 @@ async fn a_client_certificate_is_requested_not_required_and_reaches_handlers() {
 #[tokio::test]
 async fn the_insecure_posture_serves_plain_http() {
     let serving = serve(None).await;
-    let body = reqwest::get(format!("{}/peer", serving.url))
+    let body = coppice_tls::HttpTls::no_roots()
+        .reqwest_client()
+        .expect("http client")
+        .get(format!("{}/peer", serving.url))
+        .send()
         .await
         .expect("GET /peer over plain HTTP")
         .text()
@@ -160,9 +162,10 @@ async fn a_daemon_configured_with_a_certificate_serves_readyz_over_https() {
     let (ca_pem, base) = daemon.set_client_tls(&ca);
     daemon.start();
 
-    let client = reqwest::Client::builder()
-        .add_root_certificate(reqwest::Certificate::from_pem(&ca_pem).expect("root"))
-        .build()
+    let client = coppice_tls::HttpTls::no_roots()
+        .extra_roots_pem(&ca_pem)
+        .expect("root")
+        .reqwest_client()
         .expect("build the https client");
 
     // The parked surface is served under the same posture the formed one will
@@ -186,7 +189,9 @@ async fn a_daemon_configured_with_a_certificate_serves_readyz_over_https() {
 
     // Plain HTTP to a TLS listener is refused at the handshake, not silently
     // downgraded.
-    let plain = reqwest::Client::new()
+    let plain = coppice_tls::HttpTls::no_roots()
+        .reqwest_client()
+        .expect("http client")
         .get(format!(
             "http://127.0.0.1{}/readyz",
             &base[base.rfind(':').unwrap()..]

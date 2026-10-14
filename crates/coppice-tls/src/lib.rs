@@ -69,9 +69,11 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::Stream;
 
 pub mod client_tls;
+pub mod http_client;
 pub mod pki;
 
 pub use client_tls::{ClientTlsPaths, ClientTlsStore};
+pub use http_client::{HttpTls, HttpTlsError};
 
 // ---------------------------------------------------------------------------
 // Metrics (crate-root describe/gather pair, mounted into the coordinator's own

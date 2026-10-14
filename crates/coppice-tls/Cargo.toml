@@ -20,6 +20,11 @@ rustls.workspace = true
 tokio-rustls.workspace = true
 # PEM → DER parsing for the cert chain, private key, and CA roots.
 rustls-pemfile.workspace = true
+# `http_client`: the ring-provider rustls config every outbound reqwest client
+# in the workspace is built with, and the trust store it carries.
+reqwest.workspace = true
+webpki-roots.workspace = true
+rustls-native-certs.workspace = true
 # Reading the leaf's `notAfter` for the expiry gauge, and — in `pki` — the leaf
 # subject and the CA public key (for the key/cert-match custody check).
 x509-parser.workspace = true

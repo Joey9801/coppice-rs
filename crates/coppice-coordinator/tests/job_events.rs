@@ -53,7 +53,10 @@ struct Sse {
 
 impl Sse {
     async fn open(url: &str, last_event_id: Option<&str>) -> Sse {
-        let mut request = reqwest::Client::new().get(url);
+        let mut request = coppice_tls::HttpTls::no_roots()
+            .reqwest_client()
+            .expect("http client")
+            .get(url);
         if let Some(id) = last_event_id {
             request = request.header("last-event-id", id);
         }

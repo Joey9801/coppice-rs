@@ -208,7 +208,9 @@ async fn a_fleet_that_lost_its_volumes_re_forms_once_and_refuses_the_old_history
     // otherwise be racing the listener's shutdown.
     let readyz_url = fleet.members[2].api("/readyz");
     let terminal_readyz = tokio::spawn(async move {
-        let client = reqwest::Client::new();
+        let client = coppice_tls::HttpTls::no_roots()
+            .reqwest_client()
+            .expect("http client");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
         while tokio::time::Instant::now() < deadline {
             if let Ok(response) = client.get(&readyz_url).send().await {

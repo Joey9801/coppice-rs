@@ -456,7 +456,9 @@ mod tests {
     #[test]
     fn jitter_stays_inside_the_configured_band() {
         let cache = JwksCache::with_timings(
-            reqwest::Client::new(),
+            coppice_tls::HttpTls::no_roots()
+                .reqwest_client()
+                .expect("http client"),
             "https://idp.example".to_string(),
             JwksTimings {
                 refresh_interval: Duration::from_secs(600),
@@ -476,7 +478,9 @@ mod tests {
     #[test]
     fn zero_jitter_is_the_bare_interval() {
         let cache = JwksCache::with_timings(
-            reqwest::Client::new(),
+            coppice_tls::HttpTls::no_roots()
+                .reqwest_client()
+                .expect("http client"),
             "https://idp.example".to_string(),
             JwksTimings {
                 refresh_interval: Duration::from_secs(30),

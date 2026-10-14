@@ -382,23 +382,22 @@ impl EnrollClient {
     ) -> Result<EnrollClient, EnrollClientError> {
         validate_endpoint(endpoint, insecure)?;
 
-        let mut builder = reqwest::Client::builder()
+        let mut tls = coppice_tls::HttpTls::built_in_roots();
+        if let Some(pem) = extra_root {
+            tls = tls
+                .extra_roots_pem(pem)
+                .map_err(|e| EnrollClientError::BuildClient(e.to_string()))?;
+        }
+
+        let http = tls
+            .reqwest_builder()
+            .map_err(|e| EnrollClientError::BuildClient(e.to_string()))?
             // A 3xx carrying an `Authorization: Bearer` header to a host the
             // response chose is exactly the leak §4 forbids. `none()` makes the
             // redirect visible to us as a status, which `enroll` turns into an
             // error rather than a hop.
             .redirect(reqwest::redirect::Policy::none())
             .timeout(REQUEST_TIMEOUT)
-            .use_rustls_tls()
-            .tls_built_in_root_certs(true);
-
-        if let Some(pem) = extra_root {
-            let cert = reqwest::Certificate::from_pem(pem)
-                .map_err(|e| EnrollClientError::BuildClient(e.to_string()))?;
-            builder = builder.add_root_certificate(cert);
-        }
-
-        let http = builder
             .build()
             .map_err(|e| EnrollClientError::BuildClient(e.to_string()))?;
         Ok(EnrollClient {

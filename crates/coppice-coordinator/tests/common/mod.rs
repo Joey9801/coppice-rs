@@ -1446,7 +1446,9 @@ log_level = "warn"
     async fn readyz_snapshot(&self) -> String {
         let url = self.api("/readyz");
         let attempt = async {
-            let client = reqwest::Client::new();
+            let client = coppice_tls::HttpTls::no_roots()
+                .reqwest_client()
+                .expect("http client");
             let resp = client.get(&url).send().await.ok()?;
             let status = resp.status().as_u16();
             let body = resp.text().await.ok()?;
@@ -1650,7 +1652,9 @@ log_level = "warn"
         // `timeout()`/`connect_timeout()` builders. Both would do, but one
         // wrapper is the obviously-correct version: there is no question left
         // about which phases of the exchange the bound does and does not cover.
-        let client = reqwest::Client::new();
+        let client = coppice_tls::HttpTls::no_roots()
+            .reqwest_client()
+            .expect("http client");
         let url = self.api("/readyz");
         let mut last: Option<String> = None;
         let deadline = Instant::now() + Duration::from_secs(30);

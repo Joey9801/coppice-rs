@@ -489,15 +489,20 @@ impl PublicEdge {
         let http = match self.http.get() {
             Some(http) => http,
             None => {
-                let built = reqwest::Client::builder()
+                let tls = if self.insecure {
+                    coppice_tls::HttpTls::no_roots()
+                } else {
+                    coppice_tls::HttpTls::built_in_roots()
+                };
+                let built = tls.reqwest_builder().and_then(|builder| {
                     // The same two transport rules the enrollment client sets,
                     // for the same reasons: a redirect is a different host's
                     // answer, and an unbounded dial is a hung tick.
-                    .redirect(reqwest::redirect::Policy::none())
-                    .timeout(crate::probe::PROBE_TIMEOUT)
-                    .use_rustls_tls()
-                    .tls_built_in_root_certs(!self.insecure)
-                    .build();
+                    Ok(builder
+                        .redirect(reqwest::redirect::Policy::none())
+                        .timeout(crate::probe::PROBE_TIMEOUT)
+                        .build()?)
+                });
                 match built {
                     Ok(http) => {
                         let _ = self.http.set(http);
