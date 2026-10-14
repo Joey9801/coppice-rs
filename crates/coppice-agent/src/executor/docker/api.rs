@@ -125,6 +125,14 @@ fn usable_socket(path: &Path) -> bool {
     is_socket && std::os::unix::net::UnixStream::connect(path).is_ok()
 }
 
+/// The Docker Engine API version the agent requests: 1.44 (Docker 25.0), the
+/// oldest that every endpoint, parameter and field the agent uses exists in,
+/// so Docker 25.0 is the documented minimum daemon.
+const DOCKER_API_VERSION: &bollard::ClientVersion = &bollard::ClientVersion {
+    major_version: 1,
+    minor_version: 44,
+};
+
 /// Connect to the Docker daemon named by `docker_host`.
 ///
 /// `unix://…` dials a local socket; `tcp://…`/`http://…` a remote daemon over
@@ -134,7 +142,7 @@ fn usable_socket(path: &Path) -> bool {
 /// configuration that the agent does not carry yet — advertising it would
 /// connect in the clear while claiming otherwise. Anything else is a clear
 /// configuration error (we never guess a scheme). Uses bollard's default
-/// timeout and negotiated API version.
+/// timeout and speaks [`DOCKER_API_VERSION`].
 ///
 /// Public (not `pub(crate)`) so both `run_daemon` and `coppice dev` can build a
 /// client before constructing a [`super::DockerExecutor`] with
@@ -142,9 +150,9 @@ fn usable_socket(path: &Path) -> bool {
 /// the same way.
 pub fn connect(docker_host: &str) -> Result<Docker, ExecutorError> {
     let result = if docker_host.starts_with("unix://") {
-        Docker::connect_with_unix(docker_host, DOCKER_TIMEOUT, bollard::API_DEFAULT_VERSION)
+        Docker::connect_with_unix(docker_host, DOCKER_TIMEOUT, DOCKER_API_VERSION)
     } else if docker_host.starts_with("tcp://") || docker_host.starts_with("http://") {
-        Docker::connect_with_http(docker_host, DOCKER_TIMEOUT, bollard::API_DEFAULT_VERSION)
+        Docker::connect_with_http(docker_host, DOCKER_TIMEOUT, DOCKER_API_VERSION)
     } else if docker_host.starts_with("https://") {
         return Err(ExecutorError::Other(format!(
             "docker_host {docker_host:?}: TLS to the daemon is not supported yet \

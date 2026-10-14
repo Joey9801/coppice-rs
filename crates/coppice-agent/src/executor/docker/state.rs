@@ -45,7 +45,7 @@ pub(crate) enum Mapped {
 /// Map one container's `inspect` state onto its disposition (docker-executor.md
 /// §3). `now` stamps the running-container runtime (`now − StartedAt`).
 ///
-/// Total over Docker's seven documented states and defensive over bollard's
+/// Total over Docker's eight documented states and defensive over bollard's
 /// `EMPTY`/`None`.
 pub(crate) fn map_container(state: &bollard::models::ContainerState, now: Timestamp) -> Mapped {
     use bollard::models::ContainerStateStatusEnum as S;
@@ -55,10 +55,12 @@ pub(crate) fn map_container(state: &bollard::models::ContainerState, now: Timest
         Some(S::CREATED) => Mapped::StartDebris,
 
         // Running is running. Paused holds resources and we never pause, so we
-        // treat it as running (reconcile stops it if unowned, §3). Restarting
+        // treat it as running (reconcile stops it if unowned, §3). Stopping is
+        // a stop in progress: the process is still alive and holding its
+        // resources until the `die`, which then reports the exit. Restarting
         // is unreachable — restart policy is always `no` — but mapped
         // defensively to running rather than dropped.
-        Some(S::RUNNING) | Some(S::PAUSED) | Some(S::RESTARTING) => {
+        Some(S::RUNNING) | Some(S::PAUSED) | Some(S::STOPPING) | Some(S::RESTARTING) => {
             Mapped::Report(ContainerState::Running {
                 runtime: running_runtime(state, now),
             })
