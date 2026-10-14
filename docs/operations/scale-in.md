@@ -149,7 +149,9 @@ SIGTERM drain to wait for.
 
 1. The agent announces `draining` on its next report, sent immediately,
    and on every report after that. The leader replicates it, and no new
-   placement lands on the node from that log position.
+   placement lands on the node from that log position; a `StartJob`
+   already in flight is refused at the agent's door and requeued free
+   (`Preempted { drain }`, runtime 0).
 2. The agent keeps serving — heartbeats, exit reports, reconnects — until
    every container it is accountable for has exited and been reported,
    or until `shutdown_grace` (agent config, default `5m`) elapses.

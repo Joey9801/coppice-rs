@@ -246,8 +246,7 @@ second interruption notice may only make its `D` earlier, and every mark
 later than the interruption's `T_stop` gets a replacement mark, journaled
 before it is re-reported, so a restart can never restore a stop later than
 one the coordinator has published. A `StartJob` that arrives under an
-interruption is still started — its committed intent predates the
-announcement — and is notified at once.
+interruption is refused at the door (below).
 
 **Starts in flight.** A container still starting at its plan `T_stop` never
 starts: every start carries a launch bound, the earlier of its own
@@ -291,11 +290,14 @@ The replicated `Node.drain` record is the source of intent; a regular drain
   leadership change is re-sent by the next leader to see the mismatch; a
   restarted agent recovers its target from the journal, so a matching echo
   sends nothing.
-- **Admission at the door.** Under an operator plan, a `StartJob` arriving
-  at or after its own `T_notice` (its dispatched grace and margin) is
-  refused: the agent journals a `Preempt { Drain }` tombstone and reports
-  the attempt terminal `Preempted { Drain }`, runtime 0 — a free retry. A
-  passed `latest_start_us` answers `Revoked` first. A start already in
+- **Admission at the door.** A `StartJob` that arrives while the agent
+  admits nothing is refused without a launch: under an operator plan at or
+  after its own `T_notice` (its dispatched grace and margin), under an
+  interruption, or during the agent's own SIGTERM drain. The agent
+  journals a `Preempt { reason }` tombstone — `Interruption` under an
+  interruption, else `Drain` — and reports the attempt terminal
+  `Preempted { reason }`, runtime 0 — a free retry. A passed
+  `latest_start_us` answers `Revoked` first. A start already in
   flight at `T_notice` is notified once it has a container and stopped at
   `T_stop`; one still starting at `T_stop` never launches (above).
 

@@ -299,30 +299,31 @@ async fn an_oom_during_the_notice_window_is_the_limit() {
 #[tokio::test]
 async fn a_max_runtime_watchdog_that_fires_first_wins() {
     let (_dir, mut session, exec) = registered().await;
-    let ids = (AllocationId::new(), AttemptId::new(), JobId::new());
-    session
-        .handle_command_settled(command(1, 1, 2, start_body(ids, Some(5_000_000))))
-        .await
-        .unwrap();
-    let a = ids.0;
+    let a = (AllocationId::new(), AttemptId::new(), JobId::new());
+    let b = (AllocationId::new(), AttemptId::new(), JobId::new());
+    for (seq, ids) in [(2, a), (3, b)] {
+        session
+            .handle_command_settled(command(1, 1, seq, start_body(ids, Some(5_000_000))))
+            .await
+            .unwrap();
+    }
     let now = Timestamp::now();
     session
         .on_interruption(now + Duration::from_secs(120), now)
         .await
         .unwrap();
-    let reports = session.trigger_max_runtime(a).await.unwrap();
+    let reports = session.trigger_max_runtime(a.0).await.unwrap();
     assert_eq!(
         terminal_outcome(&reports),
         Some(AttemptOutcome::RuntimeLimitExceeded)
     );
-    assert!(session.next_stop_at().is_none());
+    assert_eq!(
+        session.next_stop_at(),
+        Some(session.state().marks[&b.0].stop_at)
+    );
 
     // ...but once the preemption stop is in flight, the watchdog stands down.
-    let ids = (AllocationId::new(), AttemptId::new(), JobId::new());
-    session
-        .handle_command_settled(command(1, 1, 3, start_body(ids, Some(5_000_000))))
-        .await
-        .unwrap();
+    let ids = b;
     let stop_at = session.state().marks[&ids.0].stop_at;
     let stops = session.begin_due_stops(stop_at).unwrap();
     assert_eq!(stops.len(), 1);
@@ -573,38 +574,46 @@ async fn a_stale_notice_starts_no_plan() {
 
 // ---- StartJob under a plan ----
 
-#[tokio::test]
-async fn a_start_under_an_active_plan_is_notified_at_once() {
-    let (_dir, mut session, exec) = registered().await;
-    let now = Timestamp::now();
-    let d = now + Duration::from_secs(300);
-    session.on_interruption(d, now).await.unwrap();
-
-    let ids = (AllocationId::new(), AttemptId::new(), JobId::new());
-    let reports = session
-        .handle_command_settled(command(1, 1, 2, start_body(ids, None)))
-        .await
-        .unwrap();
-    assert!(super::is_running_report(&reports[..1]));
-    let reported = notices(&reports);
-    assert_eq!(reported.len(), 1);
-    assert_eq!(reported[0].0, ids.0);
-    assert_eq!(exec.signals_delivered(ids.0), vec![NoticeSignal::Sigusr1]);
-    assert_eq!(session.state().marks[&ids.0].stop_at, t_stop(d));
+/// Assert `reports` answer `ids`' StartJob with the door's refusal: a terminal
+/// `Preempted { reason }` with runtime 0, its tombstone journaled, and no
+/// intent, container or exit behind it.
+fn assert_refused_at_door(
+    session: &TestSession,
+    exec: &FakeExecutor,
+    reports: &[pb::AgentReport],
+    (alloc, _, _): (AllocationId, AttemptId, JobId),
+    reason: PreemptReason,
+) {
+    assert_eq!(reports.len(), 1, "one terminal status: {reports:?}");
+    assert_eq!(
+        terminal_outcome(reports),
+        Some(AttemptOutcome::Preempted { reason })
+    );
+    let pb::agent_report::Body::AttemptStatus(status) = reports[0].body.clone().unwrap() else {
+        panic!("AttemptStatus");
+    };
+    assert_eq!(status.runtime_us, 0);
+    assert!(!session.state().intents.contains_key(&alloc), "no intent");
+    assert_eq!(
+        session.state().tombstones.get(&alloc),
+        Some(&crate::journal::TombstoneReason::Preempt { reason })
+    );
+    assert_eq!(exec.start_count(alloc), 0, "nothing was started");
+    assert!(!session.state().exits.contains_key(&alloc), "no exit");
+    assert!(session.outstanding_live_work().is_empty());
 }
 
-/// A start whose plan stop has already passed when it reaches the agent
-/// never launches (ADR 0044 §5: at `T_stop` the plan stops what remains,
-/// "including containers still starting"): it resolves as the plan's
-/// preemption, runtime 0, with nothing signalled.
+/// An agent announcing `draining` for an interruption admits nothing
+/// (ADR 0044 §5): a StartJob arriving under the plan — whether or not its
+/// stop time has passed — is refused at the door as the interruption's
+/// preemption, and a re-delivery answers the same from the tombstone.
 #[tokio::test]
-async fn a_start_whose_stop_time_has_passed_never_launches() {
-    let (_dir, mut session, exec) = registered().await;
-    exec.set_now(Timestamp::now());
-    let now = exec.now();
-    // D is 35 s out: T_stop = D − 30 s − 10 s is already 5 s past.
+async fn a_start_under_an_interruption_is_refused_at_the_door() {
+    let (dir, mut session, exec) = registered().await;
+    let now = Timestamp::now();
+    // T_stop = D − 30 s − 10 s is well ahead.
     session
-        .on_interruption(now + Duration::from_secs(35), now)
+        .on_interruption(now + Duration::from_secs(300), now)
         .await
         .unwrap();
     let ids = (AllocationId::new(), AttemptId::new(), JobId::new());
@@ -612,16 +621,45 @@ async fn a_start_whose_stop_time_has_passed_never_launches() {
         .handle_command_settled(command(1, 1, 2, start_body(ids, None)))
         .await
         .unwrap();
+    assert_refused_at_door(&session, &exec, &reports, ids, INTERRUPTED);
     assert!(notices(&reports).is_empty(), "nothing ran to be noticed");
-    assert_eq!(terminal_outcome(&reports), Some(PREEMPTED));
-    assert_eq!(exec.start_count(ids.0), 0, "no container was launched");
-    assert_eq!(
-        session.state().tombstones.get(&ids.0),
-        Some(&crate::journal::TombstoneReason::Preempt {
-            reason: INTERRUPTED
-        })
-    );
-    assert!(session.outstanding_live_work().is_empty());
+    assert!(exec.signals_delivered(ids.0).is_empty());
+
+    // Re-delivered after a restart: the tombstone answers the same.
+    drop(session);
+    let mut session = restarted(&dir, &exec);
+    register(&mut session, 1, 2, 1).await;
+    let reports = session
+        .handle_command_settled(command(1, 2, 2, start_body(ids, None)))
+        .await
+        .unwrap();
+    assert_refused_at_door(&session, &exec, &reports, ids, INTERRUPTED);
+}
+
+/// The agent's own shutdown drain (ADR 0041) announces `draining` too, and
+/// closes the door the same way, as a drain.
+#[tokio::test]
+async fn a_start_during_the_agents_shutdown_drain_is_refused_at_the_door() {
+    let (_dir, mut session, exec) = registered().await;
+    session.set_draining(true);
+    let ids = (AllocationId::new(), AttemptId::new(), JobId::new());
+    let reports = session
+        .handle_command_settled(command(1, 1, 2, start_body(ids, None)))
+        .await
+        .unwrap();
+    assert_refused_at_door(&session, &exec, &reports, ids, PreemptReason::Drain);
+
+    // A start whose own launch bound has passed still answers Revoked.
+    let stale = (AllocationId::new(), AttemptId::new(), JobId::new());
+    let body = start_body_with(stale, |sj| {
+        sj.latest_start_us = Some((Timestamp::now() - secs(1)).as_micros());
+    });
+    let reports = session
+        .handle_command_settled(command(1, 1, 3, body))
+        .await
+        .unwrap();
+    assert_eq!(terminal_outcome(&reports), Some(AttemptOutcome::Revoked));
+    assert_eq!(exec.start_count(stale.0), 0);
 }
 
 // ---- readiness ----
