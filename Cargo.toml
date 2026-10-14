@@ -109,7 +109,7 @@ jsonwebtoken = "9"
 openraft = { version = "0.9", features = ["storage-v2", "generic-snapshot-data"] }
 # The public client listener (ADR 0031): JSON-over-HTTP on
 # `listen.client_addr`, serving proto3-JSON bodies of `coppice.api.v1`
-# messages. 0.7 rides the same hyper-1 stack tonic 0.12 already pulls in.
+# messages. 0.7 rides the same hyper-1 stack tonic already pulls in.
 axum = "0.7"
 # Embeds `web/dist` into the coordinator so the same client listener serves
 # the UI (ADR 0031, "Serving the UI"): release builds carry the assets in
@@ -120,13 +120,13 @@ mime_guess = "2"
 # `ServiceExt::oneshot` drives the axum router: in tests without a listener,
 # and in the coordinator's own TLS serving path, where each accepted connection
 # hands hyper a service over the shared router. Version tracks what axum
-# 0.7/tonic 0.12 already depend on.
+# 0.7 and tonic already depend on.
 tower = { version = "0.5", features = ["util"] }
 # The HTTP/1+2 server behind the client listener's TLS posture (ADR 0037 §4).
 # `axum::serve` only accepts a bare `TcpListener`, so a listener that terminates
 # TLS itself must drive hyper directly: `hyper-util`'s auto builder negotiates
 # h2/http1 per connection and `TokioIo` adapts the rustls stream. Same hyper-1
-# stack axum 0.7 and tonic 0.12 already resolve — no second HTTP
+# stack axum 0.7 and tonic already resolve — no second HTTP
 # implementation enters the tree.
 hyper = { version = "1", default-features = false, features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", default-features = false, features = ["server-auto", "tokio"] }
@@ -141,10 +141,10 @@ hyper-util = { version = "0.1", default-features = false, features = ["server-au
 # Mozilla's bundle. Both sets are loaded; neither alone covers the field.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "rustls-tls-native-roots"] }
 proptest = "1"
-prost = "0.13"
-prost-build = "0.13"
-prost-types = "0.13"
-protox = "0.7"
+prost = "0.14"
+prost-build = "0.14"
+prost-types = "0.14"
+protox = "0.10"
 # Certificate and CSR generation/signing (ring provider, avoiding the aws-lc
 # build toolchain). Used both as test-only mTLS material for the Raft transport
 # (ADR 0011) and — from `coppice-tls::pki` only — as the cluster-owned CA and
@@ -181,13 +181,17 @@ tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 # gRPC transport for coordinator↔coordinator Raft traffic and the membership
 # admin surface; TLS because intra-cluster traffic is mTLS from day one
-# (ADR 0011). tonic 0.12 matches the workspace's prost 0.13 pin.
-tonic = { version = "0.12", features = ["tls"] }
-tonic-build = "0.12"
+# (ADR 0011). `tls-ring` keeps tonic's rustls on the ring provider, matching
+# the rest of the workspace. Since tonic 0.14 the prost codec and codegen live
+# in `tonic-prost` / `tonic-prost-build`, which move in lockstep with tonic and
+# match the workspace's prost pin.
+tonic = { version = "0.14", features = ["tls-ring"] }
+tonic-prost = "0.14"
+tonic-prost-build = "0.14"
 # Hot-reloadable coordinator TLS material (ADR 0037 §4): `coppice-tls` hand-rolls
 # a tokio-rustls acceptor whose per-connection `ServerConfig` is resolved from an
 # `ArcSwap` at handshake time, so a cert/key/CA rotation on disk is picked up
-# without a restart. Pinned to the exact rustls/tokio-rustls versions tonic 0.12
+# without a restart. Pinned to the exact rustls/tokio-rustls versions tonic
 # already resolves (ring provider only — the workspace deliberately avoids the
 # aws-lc-rs build toolchain, matching tonic's own feature selection) so the whole
 # graph shares one rustls.

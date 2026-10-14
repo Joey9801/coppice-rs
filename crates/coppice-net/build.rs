@@ -5,7 +5,7 @@
 //!
 //! Compiles the whole `proto/` corpus with `protox` (pure-Rust, no system
 //! `protoc`), exactly like `crates/coppice-proto/build.rs`, then hands the
-//! descriptor set to `tonic-build`. Every message package is `extern_path`ed
+//! descriptor set to `tonic-prost-build`. Every message package is `extern_path`ed
 //! to `coppice_proto::pb`, so prost regenerates none of the message types —
 //! the only output is the client/server code for the services, which
 //! references the message types owned by `coppice-proto`.
@@ -27,7 +27,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // Point every message package at coppice-proto's generated types so no
     // message struct is regenerated here — only the service glue is emitted.
-    tonic_build::configure()
+    tonic_prost_build::configure()
         .build_client(true)
         .build_server(true)
         .extern_path(".coppice.core.v1", "::coppice_proto::pb::core::v1")
