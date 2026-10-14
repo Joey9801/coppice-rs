@@ -54,8 +54,9 @@ Configuration then goes at:
 
 Then `systemctl enable --now coppice-coordinator` (or `coppice-agent`).
 
-An agent host must have Docker installed **before** the agent unit starts: the
-unit's `SupplementaryGroups=docker` is resolved by systemd, not by the daemon,
+An agent host must have Docker 25.0 or newer (Engine API 1.44) installed
+**before** the agent unit starts (the AWS demo installs current `docker-ce`
+from Docker's own apt repository). The `SupplementaryGroups=docker` is resolved by systemd, not by the daemon,
 so on a host with no `docker` group the unit dies with `status=216/GROUP`
 before `ExecStart` runs. `Restart=always` makes that self-healing — the unit
 retries until the group exists — but cloud-init should install Docker first

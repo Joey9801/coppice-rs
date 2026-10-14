@@ -546,7 +546,7 @@ mod harness {
 
     /// [`executor_with_telemetry`] over a **caller-supplied** [`ExecutorConfig`] —
     /// the poll-mode disk-metric test needs `disk_enforcement = Poll` with a short
-    /// `disk_poll_interval` so the enforcer's `GET /system/df` sweep populates the
+    /// `disk_poll_interval` so the enforcer's container-list sweep populates the
     /// shared `DiskReadings` the samplers read `disk_writable_bytes` from. Same
     /// single both-kinds filesystem sink and fast 1s metrics interval as
     /// [`executor_with_telemetry`]; the `FilesystemSinkOptions` are left at their
@@ -3598,10 +3598,10 @@ async fn interleaved_stdout_stderr_streams_are_tagged() {
 
 // ---- 32. poll-mode disk_writable_bytes reaches stored metric samples (§8.1/§6.2) -
 
-/// Under the poll disk strategy the enforcer's `GET /system/df` sweep records
+/// Under the poll disk strategy the enforcer's container-list sweep records
 /// each container's writable-layer `SizeRw` into the shared `DiskReadings`, and
 /// the metrics sampler reads that as `disk_writable_bytes`. This exercises the
-/// whole chain end to end — df sweep → DiskReadings → sampler → filesystem store.
+/// whole chain end to end — poll sweep → DiskReadings → sampler → filesystem store.
 /// A container writes ~2 MiB into its writable layer then idles; a stored metric
 /// sample must eventually carry `disk_writable_bytes > 0`. `disk_image_bytes > 0`
 /// rides along on the same sample (the constant per-attempt image size the
@@ -3635,7 +3635,7 @@ async fn poll_mode_disk_reading_reaches_metric_samples() {
             "sh",
             "-c",
             // /tmp is world-writable (1777) in busybox and, with no tmpfs mount in
-            // our HostConfig, lands in the overlay writable layer df's SizeRw counts;
+            // our HostConfig, lands in the overlay writable layer SizeRw counts;
             // the container runs as a non-root uid and cannot write at `/`.
             "dd if=/dev/zero of=/tmp/fill bs=1024 count=2048 2>/dev/null; sleep 300",
         ],
@@ -3648,10 +3648,10 @@ async fn poll_mode_disk_reading_reaches_metric_samples() {
     let r: anyhow::Result<()> = async {
         exec.start(sp).await?;
         // Poll until a stored sample shows a nonzero writable-layer reading. The
-        // deadline is generous: recording SizeRw needs a df sweep (2s floor) AFTER
-        // the fill lands, then a sampler tick to store it, and Colima's df
-        // accounting can lag. Do NOT weaken this to `>= 0` — a zero would mean the
-        // df → DiskReadings → sampler wiring is broken (e.g. a wrong disk-mode
+        // deadline is generous: recording SizeRw needs a poll sweep (2s floor)
+        // AFTER the fill lands, then a sampler tick to store it, and Colima's
+        // size accounting can lag. Do NOT weaken this to `>= 0` — a zero would mean the
+        // sweep → DiskReadings → sampler wiring is broken (e.g. a wrong disk-mode
         // label), which is exactly what this test exists to catch.
         let deadline = tokio::time::Instant::now() + StdDuration::from_secs(60);
         let sample = loop {
@@ -3662,7 +3662,7 @@ async fn poll_mode_disk_reading_reaches_metric_samples() {
             ensure!(
                 tokio::time::Instant::now() < deadline,
                 "no metric sample reported disk_writable_bytes > 0 within 60s \
-                 (df sweep → DiskReadings → sampler wiring); {} sample(s) seen so far",
+                 (poll sweep → DiskReadings → sampler wiring); {} sample(s) seen so far",
                 samples.len()
             );
             tokio::time::sleep(StdDuration::from_millis(500)).await;

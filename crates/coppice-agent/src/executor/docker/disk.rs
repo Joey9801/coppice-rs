@@ -13,9 +13,10 @@
 //!   fills its budget sees `ENOSPC` and exits on its own (a natural exit).
 //! - **Poll fallback:** [`spawn`] runs a serial sweep every
 //!   `disk_poll_interval` that reads writable-layer usage through the Docker
-//!   API only (`GET /system/df`, with a single-container `ContainerInspect`
-//!   recheck before any kill verdict) and kills a container past its budget
-//!   outright, reporting [`ExitCause::DiskKilled`].
+//!   API only (a label-filtered `GET /containers/json?size=true`, with a
+//!   single-container `ContainerInspect` recheck before any kill verdict) and
+//!   kills a container past its budget outright, reporting
+//!   [`ExitCause::DiskKilled`].
 //!
 //! The pure pieces — budget arithmetic, the strategy decision, and the
 //! over-budget verdict — are factored out and unit-tested without a daemon
@@ -29,8 +30,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration as StdDuration;
 
 use bollard::query_parameters::{
-    DataUsageOptions, InspectContainerOptionsBuilder, KillContainerOptionsBuilder,
-    ListContainersOptionsBuilder, ListImagesOptionsBuilder, RemoveContainerOptions,
+    InspectContainerOptionsBuilder, KillContainerOptionsBuilder, ListContainersOptionsBuilder,
+    ListImagesOptionsBuilder, RemoveContainerOptions,
 };
 use bollard::Docker;
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
@@ -50,8 +51,8 @@ use crate::executor::{ExecutorError, ExitCause, ExitEvent, StartError};
 // ---- metrics (docker-executor.md §8.1) ----------------------------------
 
 /// Wall-clock duration of one poll sweep, pushed per sweep. A histogram: the
-/// design flags these `GET /system/df` + `ContainerInspect` calls as daemon-side
-/// expensive, so the distribution (not just a mean) is what an operator watches.
+/// design flags these sized container-list + `ContainerInspect` calls as
+/// daemon-side expensive, so the distribution (not just a mean) is what an operator watches.
 const AGENT_DISK_POLL_DURATION: &str = "agent_disk_poll_duration_seconds";
 /// Hard-limit kills, labelled by `kind` (docker-executor.md §8.1: "limit kills
 /// by kind"). Incremented with `kind = "disk"` per [`ExitCause::DiskKilled`]
@@ -190,7 +191,7 @@ pub(crate) fn writable_budget(
 /// absent `size_rw` (the daemon has not sized the writable layer) is never over
 /// budget. A budget of zero means any positive usage is over.
 ///
-/// `size_rw` stays a raw `Option<i64>`: it is Docker's inspect/df field as the
+/// `size_rw` stays a raw `Option<i64>`: it is Docker's inspect/list field as the
 /// API hands it over, negatives and all, and the sign check *is* the crossing
 /// into a `ByteSize`.
 pub(crate) fn over_budget(size_rw: Option<i64>, budget: ByteSize) -> bool {
@@ -560,13 +561,19 @@ async fn run(
     }
 }
 
-/// One `GET /system/df` sweep: for every container carrying
-/// `coppice.disk-mode = poll` and *this node's* `coppice.node` label, with a
-/// parseable budget label, whose `SizeRw` is over budget, recheck with a
+/// One sweep over this node's poll-enforced containers, listed by
+/// `GET /containers/json?all=true&size=true` filtered server-side on the
+/// `coppice.node = <node>` and `coppice.disk-mode = poll` labels: for every one
+/// with a parseable budget label whose `SizeRw` is over budget, recheck with a
 /// single-container inspect and, if still over, kill it (docker-executor.md
 /// §6.2). The node filter keeps the kill authority scoped to containers this
 /// executor owns — another agent's containers on a shared daemon (in practice:
-/// the concurrent integration tests) are never this enforcer's to kill.
+/// the concurrent integration tests) are never this enforcer's to kill. The
+/// same checks are repeated on each returned row as defence in depth.
+///
+/// `all`, because exited containers stay in place as evidence until the
+/// session reaps them (§5): one whose exit has not been claimed yet is still
+/// swept, and the kill path's already-exited branch surfaces it.
 async fn sweep(
     docker: &Docker,
     state: &Mutex<ExecutorState>,
@@ -575,8 +582,23 @@ async fn sweep(
     node: &str,
     readings: &DiskReadings,
 ) -> Result<(), bollard::errors::Error> {
-    let usage = docker.df(None::<DataUsageOptions>).await?;
-    let containers = usage.containers.unwrap_or_default();
+    let mut filters = HashMap::new();
+    filters.insert(
+        "label".to_string(),
+        vec![
+            format!("{LABEL_NODE}={node}"),
+            format!("{LABEL_DISK_MODE}={}", DiskMode::Poll.label_value()),
+        ],
+    );
+    let containers = docker
+        .list_containers(Some(
+            ListContainersOptionsBuilder::new()
+                .all(true)
+                .size(true)
+                .filters(&filters)
+                .build(),
+        ))
+        .await?;
     // Rebuilt from scratch each sweep and swapped in at the end, so a departed
     // container's stale reading never lingers for the samplers (§8.1).
     let mut fresh: HashMap<AllocationId, u64> = HashMap::new();
@@ -626,7 +648,7 @@ async fn sweep(
         }
 
         // Recheck with the single-container ground truth before any verdict:
-        // df's SizeRw can lag, and a kill is irreversible.
+        // the list's SizeRw can lag, and a kill is irreversible.
         let recheck = docker
             .inspect_container(
                 target,
@@ -642,7 +664,7 @@ async fn sweep(
             }
         };
         if !over_budget(inspect.size_rw, budget) {
-            continue; // df was stale; not actually over budget
+            continue; // the list was stale; not actually over budget
         }
 
         kill_over_budget(docker, state, cpuset, exit_tx, allocation, target, budget).await;

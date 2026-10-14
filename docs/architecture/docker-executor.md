@@ -403,7 +403,9 @@ the info fields are just the log message.
 
 **Poll fallback.** Everywhere else: a poller (default every 30s, config)
 reads writable-layer usage through the Docker API only — one
-`GET /system/df` sweep for all containers' `SizeRw`, with
+`GET /containers/json?all=true&size=true` sweep, filtered server-side to
+this node's poll-mode containers by the `coppice.node` and
+`coppice.disk-mode` labels, for each container's `SizeRw`, with
 `ContainerInspect(size=true)` as the single-container recheck before a
 kill verdict. (Docker's documentation explicitly advises against
 measuring the overlay2 directories directly; the executor never touches

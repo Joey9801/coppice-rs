@@ -32,12 +32,23 @@ retry() {
 export DEBIAN_FRONTEND=noninteractive
 
 retry "apt-get update" apt-get update
-# `docker.io` is installed here and not later because the agent unit's
-# `SupplementaryGroups=docker` is resolved by systemd, not by the daemon: on a
-# host with no `docker` group the unit dies with status=216/GROUP before
-# ExecStart runs. `Restart=always` would eventually recover, but there is no
+retry "apt-get install" apt-get install -y ca-certificates curl jq unzip
+
+# Docker comes from Docker's own apt repository rather than Ubuntu's
+# `docker.io`, so the demo runs a current Docker release; the agent itself only
+# needs Docker 25.0 (Engine API 1.44). It is installed here and not later
+# because the agent unit's `SupplementaryGroups=docker` is resolved by systemd,
+# not by the daemon: on a host with no `docker` group the unit dies with
+# status=216/GROUP before ExecStart runs. `Restart=always` would eventually recover, but there is no
 # reason to make it.
-retry "apt-get install" apt-get install -y curl jq unzip docker.io
+install -m 0755 -d /etc/apt/keyrings
+retry "docker apt key" curl -fsSL -o /etc/apt/keyrings/docker.asc https://download.docker.com/linux/ubuntu/gpg
+chmod a+r /etc/apt/keyrings/docker.asc
+. /etc/os-release
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $VERSION_CODENAME stable" \
+  >/etc/apt/sources.list.d/docker.list
+retry "apt-get update" apt-get update
+retry "docker install" apt-get install -y docker-ce docker-ce-cli containerd.io
 
 # Ubuntu 24.04 ships no `awscli` apt package (noble dropped it; the snap is
 # the only Canonical route, and snapd seeding on first boot is slow and
