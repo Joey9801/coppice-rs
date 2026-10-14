@@ -414,15 +414,26 @@ fn key_algorithm(jwk: &jsonwebtoken::jwk::Jwk) -> Option<Algorithm> {
         },
         AlgorithmParameters::RSA(_) => Some(Algorithm::RS256),
         AlgorithmParameters::OctetKeyPair(_) => Some(Algorithm::EdDSA),
-        AlgorithmParameters::OctetKey(_) => None,
+        // A shared secret, or a key type this crate has no verifier for.
+        _ => None,
     }
 }
 
-/// `Some(alg)` only for the asymmetric algorithms.
+/// `Some(alg)` only for the asymmetric algorithms. An allowlist, so an
+/// algorithm a later jsonwebtoken adds (the enum is non-exhaustive) is refused
+/// until it is reviewed here.
 pub(crate) fn asymmetric(alg: Algorithm) -> Option<Algorithm> {
     match alg {
-        Algorithm::HS256 | Algorithm::HS384 | Algorithm::HS512 => None,
-        other => Some(other),
+        Algorithm::ES256
+        | Algorithm::ES384
+        | Algorithm::RS256
+        | Algorithm::RS384
+        | Algorithm::RS512
+        | Algorithm::PS256
+        | Algorithm::PS384
+        | Algorithm::PS512
+        | Algorithm::EdDSA => Some(alg),
+        _ => None,
     }
 }
 
