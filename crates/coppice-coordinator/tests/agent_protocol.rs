@@ -871,7 +871,9 @@ async fn stale_fenced_command_is_rejected_by_the_agent() {
         .client_ca_root(Certificate::from_pem(&ca.pem))
         .client_auth_optional(false);
     let addr = format!("127.0.0.1:{port}").parse().expect("scripted addr");
-    let incoming = TcpIncoming::new(addr, true, None).expect("bind scripted listener");
+    let incoming = TcpIncoming::bind(addr)
+        .expect("bind scripted listener")
+        .with_nodelay(Some(true));
     let server = tokio::spawn(async move {
         TonicServer::builder()
             .tls_config(tls)
