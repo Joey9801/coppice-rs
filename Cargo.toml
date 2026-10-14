@@ -246,7 +246,7 @@ metrics-util = { version = "0.19", default-features = false, features = [
 nix = { version = "0.30", features = ["fs", "user"] }
 # Node configuration is one TOML file per process (ADR 0020), with humane
 # duration strings ("1500ms") parsed at load.
-toml = "0.8"
+toml = "1"
 humantime-serde = "1"
 # Seed discovery (ADR 0037 §2): the `dns` backend resolves one name per
 # consultation. `system-config` reads `/etc/resolv.conf`; `tokio` runs the
