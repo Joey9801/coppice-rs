@@ -1,4 +1,5 @@
 import { formatRelativeTime, formatTimestamp } from '@/lib/format'
+import { useNow } from '@/lib/use-now'
 import { Badge } from '@/components/ui/badge'
 
 /**
@@ -7,13 +8,15 @@ import { Badge } from '@/components/ui/badge'
  */
 export function InterruptionBadge({
   deadline,
-  now = new Date(),
+  now: nowProp,
   className,
 }: {
   deadline: Date
   now?: Date
   className?: string
 }) {
+  const ticking = useNow()
+  const now = nowProp ?? ticking
   return (
     <Badge
       variant="destructive"

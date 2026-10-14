@@ -1,15 +1,18 @@
 import type { AttemptPreemption } from '@/api/types'
 import { formatDuration, formatRelativeTime, formatTimestamp } from '@/lib/format'
+import { useNow } from '@/lib/use-now'
 import { IdLink, preemptReasonLabel } from '@/components'
 
 /** An attempt's termination record (ADR 0044 §3), one line under its attempts-table row. */
 export function AttemptPreemptionDetail({
   preemption,
-  now = new Date(),
+  now: nowProp,
 }: {
   preemption: AttemptPreemption
   now?: Date
 }) {
+  const ticking = useNow()
+  const now = nowProp ?? ticking
   const { reason, forJob, requestedAt, notifiedAt, deadline, noticeShortfallSeconds } = preemption
   return (
     <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
