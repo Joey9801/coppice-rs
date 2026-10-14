@@ -861,7 +861,7 @@ impl Consensus for OpenraftConsensus {
         // transfer, which is a network round-trip and a replicated write, so
         // membership may have moved underneath it.
         let voters = self.voter_ids();
-        let removal_settled = remove.map_or(true, |departed| !self.is_member(departed));
+        let removal_settled = remove.is_none_or(|departed| !self.is_member(departed));
         if voters.contains(&promote) && removal_settled {
             return Ok(());
         }

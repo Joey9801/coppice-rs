@@ -22,7 +22,7 @@ members = [
 [workspace.package]
 version = "0.0.1"
 edition = "2021"
-rust-version = "1.79"
+rust-version = "1.94.1"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Joey9801/coppice-rs"
 authors = ["The Coppice Authors"]
@@ -84,9 +84,6 @@ chrono = { version = "0.4", features = ["serde"] }
 crc32c = "0.6"
 # Benchmark harness for the ADR 0018 storage benchmark suite.
 criterion = "0.5"
-# Advisory file locking for the storage LOCK file (ADR 0017); std gains
-# File::lock only after our 1.79 MSRV.
-fs2 = "0.4"
 # Immutable ordered maps with structural sharing (KOI-5): the job-scaled maps
 # in the replicated `StateMachine` use `imbl::OrdMap` so view publication and
 # snapshot capture clone the whole state in O(1) instead of deep-copying

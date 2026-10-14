@@ -18,7 +18,6 @@ coppice-state.workspace = true
 # material when its generation advances.
 coppice-tls.workspace = true
 crc32c.workspace = true
-fs2.workspace = true
 metrics.workspace = true
 openraft.workspace = true
 prost.workspace = true

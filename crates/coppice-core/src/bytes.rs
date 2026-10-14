@@ -246,7 +246,7 @@ impl ByteSize {
             .iter()
             .rev()
             .copied()
-            .find(|unit| bytes % unit_multiplier(*unit) == 0)
+            .find(|unit| bytes.is_multiple_of(unit_multiplier(*unit)))
             .unwrap_or(Unit::B);
         format!("{} {unit}", bytes / unit_multiplier(unit))
     }

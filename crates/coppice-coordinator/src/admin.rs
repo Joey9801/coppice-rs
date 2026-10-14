@@ -1188,7 +1188,7 @@ impl<C: Consensus> RaftAdminService for AdminService<C> {
             Some(m) if m.addr == req.address => {
                 let binding_settled = bound_addr
                     .as_deref()
-                    .map_or(true, |bound| bound == req.address);
+                    .is_none_or(|bound| bound == req.address);
                 if binding_settled {
                     return Ok(Response::new(pb::SetNodeAddressResponse {}));
                 }

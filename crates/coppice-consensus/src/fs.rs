@@ -258,7 +258,7 @@ pub struct RealLock {
 impl Drop for RealLock {
     fn drop(&mut self) {
         // Unlock explicitly for clarity; closing the fd would release it too.
-        let _ = fs2::FileExt::unlock(&self.file);
+        let _ = self.file.unlock();
     }
 }
 
@@ -278,7 +278,8 @@ impl Fs for RealFs {
             .create(true)
             .truncate(false)
             .open(self.full(path)?)?;
-        fs2::FileExt::try_lock_exclusive(&file)?;
+        // A held lock surfaces as `io::ErrorKind::WouldBlock`, as SimFs does.
+        file.try_lock()?;
         Ok(RealLock { file })
     }
 
