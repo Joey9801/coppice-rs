@@ -163,7 +163,11 @@ struct RunningAgent {
 impl RunningAgent {
     /// `GET <probe_base><path>`, answering the status and decoded JSON body.
     async fn probe(&self, path: &str) -> (reqwest::StatusCode, serde_json::Value) {
-        let response = reqwest::get(format!("{}{path}", self.probe_base))
+        let response = coppice_tls::HttpTls::no_roots()
+            .reqwest_client()
+            .expect("http client")
+            .get(format!("{}{path}", self.probe_base))
+            .send()
             .await
             .expect("the agent's operational listener must answer");
         let status = response.status();
@@ -1159,7 +1163,9 @@ async fn node_usage_rides_the_heartbeat_to_the_read_surfaces() {
     };
     world.executor.set_usage(Some(used));
 
-    let client = reqwest::Client::new();
+    let client = coppice_tls::HttpTls::no_roots()
+        .reqwest_client()
+        .expect("http client");
     let node = world.node;
     let overview_url = world.coord.api("/api/v1/overview");
 

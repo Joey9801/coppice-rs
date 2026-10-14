@@ -17,7 +17,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 ///   a compromised or misconfigured IdP would point key fetches somewhere else.
 ///   A redirect surfaces as a non-2xx status and becomes a fetch failure, which
 ///   is exactly the visible outcome we want.
-/// - **rustls with the built-in roots.** An IdP is a public-internet service
+/// - **rustls with the built-in roots** ([`coppice_tls::HttpTls`]). An IdP is a public-internet service
 ///   fronted by a public CA; there is no cluster-CA relationship here.
 /// - **a bounded timeout**, so a dark IdP costs a backoff cycle, not a task.
 ///
@@ -27,11 +27,11 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// runtime condition — every other caller of `reqwest::Client::builder` in the
 /// workspace treats it the same way.
 pub fn default_http_client() -> reqwest::Client {
-    reqwest::Client::builder()
+    coppice_tls::HttpTls::built_in_roots()
+        .reqwest_builder()
+        .expect("build the OIDC client's TLS config")
         .redirect(reqwest::redirect::Policy::none())
         .timeout(REQUEST_TIMEOUT)
-        .use_rustls_tls()
-        .tls_built_in_root_certs(true)
         .build()
         .expect("build the OIDC HTTP client")
 }

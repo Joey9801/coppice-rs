@@ -88,7 +88,11 @@ async fn a_fresh_daemon_parks_and_serves_only_readyz_and_the_admin_socket() {
     assert_eq!(serde_json::to_value(status.phase).unwrap(), "waiting");
 
     // The client API is not served at all.
-    let response = reqwest::get(daemon.api("/api/v1/overview"))
+    let response = coppice_tls::HttpTls::no_roots()
+        .reqwest_client()
+        .expect("http client")
+        .get(daemon.api("/api/v1/overview"))
+        .send()
         .await
         .expect("client listener is up");
     assert_eq!(response.status().as_u16(), 404);
@@ -155,7 +159,9 @@ async fn a_never_attempted_waiting_daemon_refuses_enrollment_and_membership_unti
     // so `/enroll` is not merely unauthenticated — it does not exist. Asserted
     // with a *well-formed* enrollment request (the shape `coppice-enroll`
     // sends), so a 404 cannot be confused with a rejected body.
-    let client = reqwest::Client::new();
+    let client = coppice_tls::HttpTls::no_roots()
+        .reqwest_client()
+        .expect("http client");
     let enroll = daemon.api("/api/v1/enroll");
     let response = client
         .post(&enroll)
@@ -271,7 +277,11 @@ async fn init_forms_a_single_voter_cluster_opens_the_api_and_stamps_the_marker()
 
     // Step 6 ran: the seeded quota entity is in replicated state, reachable
     // through the client API that formation opened.
-    let response = reqwest::get(daemon.api(&format!("/api/v1/quota-entities/{entity}")))
+    let response = coppice_tls::HttpTls::no_roots()
+        .reqwest_client()
+        .expect("http client")
+        .get(daemon.api(&format!("/api/v1/quota-entities/{entity}")))
+        .send()
         .await
         .expect("client API is served");
     assert_eq!(
@@ -599,7 +609,11 @@ async fn a_certless_daemon_parks_forms_and_resumes() {
         panic!("expected the certless daemon to form, got {reply:?}");
     };
     daemon.await_phase("voter").await;
-    let response = reqwest::get(daemon.api("/api/v1/overview"))
+    let response = coppice_tls::HttpTls::no_roots()
+        .reqwest_client()
+        .expect("http client")
+        .get(daemon.api("/api/v1/overview"))
+        .send()
         .await
         .expect("client API is served");
     assert_eq!(response.status().as_u16(), 200);
@@ -827,7 +841,11 @@ async fn assert_failed_and_closed(daemon: &mut Daemon, ca: &Ca) {
     assert!(reason.contains("coppice coordinator init"), "{reason}");
 
     // The client API is not served.
-    let response = reqwest::get(daemon.api("/api/v1/overview"))
+    let response = coppice_tls::HttpTls::no_roots()
+        .reqwest_client()
+        .expect("http client")
+        .get(daemon.api("/api/v1/overview"))
+        .send()
         .await
         .expect("client listener is up");
     assert_eq!(response.status().as_u16(), 404);
@@ -934,7 +952,11 @@ async fn a_stalled_client_cannot_wedge_the_parked_to_formed_handover() {
 
     // The full runtime takes the listeners despite the hostage connection.
     daemon.await_phase("voter").await;
-    let response = reqwest::get(daemon.api("/api/v1/overview"))
+    let response = coppice_tls::HttpTls::no_roots()
+        .reqwest_client()
+        .expect("http client")
+        .get(daemon.api("/api/v1/overview"))
+        .send()
         .await
         .expect("the client API is served after the handover");
     assert_eq!(response.status().as_u16(), 200);

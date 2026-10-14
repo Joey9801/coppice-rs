@@ -25,8 +25,19 @@ authors.workspace = true
 # the OS store, not in the bundle. A caller who wants neither (a plain-HTTP
 # coordinator, or their own pre-built `reqwest::Client`) turns default
 # features off and pays for no TLS stack at all.
+#
+# reqwest's own `rustls` feature brings the aws-lc-rs provider; this crate
+# builds its rustls config itself on the ring provider instead (reqwest's
+# `rustls-no-provider` plus a preconfigured `rustls::ClientConfig`), so it
+# neither needs the aws-lc toolchain nor touches the process-wide rustls
+# default provider.
 default = ["rustls-tls-native-roots"]
-rustls-tls-native-roots = ["reqwest/rustls-tls", "reqwest/rustls-tls-native-roots"]
+rustls-tls-native-roots = [
+    "reqwest/rustls-no-provider",
+    "dep:rustls",
+    "dep:webpki-roots",
+    "dep:rustls-native-certs",
+]
 
 [dependencies]
 # This crate publishes to crates.io on its own, so it deliberately depends on
@@ -46,8 +57,15 @@ thiserror = { workspace = true }
 # Declared locally, not `workspace = true`: the workspace entry turns on
 # `json`, `rustls-tls` and `rustls-tls-native-roots` unconditionally, and a
 # published client must let its TLS backend be a cargo feature (see
-# `[features]` above). `json` is the only feature always wanted.
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+# `[features]` above). `json` and `query` (URL query strings, a separate
+# feature since reqwest 0.13) are the only features always wanted.
+reqwest = { version = "0.13", default-features = false, features = ["json", "query"] }
+# The TLS backend's pieces, all behind `rustls-tls-native-roots`: rustls on the
+# ring provider (the version reqwest resolves, or its preconfigured-config hook
+# does not recognise the config), the Mozilla bundle, and the platform store.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+webpki-roots = { version = "1", optional = true }
+rustls-native-certs = { version = "0.8", optional = true }
 
 # Declared locally: the workspace entry is `features = ["full"]`, which pulls
 # in the whole runtime. Nothing here needs more than `tokio::time` — the log

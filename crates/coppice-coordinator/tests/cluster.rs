@@ -299,7 +299,9 @@ async fn a_leader_with_an_uncommittable_write_in_flight_still_shuts_down() {
     // One write, left parked inside the API server's request handler.
     let inflight = tokio::spawn(async move {
         let entity = QuotaEntityId::new();
-        reqwest::Client::new()
+        coppice_tls::HttpTls::no_roots()
+            .reqwest_client()
+            .expect("http client")
             .post(&url)
             .json(&serde_json::json!({
                 "entity": entity.to_string(),
@@ -368,7 +370,9 @@ async fn formed_stays_true_but_require_healthy_degrades_once_a_voter_dies() {
     fleet.await_voters(3).await;
 
     let leader_idx = fleet_leader_index(&fleet, 3).await;
-    let client = reqwest::Client::new();
+    let client = coppice_tls::HttpTls::no_roots()
+        .reqwest_client()
+        .expect("http client");
     let healthy_url = fleet.members[leader_idx].api("/readyz?require=healthy");
     poll(
         Duration::from_secs(30),
@@ -456,7 +460,9 @@ async fn a_flap_between_health_requests_still_resets_the_stability_window() {
     fleet.await_voters(3).await;
 
     let leader_idx = fleet_leader_index(&fleet, 3).await;
-    let client = reqwest::Client::new();
+    let client = coppice_tls::HttpTls::no_roots()
+        .reqwest_client()
+        .expect("http client");
     let healthy_url = fleet.members[leader_idx].api("/readyz?require=healthy");
     poll(
         Duration::from_secs(30),
@@ -583,7 +589,11 @@ async fn require_healthy_on_a_follower_is_health_unknown_with_a_leader_hint() {
         .as_u64()
         .expect("the leader reports its node id");
 
-    let resp = reqwest::get(fleet.members[follower_idx].api("/readyz?require=healthy"))
+    let resp = coppice_tls::HttpTls::no_roots()
+        .reqwest_client()
+        .expect("http client")
+        .get(fleet.members[follower_idx].api("/readyz?require=healthy"))
+        .send()
         .await
         .expect("follower readyz");
     assert_eq!(resp.status().as_u16(), 503);
@@ -648,7 +658,9 @@ async fn a_client_pointed_at_a_follower_submits_observes_and_aborts() {
         "the member every request below targets must actually be a follower"
     );
 
-    let client = reqwest::Client::new();
+    let client = coppice_tls::HttpTls::no_roots()
+        .reqwest_client()
+        .expect("http client");
 
     // (a) Create the quota entity the job will charge against, over the
     // follower. Pre-ADR-0038 this was a 421 REDIRECT; now the follower
@@ -985,7 +997,9 @@ async fn a_follower_reports_node_health_from_the_leaders_liveness_marks() {
     });
 
     // -- Read health through the follower, and only the follower. -----------
-    let client = reqwest::Client::new();
+    let client = coppice_tls::HttpTls::no_roots()
+        .reqwest_client()
+        .expect("http client");
     let follower = &fleet.members[follower_idx];
     assert!(
         follower.readyz().await.1["is_leader"] == false,

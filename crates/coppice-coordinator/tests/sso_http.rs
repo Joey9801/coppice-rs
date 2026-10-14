@@ -141,10 +141,11 @@ impl Cluster {
         }
         daemon.start();
 
-        let anon = reqwest::Client::builder()
-            .add_root_certificate(
-                reqwest::Certificate::from_pem(&server_root_pem).expect("serving root"),
-            )
+        let anon = coppice_tls::HttpTls::no_roots()
+            .extra_roots_pem(&server_root_pem)
+            .expect("serving root")
+            .reqwest_builder()
+            .expect("certless tls")
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("build the certless https client");
@@ -209,14 +210,16 @@ impl Cluster {
             .key_pem
             .as_ref()
             .expect("no CSR was supplied, so the cluster minted the keypair");
-        // reqwest's rustls identity takes one PEM blob: key then chain.
+        // The identity is one PEM blob: key then chain.
         let mut identity = key.clone().into_bytes();
         identity.extend_from_slice(self.operator.cert_pem.as_bytes());
-        reqwest::Client::builder()
-            .add_root_certificate(
-                reqwest::Certificate::from_pem(&self.server_root_pem).expect("serving root"),
-            )
-            .identity(reqwest::Identity::from_pem(&identity).expect("operator identity"))
+        coppice_tls::HttpTls::no_roots()
+            .extra_roots_pem(&self.server_root_pem)
+            .expect("serving root")
+            .identity_pem(&identity)
+            .expect("operator identity")
+            .reqwest_builder()
+            .expect("operator tls")
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("build the operator-certificate https client")
@@ -1461,7 +1464,9 @@ async fn open_mode_serves_every_request_as_an_anonymous_admin() {
     );
     daemon.await_phase("voter").await;
 
-    let client = reqwest::Client::builder()
+    let client = coppice_tls::HttpTls::no_roots()
+        .reqwest_builder()
+        .expect("http client tls")
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .expect("build the plain-http client");

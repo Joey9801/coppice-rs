@@ -942,7 +942,9 @@ async fn evicted_terminal_job_reads_degrade_rather_than_erroring() {
     }
 
     // -- Before eviction: the job is a perfectly ordinary read. -------------
-    let client = reqwest::Client::new();
+    let client = coppice_tls::HttpTls::no_roots()
+        .reqwest_client()
+        .expect("http client");
     let (status, body) = api_get(
         &client,
         &coord.api(&format!("/api/v1/jobs/{job}?min_index={abort_index}")),

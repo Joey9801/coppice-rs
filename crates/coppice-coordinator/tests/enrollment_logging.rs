@@ -108,7 +108,9 @@ async fn no_enrollment_path_ever_logs_the_token_secret() {
 
     // The same redemption over the public route, which reads the token from an
     // `Authorization` header and hands it to the same core.
-    let http = reqwest::Client::new();
+    let http = coppice_tls::HttpTls::no_roots()
+        .reqwest_client()
+        .expect("http client");
     let enroll_url = daemon.api(coppice_enroll::ENROLL_PATH);
     let (_key, http_csr) = pki::generate_key_and_csr().unwrap();
     let body = serde_json::to_string(&coppice_enroll::EnrollRequest {

@@ -152,7 +152,9 @@ async fn a_revocation_racing_an_in_flight_submission_resolves_in_log_order() {
         .await;
     await_voters(&fleet, &server_root_pem, &operator_base, 3).await;
 
-    let plain = reqwest::Client::builder()
+    let plain = coppice_tls::HttpTls::no_roots()
+        .reqwest_builder()
+        .expect("http client tls")
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .expect("build the plain-http client");
@@ -161,14 +163,16 @@ async fn a_revocation_racing_an_in_flight_submission_resolves_in_log_order() {
             .key_pem
             .as_ref()
             .expect("no CSR was supplied, so the cluster minted the keypair");
-        // reqwest's rustls identity takes one PEM blob: key then chain.
+        // The identity is one PEM blob: key then chain.
         let mut identity = key.clone().into_bytes();
         identity.extend_from_slice(operator_pem.cert_pem.as_bytes());
-        reqwest::Client::builder()
-            .add_root_certificate(
-                reqwest::Certificate::from_pem(&server_root_pem).expect("serving root"),
-            )
-            .identity(reqwest::Identity::from_pem(&identity).expect("operator identity"))
+        coppice_tls::HttpTls::no_roots()
+            .extra_roots_pem(&server_root_pem)
+            .expect("serving root")
+            .identity_pem(&identity)
+            .expect("operator identity")
+            .reqwest_builder()
+            .expect("operator tls")
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("build the operator-certificate https client")
@@ -378,12 +382,17 @@ async fn a_revocation_racing_an_in_flight_submission_resolves_in_log_order() {
 /// serves HTTPS: that helper polls `/readyz` over plain HTTP on every member,
 /// which the operator edge here does not answer.
 async fn await_voters(fleet: &Fleet, server_root_pem: &[u8], operator_base: &str, expected: usize) {
-    let plain = reqwest::Client::builder()
+    let plain = coppice_tls::HttpTls::no_roots()
+        .reqwest_builder()
+        .expect("http client tls")
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .expect("build the plain-http client");
-    let https = reqwest::Client::builder()
-        .add_root_certificate(reqwest::Certificate::from_pem(server_root_pem).expect("root"))
+    let https = coppice_tls::HttpTls::no_roots()
+        .extra_roots_pem(server_root_pem)
+        .expect("root")
+        .reqwest_builder()
+        .expect("https tls")
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .expect("build the https client");

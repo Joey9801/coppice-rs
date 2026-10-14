@@ -112,7 +112,9 @@ async fn mint_with_ttl(
 /// enrollment token must not be told to re-send it somewhere else, and the
 /// tests below assert that by refusing to do it.
 fn http() -> reqwest::Client {
-    reqwest::Client::builder()
+    coppice_tls::HttpTls::no_roots()
+        .reqwest_builder()
+        .expect("http client tls")
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(20))
         .build()
@@ -719,9 +721,10 @@ async fn a_client_certificate_is_refused_on_enroll_and_renews_on_the_machine_pla
     // `Daemon::await_phase` polls `/readyz` over plain HTTP, which this
     // daemon no longer serves once `set_client_tls` is in effect — poll the
     // same surface over HTTPS instead.
-    let root_only = reqwest::Client::builder()
-        .add_root_certificate(reqwest::Certificate::from_pem(&server_root_pem).expect("root"))
-        .build()
+    let root_only = coppice_tls::HttpTls::no_roots()
+        .extra_roots_pem(&server_root_pem)
+        .expect("root")
+        .reqwest_client()
         .expect("build the https polling client");
     await_https_phase(&root_only, &https_base, "waiting").await;
     let reply = daemon
@@ -791,16 +794,15 @@ async fn a_client_certificate_is_refused_on_enroll_and_renews_on_the_machine_pla
     .await;
     let (_key, fresh_csr) = pki::generate_key_and_csr().unwrap();
 
-    let root = reqwest::Certificate::from_pem(&server_root_pem).expect("server root");
-    let with_cert = reqwest::Client::builder()
-        .add_root_certificate(root.clone())
-        .identity({
-            // reqwest's rustls identity takes one PEM blob: key then chain
-            // (see crates/coppice-coordinator/tests/client_tls.rs).
-            let mut pem = agent_key.clone();
-            pem.extend_from_slice(agent_leaf.cert_pem.as_bytes());
-            reqwest::Identity::from_pem(&pem).expect("client identity")
-        })
+    let root = coppice_tls::HttpTls::no_roots()
+        .extra_roots_pem(&server_root_pem)
+        .expect("server root");
+    let with_cert = root
+        .clone()
+        .identity_pem(&[agent_key.as_slice(), agent_leaf.cert_pem.as_bytes()].concat())
+        .expect("client identity")
+        .reqwest_builder()
+        .expect("client tls")
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .expect("build the client-cert https client");
@@ -825,8 +827,9 @@ async fn a_client_certificate_is_refused_on_enroll_and_renews_on_the_machine_pla
     // The same request WITHOUT the client certificate, same live token:
     // succeeds — proving the refusal above is about the presented
     // certificate, not about the request being malformed.
-    let certless = reqwest::Client::builder()
-        .add_root_certificate(root)
+    let certless = root
+        .reqwest_builder()
+        .expect("client tls")
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .expect("build the certless https client");

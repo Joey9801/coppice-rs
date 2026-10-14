@@ -131,15 +131,21 @@ tower = { version = "0.5", features = ["util"] }
 hyper = { version = "1", default-features = false, features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", default-features = false, features = ["server-auto", "tokio"] }
 # HTTP client for the `coppice job` verbs (ADR 0031): they talk to the
-# coordinator's JSON-over-HTTP client API. `rustls-tls` so no OpenSSL toolchain
-# is dragged in; `json` for typed request/response bodies. Default features are
-# off to keep the surface (and the dependency tree) minimal.
-# `rustls-tls-native-roots` alongside the webpki bundle so enrollment's
-# "ordinary system-root verification" (ADR 0037 §4) really means the platform
-# trust store: a cluster fronted by a corporate or private-PKI certificate is an
+# coordinator's JSON-over-HTTP client API. Also the OIDC/JWKS fetcher, the
+# enrollment client and the convergence probe. `json` for typed
+# request/response bodies; default features are off to keep the surface (and
+# the dependency tree) minimal. `rustls-no-provider` because reqwest's `rustls`
+# feature selects aws-lc-rs: every client is instead built with a
+# preconfigured ring-provider rustls config (`coppice_tls::HttpTls`), which
+# also carries the trust store — the Mozilla bundle (`webpki-roots`) *and* the
+# platform's native roots (`rustls-native-certs`), so enrollment's "ordinary
+# system-root verification" (ADR 0037 §4) really means the platform trust
+# store: a cluster fronted by a corporate or private-PKI certificate is an
 # explicitly supported posture, and those roots live in the OS store, not in
 # Mozilla's bundle. Both sets are loaded; neither alone covers the field.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "rustls-tls-native-roots"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
+webpki-roots = "1"
+rustls-native-certs = "0.8"
 proptest = "1"
 prost = "0.14"
 prost-build = "0.14"
