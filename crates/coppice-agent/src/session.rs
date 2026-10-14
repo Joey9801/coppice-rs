@@ -561,6 +561,32 @@ impl<F: Fs, E: Executor> Session<F, E> {
 
     // ---- StartJob ----
 
+    /// Why a StartJob with this `abort_grace` and `cleanup_margin`, arriving
+    /// at `now`, is refused at the door, if it is (ADR 0044 §5: an agent that
+    /// has announced `draining`, including for an interruption, admits
+    /// nothing). In order: an interruption plan is active; the agent's own
+    /// shutdown drain (ADR 0041) is under way; or an operator deadline drain
+    /// closed admission at this attempt's `T_notice`. A refused start resolves
+    /// as the drain would have stopped it — `Preempted { reason }`, runtime 0,
+    /// a free retry — and its journaled tombstone makes a re-delivered
+    /// StartJob answer the same.
+    fn door_refusal(
+        &self,
+        abort_grace: Duration,
+        cleanup_margin: Duration,
+        now: Timestamp,
+    ) -> Option<DoorRefusal> {
+        if self.state.plan.interruption.is_some() {
+            return Some(DoorRefusal::Interruption);
+        }
+        if self.draining {
+            return Some(DoorRefusal::ShutdownDrain);
+        }
+        self.operator_notice_at(abort_grace, cleanup_margin)
+            .filter(|notice_at| now >= *notice_at)
+            .map(|notice_at| DoorRefusal::DeadlineDrain { notice_at })
+    }
+
     async fn start_job(&mut self, sj: pb::StartJob) -> std::io::Result<Vec<pb::AgentReport>> {
         let Some(StartIds {
             allocation: alloc,
@@ -645,34 +671,27 @@ impl<F: Fs, E: Executor> Session<F, E> {
         // door's checks.
         let now = Timestamp::now();
         let launch_bound_passed = latest_start.is_some_and(|latest| now > latest);
-        // Under the operator's deadline drain, admission closed at this
-        // attempt's T_notice (ADR 0044 §5): a start reaching the agent from
-        // then on is refused at the door, resolving as the drain would have
-        // stopped it — `Preempted { Drain }`, runtime 0, a free retry. The
-        // tombstone makes a re-delivered StartJob answer the same. A launch
-        // bound already passed answers `Revoked` first, below.
+        // A launch bound already passed answers `Revoked` first, below.
         if !launch_bound_passed {
-            if let Some(notice_at) = self.operator_notice_at(abort_grace, cleanup_margin) {
-                if now >= notice_at {
-                    let tombstone = TombstoneReason::Preempt {
-                        reason: PreemptReason::Drain,
-                    };
-                    self.journal.journal_tombstone(alloc, tombstone)?;
-                    self.state.tombstones.insert(alloc, tombstone);
-                    tracing::info!(
-                        node = %self.node,
-                        %alloc,
-                        %notice_at,
-                        "refusing a StartJob that arrived after the deadline drain's notice time"
-                    );
-                    return Ok(vec![self.terminal_status(
-                        alloc,
-                        attempt,
-                        job,
-                        tombstone.outcome(),
-                        Duration::ZERO,
-                    )]);
-                }
+            if let Some(refusal) = self.door_refusal(abort_grace, cleanup_margin, now) {
+                let tombstone = TombstoneReason::Preempt {
+                    reason: refusal.reason(),
+                };
+                self.journal.journal_tombstone(alloc, tombstone)?;
+                self.state.tombstones.insert(alloc, tombstone);
+                tracing::info!(
+                    node = %self.node,
+                    %alloc,
+                    refused_by = %refusal,
+                    "refusing a StartJob at the door: this agent admits nothing new"
+                );
+                return Ok(vec![self.terminal_status(
+                    alloc,
+                    attempt,
+                    job,
+                    tombstone.outcome(),
+                    Duration::ZERO,
+                )]);
             }
         }
 
@@ -1234,6 +1253,41 @@ struct StartIds {
     attempt: AttemptId,
     /// The job the attempt belongs to.
     job: JobId,
+}
+
+/// The condition that refuses a StartJob at the door
+/// ([`Session::door_refusal`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DoorRefusal {
+    /// An interruption plan is active (ADR 0044 §5).
+    Interruption,
+    /// The agent's own shutdown drain is under way (ADR 0041).
+    ShutdownDrain,
+    /// The operator's deadline drain closed admission at this attempt's
+    /// `T_notice` (ADR 0044 §5).
+    DeadlineDrain { notice_at: Timestamp },
+}
+
+impl DoorRefusal {
+    /// The preemption reason the refused start resolves under.
+    fn reason(self) -> PreemptReason {
+        match self {
+            DoorRefusal::Interruption => PreemptReason::Interruption,
+            DoorRefusal::ShutdownDrain | DoorRefusal::DeadlineDrain { .. } => PreemptReason::Drain,
+        }
+    }
+}
+
+impl std::fmt::Display for DoorRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DoorRefusal::Interruption => f.write_str("an active interruption"),
+            DoorRefusal::ShutdownDrain => f.write_str("the agent's shutdown drain"),
+            DoorRefusal::DeadlineDrain { notice_at } => {
+                write!(f, "the deadline drain's notice time {notice_at}")
+            }
+        }
+    }
 }
 
 /// The runtime bound a `StartJob` carries, as a span. The wire field is
