@@ -2693,7 +2693,7 @@ EMPTY = ""
         let captured: Arc<Mutex<Vec<dto::AbortJobRequest>>> = Arc::new(Mutex::new(Vec::new()));
         let router = Router::new()
             .route(
-                "/api/v1/jobs/:job/abort",
+                "/api/v1/jobs/{job}/abort",
                 post(
                     |State(captured): State<Arc<Mutex<Vec<dto::AbortJobRequest>>>>,
                      Json(req): Json<dto::AbortJobRequest>| async move {
@@ -2720,7 +2720,7 @@ EMPTY = ""
     #[tokio::test]
     async fn not_leader_surfaces_the_leader_hint() {
         let router = Router::new().route(
-            "/api/v1/jobs/:job/abort",
+            "/api/v1/jobs/{job}/abort",
             post(|| async {
                 (
                     AxumStatus::MISDIRECTED_REQUEST,
@@ -2745,7 +2745,7 @@ EMPTY = ""
             Arc::new(Mutex::new(Vec::new()));
         let router = Router::new()
             .route(
-                "/api/v1/jobs/:job/metadata",
+                "/api/v1/jobs/{job}/metadata",
                 post(
                     |State(captured): State<Arc<Mutex<Vec<dto::UpdateJobMetadataRequest>>>>,
                      Json(req): Json<dto::UpdateJobMetadataRequest>| async move {
@@ -2787,7 +2787,7 @@ EMPTY = ""
             Arc::new(Mutex::new(Vec::new()));
         let router = Router::new()
             .route(
-                "/api/v1/jobs/:job/metadata",
+                "/api/v1/jobs/{job}/metadata",
                 put(
                     |State(captured): State<Arc<Mutex<Vec<dto::ReplaceJobMetadataRequest>>>>,
                      Json(req): Json<dto::ReplaceJobMetadataRequest>| async move {
@@ -3094,7 +3094,7 @@ EMPTY = ""
         let router =
             Router::new()
                 .route(
-                    "/api/v1/jobs/:job/logs",
+                    "/api/v1/jobs/{job}/logs",
                     get(
                         #[allow(clippy::type_complexity)]
                         |State(pages): State<
@@ -3121,7 +3121,7 @@ EMPTY = ""
                 // The walk fetches the job detail first (attempt multiplicity
                 // decides prefixing up front).
                 .route(
-                    "/api/v1/jobs/:job",
+                    "/api/v1/jobs/{job}",
                     get(|AxumPath(job): AxumPath<String>| async move {
                         let id: CoreJobId = job.parse().unwrap();
                         Json(
@@ -3161,7 +3161,7 @@ EMPTY = ""
         });
         let router = Router::new()
             .route(
-                "/api/v1/jobs/:job/logs",
+                "/api/v1/jobs/{job}/logs",
                 get(
                     |State(page): State<Arc<dto::GetJobLogsResponse>>| async move {
                         Json(serde_json::to_value(&*page).unwrap())
@@ -3169,7 +3169,7 @@ EMPTY = ""
                 ),
             )
             .route(
-                "/api/v1/jobs/:job",
+                "/api/v1/jobs/{job}",
                 get(move |AxumPath(job): AxumPath<String>| async move {
                     let id: CoreJobId = job.parse().unwrap();
                     Json(
@@ -3224,7 +3224,7 @@ EMPTY = ""
         let router =
             Router::new()
                 .route(
-                    "/api/v1/jobs/:job/logs",
+                    "/api/v1/jobs/{job}/logs",
                     get(
                         |State(script): State<Arc<FollowScript>>,
                          AxumQuery(params): AxumQuery<
@@ -3239,7 +3239,7 @@ EMPTY = ""
                     ),
                 )
                 .route(
-                    "/api/v1/jobs/:job",
+                    "/api/v1/jobs/{job}",
                     get(
                         |State(script): State<Arc<FollowScript>>,
                          AxumPath(job): AxumPath<String>| async move {
@@ -3714,7 +3714,7 @@ EMPTY = ""
         let router =
             Router::new()
                 .route(
-                    "/api/v1/jobs/:job/timeline",
+                    "/api/v1/jobs/{job}/timeline",
                     get(
                         #[allow(clippy::type_complexity)]
                         |State(pages): State<
@@ -3935,7 +3935,7 @@ EMPTY = ""
         let router =
             Router::new()
                 .route(
-                    "/api/v1/jobs/:job/usage",
+                    "/api/v1/jobs/{job}/usage",
                     get(
                         #[allow(clippy::type_complexity)]
                         |State(pages): State<
@@ -3986,7 +3986,7 @@ EMPTY = ""
     #[tokio::test]
     async fn usage_surfaces_an_api_error() {
         let router = Router::new().route(
-            "/api/v1/jobs/:job/usage",
+            "/api/v1/jobs/{job}/usage",
             get(|| async {
                 (
                     AxumStatus::NOT_FOUND,
@@ -4008,7 +4008,7 @@ EMPTY = ""
     async fn timeline_501_degrades_to_a_warning() {
         // The shape an older coordinator gives for the route it cannot serve.
         let router = Router::new().route(
-            "/api/v1/jobs/:job/timeline",
+            "/api/v1/jobs/{job}/timeline",
             get(|| async {
                 (
                     AxumStatus::NOT_IMPLEMENTED,

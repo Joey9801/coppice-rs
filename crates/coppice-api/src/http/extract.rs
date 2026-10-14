@@ -21,12 +21,11 @@ use super::error::HttpError;
 use super::read::ReadParams;
 use super::{COPPICE_APPLIED_INDEX, COPPICE_COMMITTED_INDEX};
 
-/// A typed id taken from the single path parameter (`/jobs/:job` →
+/// A typed id taken from the single path parameter (`/jobs/{job}` →
 /// [`JobId`](coppice_core::id::JobId), etc.). Parse failure — wrong prefix,
 /// not a uuid — is `INVALID_ARGUMENT`, never `NOT_FOUND` (ADR 0031).
 pub struct IdPath<T>(pub T);
 
-#[axum::async_trait]
 impl<S, T> FromRequestParts<S> for IdPath<T>
 where
     S: Send + Sync,
@@ -51,7 +50,6 @@ where
 /// on top with their own extractors).
 pub struct ReadQuery(pub ReadParams);
 
-#[axum::async_trait]
 impl<S: Send + Sync> FromRequestParts<S> for ReadQuery {
     type Rejection = HttpError;
 

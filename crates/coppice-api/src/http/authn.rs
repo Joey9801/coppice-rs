@@ -45,7 +45,6 @@ use super::error::{ErrorCode, HttpError};
 #[derive(Debug, Clone)]
 pub struct RequestActor(pub Actor);
 
-#[axum::async_trait]
 impl<S: Send + Sync> FromRequestParts<S> for RequestActor {
     type Rejection = HttpError;
 
@@ -85,7 +84,6 @@ impl<S: Send + Sync> FromRequestParts<S> for RequestActor {
 #[derive(Debug, Clone)]
 pub(super) struct RequestPresentation(pub Presentation);
 
-#[axum::async_trait]
 impl<S: Send + Sync> FromRequestParts<S> for RequestPresentation {
     type Rejection = std::convert::Infallible;
 
@@ -110,7 +108,6 @@ impl<S: Send + Sync> FromRequestParts<S> for RequestPresentation {
 #[derive(Debug, Clone, Copy)]
 pub(super) struct RequestDeadline(pub Option<coppice_core::time::Timestamp>);
 
-#[axum::async_trait]
 impl<S: Send + Sync> FromRequestParts<S> for RequestDeadline {
     type Rejection = std::convert::Infallible;
 

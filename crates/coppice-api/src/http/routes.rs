@@ -295,41 +295,41 @@ fn state_routes<P: ControlPlane>() -> Router<Arc<P>> {
         // (derived: ring events / samples); logs are provisional until log
         // storage exists.
         .route("/jobs", get(list_jobs::<P>).post(submit_job::<P>))
-        .route("/jobs/:job", get(get_job::<P>))
-        .route("/jobs/:job/abort", post(abort_job::<P>))
+        .route("/jobs/{job}", get(get_job::<P>))
+        .route("/jobs/{job}/abort", post(abort_job::<P>))
         // The ADR 0042 metadata writes, one path and two verbs: PUT is the
         // full replacement, POST the patch. Two methods rather than two
         // paths because they address the same resource — the job's metadata
         // map — and differ only in how much of it the caller claims to own.
         .route(
-            "/jobs/:job/metadata",
+            "/jobs/{job}/metadata",
             put(replace_job_metadata::<P>).post(update_job_metadata::<P>),
         )
-        .route("/jobs/:job/timeline", get(get_job_timeline::<P>))
-        .route("/jobs/:job/usage", get(super::usage::get_job_usage::<P>))
-        .route("/jobs/:job/logs", get(super::logs::get_job_logs::<P>))
+        .route("/jobs/{job}/timeline", get(get_job_timeline::<P>))
+        .route("/jobs/{job}/usage", get(super::usage::get_job_usage::<P>))
+        .route("/jobs/{job}/logs", get(super::logs::get_job_logs::<P>))
         // Nodes. List/detail bounded; utilization/history eventual; logs
         // provisional.
         .route("/nodes", get(list_nodes::<P>))
-        .route("/nodes/:node", get(get_node::<P>))
-        .route("/nodes/:node/utilization", get(get_node_utilization::<P>))
+        .route("/nodes/{node}", get(get_node::<P>))
+        .route("/nodes/{node}/utilization", get(get_node_utilization::<P>))
         // The ADR 0041 node writes. All three are bodyless: the path names
         // the node, and the route names the intent.
-        .route("/nodes/:node/drain", post(drain_node::<P>))
-        .route("/nodes/:node/undrain", post(undrain_node::<P>))
-        .route("/nodes/:node/remove", post(remove_node::<P>))
+        .route("/nodes/{node}/drain", post(drain_node::<P>))
+        .route("/nodes/{node}/undrain", post(undrain_node::<P>))
+        .route("/nodes/{node}/remove", post(remove_node::<P>))
         .route(
-            "/nodes/:node/history",
+            "/nodes/{node}/history",
             get(unimplemented_id_read::<NodeId>("GetNodeHistory")),
         )
         .route(
-            "/nodes/:node/logs",
+            "/nodes/{node}/logs",
             get(unimplemented_id_read::<NodeId>("GetNodeLogs")),
         )
         // Coordinators — local status read; logs provisional.
         .route("/coordinators", get(get_coordinators::<P>))
         .route(
-            "/coordinators/:id/logs",
+            "/coordinators/{id}/logs",
             // Coordinator ids are raft ids: plain u64, not typed uuids (ADR 0024).
             get(unimplemented_id_read::<u64>("GetCoordinatorLogs")),
         )
@@ -339,7 +339,7 @@ fn state_routes<P: ControlPlane>() -> Router<Arc<P>> {
             "/quota-entities",
             get(list_quota_entities::<P>).post(configure_quota_entity::<P>),
         )
-        .route("/quota-entities/:entity", get(get_quota_entity::<P>))
+        .route("/quota-entities/{entity}", get(get_quota_entity::<P>))
         // The ADR 0008 event subscription, filtered and cursor-resumed per
         // ADR 0043. Eventual by nature: a derived, replica-local stream.
         .route("/events", get(super::events::subscribe_events::<P>))
