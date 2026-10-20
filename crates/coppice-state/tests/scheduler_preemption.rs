@@ -12,6 +12,7 @@ use coppice_core::attempt::{AttemptState, PreemptReason, Preemption};
 use coppice_core::id::{AllocationId, JobId, NodeId};
 use coppice_core::job::{JobState, RetryPolicy};
 use coppice_core::preemption::PreemptionSpec;
+use coppice_core::quota::PriorityClass;
 use coppice_core::time::{Duration, Timestamp};
 use coppice_state::command::{
     CommitPlacements, Eviction, EvictionRule, Placement, RecordAttemptNotified,
@@ -49,7 +50,7 @@ fn submit_with_runtime(
         },
     );
     if let Command::SubmitJob(c) = &mut cmd {
-        c.job.priority = priority;
+        c.job.priority = PriorityClass(priority);
     }
     apply_ok(sm, cmd);
 }

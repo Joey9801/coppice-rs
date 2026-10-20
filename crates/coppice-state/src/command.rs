@@ -150,7 +150,7 @@ impl Command {
 pub struct SubmitJob {
     pub job: Job,
     /// Resolved by the API from the replicated multiplier table; apply never
-    /// sees the raw `priority: i32` in arithmetic (ADR 0019).
+    /// sees the raw `PriorityClass` in arithmetic (ADR 0019).
     pub multiplier: PriorityMultiplier,
     /// Who asked — see the module note on actor-carrying commands.
     pub actor: Option<Actor>,
@@ -262,7 +262,7 @@ pub struct Eviction {
 pub enum EvictionRule {
     /// The beneficiary outranks the victim: the class rule (apply's check)
     /// and the score rule (the proposer's alone — it depends on the
-    /// scheduler-local `w_age`).
+    /// scheduler-local `w_age` and `age_weights`).
     Priority,
     /// The victim moves off a persistent node to make room for a
     /// non-preemptible beneficiary, and spot capacity is free for it now.

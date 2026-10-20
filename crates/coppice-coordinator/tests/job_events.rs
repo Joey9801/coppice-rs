@@ -20,7 +20,7 @@ use coppice_consensus::Consensus;
 use coppice_core::id::{ClusterId, JobId, QuotaEntityId};
 use coppice_core::job::Job;
 use coppice_core::metadata::JobMetadata;
-use coppice_core::quota::{CostUnits, PriorityMultiplier};
+use coppice_core::quota::{CostUnits, PriorityClass, PriorityMultiplier};
 use coppice_core::resource::Resources;
 use coppice_core::time::Timestamp;
 use coppice_state::command::{ConfigureQuotaEntity, SubmitJob};
@@ -197,7 +197,7 @@ async fn submit(coord: &RunningCoordinator, job: JobId, entity: QuotaEntityId, t
                     cpu_millis: 1_000,
                     ..Default::default()
                 },
-                priority: 0,
+                priority: PriorityClass(0),
                 max_runtime: None,
                 quota_entity: entity,
                 retry: Default::default(),

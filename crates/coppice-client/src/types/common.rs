@@ -1,6 +1,10 @@
 //! Vocabulary shared across several endpoints: resources, lifecycle states,
 //! attempts and allocations.
 
+use std::fmt;
+use std::num::ParseIntError;
+use std::str::FromStr;
+
 use serde::{Deserialize, Serialize};
 
 use crate::id::{AllocationId, AttemptId, JobId, NodeId};
@@ -64,6 +68,38 @@ impl RetryPolicy {
             max_retries,
             retry_user_errors: true,
         }
+    }
+}
+
+/// A job's priority class: the small integer chosen on submit.
+///
+/// The cluster's policy maps each class it knows to a cost multiplier, and
+/// the scheduler may weigh how fast a class's queued jobs age; a class the
+/// policy does not price is rejected at submit. On the wire it is a plain
+/// JSON integer, and `PriorityClass::from(2)` (or `2.into()`) builds one.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(transparent)]
+pub struct PriorityClass(pub i32);
+
+impl fmt::Display for PriorityClass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl From<i32> for PriorityClass {
+    fn from(class: i32) -> PriorityClass {
+        PriorityClass(class)
+    }
+}
+
+impl FromStr for PriorityClass {
+    type Err = ParseIntError;
+
+    fn from_str(s: &str) -> Result<PriorityClass, ParseIntError> {
+        s.parse().map(PriorityClass)
     }
 }
 

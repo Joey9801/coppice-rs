@@ -38,6 +38,7 @@ use coppice_consensus::{CoordinatorId, NodeHandle};
 use coppice_core::entity_ref::QuotaEntityRef;
 use coppice_core::id::{JobId, NodeId};
 use coppice_core::node::Drain;
+use coppice_core::quota::PriorityClass;
 use coppice_net::admin::Client;
 use coppice_proto::convert::{
     env_from_pb, env_to_pb, metadata_from_pb, metadata_map_to_pb, metadata_to_pb, ConvertError,
@@ -805,7 +806,7 @@ pub(crate) fn submit_to_pb(
             .as_ref()
             .map(|argv| coppice_proto::pb::core::v1::Entrypoint { argv: argv.clone() }),
         requests: Some((&requests).into()),
-        priority: req.priority,
+        priority: req.priority.0,
         max_runtime_seconds: req.max_runtime_seconds,
         quota_entity_ref: req.quota_entity.to_string(),
         retry: req
@@ -864,7 +865,7 @@ pub(crate) fn submit_from_pb(
             entrypoint,
             env,
             requests: (&requests).into(),
-            priority: req.priority,
+            priority: PriorityClass(req.priority),
             max_runtime_seconds: req.max_runtime_seconds,
             quota_entity: entity_ref_from_pb(
                 &req.quota_entity_ref,
@@ -1131,7 +1132,7 @@ mod tests {
                 memory_bytes: 1 << 30,
                 disk_bytes: 0,
             },
-            priority: -3,
+            priority: PriorityClass(-3),
             max_runtime_seconds: Some(3600),
             quota_entity: QuotaEntityRef::Path("acme/eng".parse().unwrap()),
             retry: Some(dto::RetryPolicy {

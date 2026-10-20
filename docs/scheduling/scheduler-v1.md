@@ -23,8 +23,10 @@ recomputes.
 
 Every job with `state == Queued` is a candidate. Each is scored with
 [`effective_score`](../decisions/0021-effective-score-ranking.md)
-(ADR 0021): the job's priority multiplier divided by the ancestor
-quota-penalty product, plus an age term bounded by the decay half-life.
+(ADR 0021, in ADR 0047's form `(m + w(class) · age / H) / P`): the job's
+priority multiplier plus an age credit measured in decay half-lives,
+weighted per priority class, all divided by the ancestor quota-penalty
+product.
 Penalty products are memoized per distinct leaf quota entity for the pass,
 so scoring the whole candidate set costs one ancestor walk per entity
 touched, not per job.
@@ -255,7 +257,8 @@ scan: `Active` allocations whose attempt is its job's current `Running`
 one, recorded `effective_preemptible`, with no termination record, on a job
 not being aborted. For one beneficiary a victim must also pass the **class
 rule** (`victim.priority < J.priority`) and the **score rule** (its ADR 0021
-effective score, with this pass's `w_age` and `now`, below `J`'s). On each
+effective score, with its class's age weight and this pass's `now`, below
+`J`'s). On each
 open node that admits `J` (spot-only gate included) and passes the limits
 below, eligible victims are ordered by class, then score, then work at risk
 (`(now − started_at) × rate`), and the pass takes the smallest prefix that,
@@ -345,7 +348,8 @@ still holds.
 These and the other scheduler knobs are **node config** (ADR 0020's
 node-config side of the line): they are set in the coordinator TOML's
 `[scheduler]` table, and replicas need not agree on them. Besides the two
-bounds below the table carries `w_age` (default 1.0) and
+bounds below the table carries `w_age` (default 1.0), the per-class
+`[scheduler.age_weights]` overrides (ADR 0047, default empty) and
 `replan_min_improvement` (default `5m`), and the three ADR 0044 §4
 preemption knobs:
 
@@ -393,7 +397,9 @@ and spin.
 ## Related
 
 - [ADR 0021](../decisions/0021-effective-score-ranking.md) — the
-  effective-score formula candidates are ranked by.
+  effective-score formula candidates are ranked by, as amended by
+  [ADR 0047](../decisions/0047-per-class-age-weights-and-penalised-age.md)
+  (per-class age weights, penalty-scaled age credit).
 - [ADR 0014](../decisions/0014-accruing-allocations-replace-reservations.md) —
   why accruing allocations replace standalone reservations, and the
   strict-backfill rule this page implements.

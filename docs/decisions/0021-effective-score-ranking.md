@@ -1,5 +1,13 @@
 # 21. Effective-score ranking
 
+> **Amended by [ADR 0047](0047-per-class-age-weights-and-penalised-age.md).**
+> The age weight is now per class, `w(class)`, with `w_age` as the default
+> for classes without an entry, and the penalty divides the whole numerator:
+> `effective_score = (m + w(class) · age / H) / P`. Consequence 2's "the age
+> term is untouched by `P`" and consequence 3's "aging survives an infinite
+> penalty" no longer hold; see ADR 0047 for what replaces them. The text
+> below is as accepted.
+
 - **Status:** Accepted
 - **Date:** 2026-07-08
 - **Resolves:** [OD-13](../roadmap/open-decisions.md#od-13-base-score-and-the-exact-job-costing-formula)

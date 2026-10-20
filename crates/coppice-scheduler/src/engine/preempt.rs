@@ -27,13 +27,14 @@ use coppice_core::allocation::AllocationState;
 use coppice_core::attempt::AttemptState;
 use coppice_core::id::{AllocationId, JobId, NodeId, QuotaEntityId};
 use coppice_core::job::Job;
+use coppice_core::quota::PriorityClass;
 use coppice_core::resource::Resources;
 use coppice_core::time::{Duration, Timestamp};
 use coppice_state::command::{Eviction, EvictionRule};
 use coppice_state::StateMachine;
 
 use super::{entity_penalty, node_admits, node_satisfies_labels, simulate_batch, Pass};
-use crate::{score, ProposedPlacement};
+use crate::{score, ProposedPlacement, SchedulerConfig};
 
 /// A running attempt the pass may choose as a victim at all: `Active`, its
 /// job's current `Running` attempt, recorded effectively preemptible, with
@@ -47,9 +48,10 @@ pub(super) struct Victim {
     pub(super) requested: Resources,
     pub(super) funded: Resources,
     /// `Job.priority`, the class the class rule compares.
-    pub(super) priority: i32,
-    /// ADR 0021's effective score, applied to the running job with the
-    /// pass's own `w_age` and `now`.
+    pub(super) priority: PriorityClass,
+    /// ADR 0021/0047's effective score, applied to the running job with the
+    /// age weight of its class (`SchedulerConfig::age_weight`) and the
+    /// pass's own `now`.
     pub(super) score: f64,
     /// `(now − started_at) × rate`: the progress a preemption throws away,
     /// in µCU-scaled units so dimensions weigh as the cost weights do.
@@ -66,7 +68,7 @@ pub(super) fn candidate_victims(
     snapshot: &StateMachine,
     now: Timestamp,
     horizon: Duration,
-    w_age: f64,
+    config: &SchedulerConfig,
     penalties: &mut BTreeMap<QuotaEntityId, f64>,
 ) -> BTreeMap<NodeId, Vec<Victim>> {
     let mut out: BTreeMap<NodeId, Vec<Victim>> = BTreeMap::new();
@@ -107,7 +109,7 @@ pub(super) fn candidate_victims(
                 job.submitted_at,
                 now,
                 horizon,
-                w_age,
+                config.age_weight(job.spec.priority),
             ),
             work_at_risk: u128::try_from(ran.as_micros()).unwrap_or(0)
                 * u128::from(attempt.rate_ucu_per_second),

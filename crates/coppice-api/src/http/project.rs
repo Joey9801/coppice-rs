@@ -1153,11 +1153,11 @@ fn penalty_chain(
 /// answer: the multiplier, the per-ancestor penalty chain and its product,
 /// and the job's age. Rank, queue depth, and the composed score are
 /// deliberately absent — ranking would mean either an O(queue) scan per read
-/// or duplicating scheduler-owned scoring inputs (`w_age`, the age horizon)
-/// that would drift from what the scheduler actually applies. If those fields
-/// return, they should be read from a scheduler-published structure recording
-/// how the last invocation's unplaced jobs fared against each other, never
-/// recomputed per request.
+/// or duplicating scheduler-owned scoring inputs (`w_age`, `age_weights`, the
+/// age horizon) that would drift from what the scheduler actually applies. If
+/// those fields return, they should be read from a scheduler-published
+/// structure recording how the last invocation's unplaced jobs fared against
+/// each other, never recomputed per request.
 fn queue_explainer(
     state: &StateMachine,
     record: &JobRecord,
@@ -1724,8 +1724,8 @@ mod tests {
     use coppice_core::id::{AllocationId, AttemptId, JobId, QuotaEntityId};
     use coppice_core::node::Node;
     use coppice_core::quota::{
-        ChargeInterval, ChargeRecord, CostUnits, PriorityMultiplier, Settlement, TrueUp,
-        FULL_REFUND_MILLI,
+        ChargeInterval, ChargeRecord, CostUnits, PriorityClass, PriorityMultiplier, Settlement,
+        TrueUp, FULL_REFUND_MILLI,
     };
     use coppice_state::{AllocationRecord, AttemptRecord, NodeRecord};
 
@@ -2286,7 +2286,7 @@ mod tests {
                 entrypoint: None,
                 env: Default::default(),
                 requests: Resources::ZERO,
-                priority: 0,
+                priority: PriorityClass(0),
                 max_runtime: None,
                 quota_entity: QuotaEntityId::new(),
                 retry: Default::default(),
