@@ -26,6 +26,7 @@
 //! the ones a fleet must be able to leave blank in a byte-identical artifact
 //! (chiefly `advertise_host`, ADR 0037 §2).
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -1050,9 +1051,16 @@ pub(crate) struct SchedulerSection {
     #[serde(default = "default_max_placements_per_cycle")]
     pub(crate) max_placements_per_cycle: usize,
 
-    /// Weight of the ADR 0021 age term.
+    /// Default weight of the ADR 0021 age credit: every class without an
+    /// `age_weights` entry (ADR 0047).
     #[serde(default = "default_w_age")]
     pub(crate) w_age: f64,
+
+    /// Per-class age-weight overrides (ADR 0047), the `[scheduler.age_weights]`
+    /// sub-table. TOML keys are strings, so each key is parsed as the class's
+    /// integer `priority` index at load (`-1 = 0.0` is a valid bare key).
+    #[serde(default, deserialize_with = "deserialize_age_weights")]
+    pub(crate) age_weights: BTreeMap<i32, f64>,
 
     /// Minimum earliness for revoking and reseating an accrual (ADR 0027).
     #[serde(default = "default_replan_min_improvement", with = "humantime_serde")]
@@ -1084,6 +1092,13 @@ impl SchedulerSection {
                 self.w_age
             );
         }
+        for (class, weight) in &self.age_weights {
+            if !weight.is_finite() || *weight < 0.0 {
+                bail!(
+                    "[scheduler.age_weights] {class} must be a finite, non-negative number, got {weight}"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -1093,6 +1108,7 @@ impl SchedulerSection {
             max_candidates: self.max_candidates,
             max_placements_per_cycle: self.max_placements_per_cycle,
             w_age: self.w_age,
+            age_weights: self.age_weights.clone(),
             replan_min_improvement: self.replan_min_improvement.into(),
             max_preempting_placements_per_cycle: self.max_preempting_placements_per_cycle,
             preemption_cooldown: self.preemption_cooldown.into(),
@@ -1107,6 +1123,7 @@ impl Default for SchedulerSection {
             max_candidates: default_max_candidates(),
             max_placements_per_cycle: default_max_placements_per_cycle(),
             w_age: default_w_age(),
+            age_weights: BTreeMap::new(),
             replan_min_improvement: default_replan_min_improvement(),
             max_preempting_placements_per_cycle: default_max_preempting_placements_per_cycle(),
             preemption_cooldown: default_preemption_cooldown(),
@@ -1125,6 +1142,30 @@ fn default_max_placements_per_cycle() -> usize {
 
 fn default_w_age() -> f64 {
     SchedulerConfig::default().w_age
+}
+
+/// `[scheduler.age_weights]`: string TOML keys parsed as integer priority
+/// indices, failing the load on a key that is not one, or on two spellings
+/// (`1`, `01`) of the same index.
+fn deserialize_age_weights<'de, D>(deserializer: D) -> Result<BTreeMap<i32, f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = BTreeMap::<String, f64>::deserialize(deserializer)?;
+    let mut out = BTreeMap::new();
+    for (key, weight) in raw {
+        let class: i32 = key.parse().map_err(|_| {
+            serde::de::Error::custom(format!(
+                "[scheduler.age_weights] key {key:?} is not an integer priority index"
+            ))
+        })?;
+        if out.insert(class, weight).is_some() {
+            return Err(serde::de::Error::custom(format!(
+                "[scheduler.age_weights] priority index {class} is given more than once"
+            )));
+        }
+    }
+    Ok(out)
 }
 
 fn default_replan_min_improvement() -> Duration {
@@ -2820,7 +2861,8 @@ addrs = []
             "{MINIMAL_EXAMPLE}\n[scheduler]\nmax_candidates = 10\nmax_placements_per_cycle = 20\n\
              w_age = 2.5\nreplan_min_improvement = \"10m\"\n\
              max_preempting_placements_per_cycle = 4\npreemption_cooldown = \"30s\"\n\
-             preemption_min_improvement = \"2h\"\n"
+             preemption_min_improvement = \"2h\"\n\
+             \n[scheduler.age_weights]\n-1 = 0.0\n0 = 1.0\n3 = 0.25\n"
         );
         let cfg = read_config(&write_config(&doc).1)
             .expect("parse")
@@ -2829,6 +2871,16 @@ addrs = []
         assert_eq!(cfg.max_candidates, 10);
         assert_eq!(cfg.max_placements_per_cycle, 20);
         assert_eq!(cfg.w_age, 2.5);
+        assert_eq!(
+            cfg.age_weights,
+            BTreeMap::from([(-1, 0.0), (0, 1.0), (3, 0.25)])
+        );
+        assert_eq!(cfg.age_weight(-1), 0.0);
+        assert_eq!(
+            cfg.age_weight(7),
+            2.5,
+            "a class without an entry takes w_age"
+        );
         assert_eq!(
             cfg.replan_min_improvement,
             coppice_core::time::Duration::from_mins(10)
@@ -2852,6 +2904,27 @@ addrs = []
             let doc = format!("{MINIMAL_EXAMPLE}\n[scheduler]\nw_age = {bad}\n");
             let cfg = read_config(&write_config(&doc).1).expect("parse");
             assert!(cfg.scheduler.validate().is_err(), "w_age = {bad}");
+        }
+    }
+
+    #[test]
+    fn scheduler_age_weights_reject_bad_keys_and_values() {
+        for key in ["backfill", "\"1.5\"", "\"\""] {
+            let doc = format!("{MINIMAL_EXAMPLE}\n[scheduler.age_weights]\n{key} = 1.0\n");
+            let err = read_config(&write_config(&doc).1).expect_err(key);
+            assert!(
+                format!("{err:#}").contains("not an integer priority index"),
+                "{key}: {err:#}"
+            );
+        }
+        let dup = format!("{MINIMAL_EXAMPLE}\n[scheduler.age_weights]\n1 = 1.0\n01 = 2.0\n");
+        let err = read_config(&write_config(&dup).1).expect_err("duplicate index");
+        assert!(format!("{err:#}").contains("more than once"), "{err:#}");
+        for bad in ["-1.0", "nan", "inf"] {
+            let doc = format!("{MINIMAL_EXAMPLE}\n[scheduler.age_weights]\n-1 = {bad}\n");
+            let cfg = read_config(&write_config(&doc).1).expect("parse");
+            let err = cfg.scheduler.validate().expect_err(bad);
+            assert!(err.to_string().contains("age_weights] -1"), "{bad}: {err}");
         }
     }
 }

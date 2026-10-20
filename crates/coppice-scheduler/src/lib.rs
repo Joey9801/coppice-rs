@@ -27,6 +27,8 @@
 //! asynchronously so it never blocks Raft application, API handling, or agent
 //! heartbeat processing.
 
+use std::collections::BTreeMap;
+
 use coppice_core::id::{AllocationId, AttemptId, GroupId, JobId, NodeId};
 use coppice_core::resource::Resources;
 use coppice_core::time::{Duration, Timestamp};
@@ -56,9 +58,16 @@ pub struct SchedulerConfig {
     /// Placements emitted per pass. Revocations are bounded separately by the
     /// replicated accrual cap K and need no knob.
     pub max_placements_per_cycle: usize,
-    /// Weight of the ADR 0021 age term, in effective-priority points per
-    /// decay half-life waited.
+    /// Default weight of the ADR 0021 age credit, in effective-priority
+    /// points per decay half-life waited: the weight of every class without
+    /// an entry in [`age_weights`](Self::age_weights) (ADR 0047).
     pub w_age: f64,
+    /// Per-class age-weight overrides (ADR 0047), keyed by the job's
+    /// `priority` index — the same key as the replicated
+    /// `priority_multipliers` table. A weight of zero makes a class that never
+    /// ages (a backfill lane). An entry for a class the policy does not define
+    /// is inert. Resolve through [`age_weight`](Self::age_weight).
+    pub age_weights: BTreeMap<i32, f64>,
     /// Minimum earliness by which a move to another node must improve an
     /// existing accrual's finite `projected_ready` bound before the pass
     /// will revoke and reseat it there (ADR 0027). An indefinite bound is
@@ -83,11 +92,24 @@ impl Default for SchedulerConfig {
             max_candidates: 4096,
             max_placements_per_cycle: 512,
             w_age: score::DEFAULT_AGE_WEIGHT,
+            age_weights: BTreeMap::new(),
             replan_min_improvement: Duration::from_mins(5),
             max_preempting_placements_per_cycle: 2,
             preemption_cooldown: Duration::from_mins(5),
             preemption_min_improvement: Duration::from_hours(1),
         }
+    }
+}
+
+impl SchedulerConfig {
+    /// The age weight of the class with `priority` index `priority`
+    /// (ADR 0047): its [`age_weights`](Self::age_weights) override, or the
+    /// default [`w_age`](Self::w_age).
+    pub fn age_weight(&self, priority: i32) -> f64 {
+        self.age_weights
+            .get(&priority)
+            .copied()
+            .unwrap_or(self.w_age)
     }
 }
 

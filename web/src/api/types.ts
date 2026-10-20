@@ -398,10 +398,11 @@ export interface JobSummary {
  *
  * A literal queue position is **deliberately absent, not zero**: ranking the
  * queued set would mean either an O(queue) scan per read or duplicating
- * scheduler-owned scoring inputs (`w_age`, the age horizon) that would drift
- * from what the scheduler actually applies. The scheduler also adds a small
- * age credit on top of `multiplier / penaltyProduct`, so even this quotient
- * is a ranking *term*, not a total the UI may present as final. If a true
+ * scheduler-owned scoring inputs (`w_age`, per-class `age_weights`, the age
+ * horizon) that would drift from what the scheduler actually applies. The
+ * scheduler also adds a per-class age credit to the multiplier before dividing
+ * by `penaltyProduct` (ADR 0047), so even this quotient is a ranking *term*,
+ * not a total the UI may present as final. If a true
  * position ever ships, it must come from a scheduler-published ranking
  * snapshot, never be recomputed per request.
  */

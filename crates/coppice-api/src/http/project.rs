@@ -1153,11 +1153,11 @@ fn penalty_chain(
 /// answer: the multiplier, the per-ancestor penalty chain and its product,
 /// and the job's age. Rank, queue depth, and the composed score are
 /// deliberately absent — ranking would mean either an O(queue) scan per read
-/// or duplicating scheduler-owned scoring inputs (`w_age`, the age horizon)
-/// that would drift from what the scheduler actually applies. If those fields
-/// return, they should be read from a scheduler-published structure recording
-/// how the last invocation's unplaced jobs fared against each other, never
-/// recomputed per request.
+/// or duplicating scheduler-owned scoring inputs (`w_age`, `age_weights`, the
+/// age horizon) that would drift from what the scheduler actually applies. If
+/// those fields return, they should be read from a scheduler-published
+/// structure recording how the last invocation's unplaced jobs fared against
+/// each other, never recomputed per request.
 fn queue_explainer(
     state: &StateMachine,
     record: &JobRecord,

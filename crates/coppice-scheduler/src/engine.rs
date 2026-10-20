@@ -220,7 +220,9 @@ struct Pass<'a> {
     now: Timestamp,
     max_candidates: usize,
     max_placements: usize,
-    w_age: f64,
+    /// The scheduler config, for per-class age weights
+    /// ([`SchedulerConfig::age_weight`], ADR 0047).
+    config: &'a SchedulerConfig,
     horizon: Duration,
     /// K, the replicated accrual cap.
     accrual_limit: usize,
@@ -280,7 +282,7 @@ fn entity_penalty(
 }
 
 impl<'a> Pass<'a> {
-    fn new(snapshot: &'a StateMachine, now: Timestamp, config: &SchedulerConfig) -> Pass<'a> {
+    fn new(snapshot: &'a StateMachine, now: Timestamp, config: &'a SchedulerConfig) -> Pass<'a> {
         let base_free = free_capacity_map(snapshot);
         let horizon = score::age_horizon(&snapshot.policy.decay);
 
@@ -305,7 +307,7 @@ impl<'a> Pass<'a> {
         let horizons = snapshot.node_horizons(&drained);
         let mut penalties: BTreeMap<QuotaEntityId, f64> = BTreeMap::new();
         let mut victims =
-            preempt::candidate_victims(snapshot, now, horizon, config.w_age, &mut penalties);
+            preempt::candidate_victims(snapshot, now, horizon, config, &mut penalties);
 
         let mut nodes: Vec<NodeModel> = Vec::new();
         let mut node_index: BTreeMap<NodeId, usize> = BTreeMap::new();
@@ -368,7 +370,7 @@ impl<'a> Pass<'a> {
             now,
             max_candidates: config.max_candidates,
             max_placements: config.max_placements_per_cycle,
-            w_age: config.w_age,
+            config,
             horizon,
             accrual_limit: snapshot.policy.accrual_limit as usize,
             min_improvement: config.replan_min_improvement,
@@ -390,7 +392,8 @@ impl<'a> Pass<'a> {
         }
     }
 
-    /// A job's ADR 0021 effective score at the pass's `now`.
+    /// A job's ADR 0021/0047 effective score at the pass's `now`, with its
+    /// class's age weight.
     fn job_score(&mut self, job: &coppice_state::JobRecord) -> f64 {
         let penalty = entity_penalty(
             &mut self.penalties,
@@ -404,7 +407,7 @@ impl<'a> Pass<'a> {
             job.submitted_at,
             self.now,
             self.horizon,
-            self.w_age,
+            self.config.age_weight(job.spec.priority),
         )
     }
 
