@@ -2454,10 +2454,20 @@ async fn wait_preempted_by_drain(views: &StateViews, attempt: AttemptId) {
     .await;
 }
 
-async fn wait_requeued_free(views: &StateViews, job: JobId) {
+/// Wait for `job` to requeue after its attempt `first` ended, then check the
+/// retry was free. Requeued means queued again or already re-placed: on an
+/// open node the scheduler can place a fresh attempt before a poll ever
+/// samples `Queued` (issue #182).
+async fn wait_requeued_free(views: &StateViews, job: JobId, first: AttemptId) {
     poll(DEADLINE, "job requeued", || {
         let views = views.clone();
-        async move { job_state(&views, job) == Some(JobState::Queued) }
+        async move {
+            match job_state(&views, job) {
+                Some(JobState::Queued) => true,
+                Some(JobState::Attempting(next)) => next != first,
+                _ => false,
+            }
+        }
     })
     .await;
     assert_eq!(
@@ -2513,7 +2523,7 @@ async fn a_deadline_drain_notifies_at_its_notice_time_and_requeues_free() {
         "notified on time, with (nearly) the full declared window: {}",
         acknowledged.notice_shortfall
     );
-    wait_requeued_free(&views, world.job).await;
+    wait_requeued_free(&views, world.job, world.attempt).await;
 
     // The node record is the operator's; the agent never announced draining.
     let state = views.latest().state().clone();
@@ -2570,7 +2580,7 @@ async fn a_deadline_drain_reaching_the_agent_late_reports_a_shortfall() {
         "at least the second it arrived late is short, got {}",
         acknowledged.notice_shortfall
     );
-    wait_requeued_free(&views, world.job).await;
+    wait_requeued_free(&views, world.job, world.attempt).await;
 
     stop_agent(agent).await;
     world.coord.shutdown().await;
@@ -2603,7 +2613,7 @@ async fn an_undrain_mid_notice_leaves_the_notified_attempt_stopping() {
 
     wait_preempted_by_drain(&views, world.attempt).await;
     assert!(Timestamp::now() >= t_stop, "the issued stop held");
-    wait_requeued_free(&views, world.job).await;
+    wait_requeued_free(&views, world.job, world.attempt).await;
 
     // The node is open again: the job runs a fresh attempt there.
     poll(DEADLINE, "next attempt Running", || {
