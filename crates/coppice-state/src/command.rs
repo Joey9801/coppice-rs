@@ -150,7 +150,7 @@ impl Command {
 pub struct SubmitJob {
     pub job: Job,
     /// Resolved by the API from the replicated multiplier table; apply never
-    /// sees the raw `priority: i32` in arithmetic (ADR 0019).
+    /// sees the raw `PriorityClass` in arithmetic (ADR 0019).
     pub multiplier: PriorityMultiplier,
     /// Who asked — see the module note on actor-carrying commands.
     pub actor: Option<Actor>,

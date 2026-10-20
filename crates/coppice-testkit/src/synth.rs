@@ -29,8 +29,8 @@ use coppice_core::job::{AbortRequest, Job, JobState, RetryPolicy};
 use coppice_core::node::{Drain, Node};
 use coppice_core::preemption::PreemptionSpec;
 use coppice_core::quota::{
-    self, ChargeInterval, ChargeRecord, CostUnits, DecayPolicy, PriorityMultiplier, Settlement,
-    UsageState,
+    self, ChargeInterval, ChargeRecord, CostUnits, DecayPolicy, PriorityClass, PriorityMultiplier,
+    Settlement, UsageState,
 };
 use coppice_core::resource::Resources;
 use coppice_core::time::{Duration, Timestamp};
@@ -85,7 +85,7 @@ pub fn synth_state(cfg: &SynthConfig) -> StateMachine {
         groups_claim: "coppice_groups".to_string(),
         ..PolicyConfig::default()
     };
-    let priorities: Vec<i32> = policy.priority_multipliers.keys().copied().collect();
+    let priorities: Vec<PriorityClass> = policy.priority_multipliers.keys().copied().collect();
 
     let mut jobs_buf: Vec<(JobId, JobRecord)> = Vec::with_capacity(cfg.jobs);
     let mut bufs = Buffers {
@@ -766,11 +766,11 @@ fn random_terminal_failure_outcome(rng: &mut Rng) -> AttemptOutcome {
 }
 
 /// A small, plausible priority ladder: 6 tiers from 0.5x to 3x, Q32.32.
-fn build_priority_table() -> BTreeMap<i32, PriorityMultiplier> {
+fn build_priority_table() -> BTreeMap<PriorityClass, PriorityMultiplier> {
     let mut table = BTreeMap::new();
     for priority in -2i32..=3 {
         let n = (priority + 3) as u64; // 1..=6
-        table.insert(priority, PriorityMultiplier((n << 32) / 2));
+        table.insert(PriorityClass(priority), PriorityMultiplier((n << 32) / 2));
     }
     table
 }

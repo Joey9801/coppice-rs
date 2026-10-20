@@ -11,7 +11,7 @@ use coppice_core::bytes::ByteSize;
 use coppice_core::id::{AllocationId, AttemptId, GroupId, JobId, NodeId, QuotaEntityId};
 use coppice_core::job::{Job, RetryPolicy};
 use coppice_core::node::Drain;
-use coppice_core::quota::{CostUnits, CostWeights, PriorityMultiplier};
+use coppice_core::quota::{CostUnits, CostWeights, PriorityClass, PriorityMultiplier};
 use coppice_core::resource::Resources;
 use coppice_core::time::{Duration, Timestamp};
 use coppice_state::command::{
@@ -192,7 +192,7 @@ pub fn submit_cmd_with(
             command: vec!["run".into()],
             entrypoint: None,
             requests,
-            priority: 0,
+            priority: PriorityClass(0),
             max_runtime: max_runtime_s.map(Duration::from_secs),
             quota_entity: ROOT,
             retry: RetryPolicy::default(),
@@ -329,7 +329,7 @@ pub fn submit_full(
     ) else {
         unreachable!("submit_cmd_with builds a SubmitJob");
     };
-    c.job.priority = priority;
+    c.job.priority = PriorityClass(priority);
     apply_ok(sm, Command::SubmitJob(c));
 }
 

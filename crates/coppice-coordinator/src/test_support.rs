@@ -14,7 +14,9 @@ use coppice_core::attempt::{Attempt, AttemptState};
 use coppice_core::id::{AllocationId, AttemptId, GroupId, JobId, NodeId, QuotaEntityId};
 use coppice_core::job::{Job, JobState, RetryPolicy};
 use coppice_core::node::Node;
-use coppice_core::quota::{ChargeRecord, CostUnits, PriorityMultiplier, FULL_REFUND_MILLI};
+use coppice_core::quota::{
+    ChargeRecord, CostUnits, PriorityClass, PriorityMultiplier, FULL_REFUND_MILLI,
+};
 use coppice_core::resource::Resources;
 use coppice_core::time::{Duration, Timestamp};
 use coppice_state::{
@@ -131,7 +133,7 @@ pub fn job_record(
             entrypoint: None,
             env: Default::default(),
             requests,
-            priority: 0,
+            priority: PriorityClass(0),
             max_runtime,
             quota_entity: QuotaEntityId::new(),
             retry: RetryPolicy::default(),

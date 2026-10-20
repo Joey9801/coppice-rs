@@ -34,6 +34,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use coppice_core::id::ClusterId;
+use coppice_core::quota::PriorityClass;
 use coppice_scheduler::SchedulerConfig;
 use serde::Deserialize;
 
@@ -1060,7 +1061,7 @@ pub(crate) struct SchedulerSection {
     /// sub-table. TOML keys are strings, so each key is parsed as the class's
     /// integer `priority` index at load (`-1 = 0.0` is a valid bare key).
     #[serde(default, deserialize_with = "deserialize_age_weights")]
-    pub(crate) age_weights: BTreeMap<i32, f64>,
+    pub(crate) age_weights: BTreeMap<PriorityClass, f64>,
 
     /// Minimum earliness for revoking and reseating an accrual (ADR 0027).
     #[serde(default = "default_replan_min_improvement", with = "humantime_serde")]
@@ -1147,14 +1148,16 @@ fn default_w_age() -> f64 {
 /// `[scheduler.age_weights]`: string TOML keys parsed as integer priority
 /// indices, failing the load on a key that is not one, or on two spellings
 /// (`1`, `01`) of the same index.
-fn deserialize_age_weights<'de, D>(deserializer: D) -> Result<BTreeMap<i32, f64>, D::Error>
+fn deserialize_age_weights<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<PriorityClass, f64>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let raw = BTreeMap::<String, f64>::deserialize(deserializer)?;
     let mut out = BTreeMap::new();
     for (key, weight) in raw {
-        let class: i32 = key.parse().map_err(|_| {
+        let class: PriorityClass = key.parse().map_err(|_| {
             serde::de::Error::custom(format!(
                 "[scheduler.age_weights] key {key:?} is not an integer priority index"
             ))
@@ -2873,11 +2876,15 @@ addrs = []
         assert_eq!(cfg.w_age, 2.5);
         assert_eq!(
             cfg.age_weights,
-            BTreeMap::from([(-1, 0.0), (0, 1.0), (3, 0.25)])
+            BTreeMap::from([
+                (PriorityClass(-1), 0.0),
+                (PriorityClass(0), 1.0),
+                (PriorityClass(3), 0.25)
+            ])
         );
-        assert_eq!(cfg.age_weight(-1), 0.0);
+        assert_eq!(cfg.age_weight(PriorityClass(-1)), 0.0);
         assert_eq!(
-            cfg.age_weight(7),
+            cfg.age_weight(PriorityClass(7)),
             2.5,
             "a class without an entry takes w_age"
         );

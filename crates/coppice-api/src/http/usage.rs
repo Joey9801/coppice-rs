@@ -590,7 +590,9 @@ mod tests {
     use coppice_core::id::{AllocationId, ClusterId, GroupId};
     use coppice_core::job::{Job, JobState};
     use coppice_core::node::Node;
-    use coppice_core::quota::{ChargeRecord, CostUnits, PriorityMultiplier, FULL_REFUND_MILLI};
+    use coppice_core::quota::{
+        ChargeRecord, CostUnits, PriorityClass, PriorityMultiplier, FULL_REFUND_MILLI,
+    };
     use coppice_core::resource::Resources;
     use coppice_state::{AttemptRecord, JobRecord, NodeRecord, StateMachine};
 
@@ -833,7 +835,7 @@ mod tests {
                 entrypoint: None,
                 env: Default::default(),
                 requests: Resources::ZERO,
-                priority: 0,
+                priority: PriorityClass(0),
                 max_runtime: None,
                 quota_entity: coppice_core::id::QuotaEntityId::new(),
                 retry: Default::default(),

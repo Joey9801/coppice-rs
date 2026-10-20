@@ -28,7 +28,7 @@ use coppice_consensus::Consensus;
 use coppice_coordinator::admin;
 use coppice_coordinator::CoordinatorControlPlane;
 use coppice_core::id::{ClusterId, JobId, QuotaEntityId};
-use coppice_core::quota::{CostUnits, PriorityMultiplier};
+use coppice_core::quota::{CostUnits, PriorityClass, PriorityMultiplier};
 use coppice_core::time::Timestamp;
 use coppice_state::command::{ConfigureQuotaEntity, UpdatePolicy};
 use coppice_state::{Actor, Command, PolicyConfig};
@@ -79,7 +79,7 @@ fn submit_request(job: JobId, quota_entity: QuotaEntityId) -> dto::SubmitJobRequ
             memory_bytes: 0,
             disk_bytes: 0,
         },
-        priority: 0,
+        priority: PriorityClass(0),
         max_runtime_seconds: Some(3_600),
         quota_entity: quota_entity.into(),
         retry: None,
@@ -152,7 +152,7 @@ async fn retried_submission_across_leader_change_creates_one_job() {
     let mut policy = PolicyConfig::default();
     policy
         .priority_multipliers
-        .insert(0, PriorityMultiplier::ONE);
+        .insert(PriorityClass(0), PriorityMultiplier::ONE);
     consensus
         .propose(Command::UpdatePolicy(UpdatePolicy {
             policy,
@@ -172,7 +172,10 @@ async fn retried_submission_across_leader_change_creates_one_job() {
             let views = views.clone();
             async move {
                 let view = views.latest();
-                view.state().policy.priority_multipliers.contains_key(&0)
+                view.state()
+                    .policy
+                    .priority_multipliers
+                    .contains_key(&PriorityClass(0))
             }
         })
         .await;
@@ -299,7 +302,7 @@ async fn retried_submission_by_path_dedups_even_after_an_attempted_rename() {
     let mut policy = PolicyConfig::default();
     policy
         .priority_multipliers
-        .insert(0, PriorityMultiplier::ONE);
+        .insert(PriorityClass(0), PriorityMultiplier::ONE);
     nodes[0]
         .consensus()
         .propose(Command::UpdatePolicy(UpdatePolicy {

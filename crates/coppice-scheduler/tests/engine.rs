@@ -15,7 +15,7 @@ use coppice_core::attempt::{AttemptOutcome, AttemptState};
 use coppice_core::bytes::ByteSize;
 use coppice_core::id::{AllocationId, JobId, NodeId};
 use coppice_core::job::JobState;
-use coppice_core::quota::{CostUnits, PriorityMultiplier};
+use coppice_core::quota::{CostUnits, PriorityClass, PriorityMultiplier};
 use coppice_core::resource::Resources;
 use coppice_core::time::{Duration, Timestamp};
 use coppice_scheduler::{score, HeuristicScheduler, PlacementProposal, Scheduler, SchedulerConfig};
@@ -44,7 +44,7 @@ fn submit_exact_runtime(
         command: vec!["run".into()],
         entrypoint: None,
         requests,
-        priority: 0,
+        priority: PriorityClass(0),
         max_runtime: Some(max_runtime),
         quota_entity: ROOT,
         retry: coppice_core::job::RetryPolicy::default(),
@@ -276,7 +276,7 @@ fn a_zero_weight_class_yields_until_the_penalty_exceeds_the_class_ratio() {
             .collect()
     };
     let backfill_lane = SchedulerConfig {
-        age_weights: BTreeMap::from([(-1, 0.0)]),
+        age_weights: BTreeMap::from([(PriorityClass(-1), 0.0)]),
         ..SchedulerConfig::default()
     };
 

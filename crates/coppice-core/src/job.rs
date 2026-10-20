@@ -20,6 +20,7 @@ use crate::env::JobEnv;
 use crate::id::{AttemptId, JobId, QuotaEntityId};
 use crate::metadata::JobMetadata;
 use crate::preemption::PreemptionSpec;
+use crate::quota::PriorityClass;
 use crate::resource::Resources;
 use crate::time::{Duration, Timestamp};
 
@@ -54,7 +55,7 @@ pub struct Job {
     /// burning budget faster pushes this job forward (ADR 0005). Also the
     /// job's preemption class: a scheduler preemption's victim is always of
     /// a strictly lower priority than its beneficiary (ADR 0044 §4).
-    pub priority: i32,
+    pub priority: PriorityClass,
     /// Enforced runtime bound. Part of the job's price (ADR 0005) and the
     /// license to backfill (ADR 0014); jobs without one never touch pledged
     /// capacity and are charged a policy default runtime. Always positive —

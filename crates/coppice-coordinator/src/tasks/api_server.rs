@@ -46,7 +46,7 @@ use crate::tasks::node_client::NodeClient;
 use coppice_core::job::Job;
 use coppice_core::node::Drain;
 use coppice_core::preemption::{NoticeSignal, PreemptionSpec};
-use coppice_core::quota::{CostUnits, PriorityMultiplier};
+use coppice_core::quota::{CostUnits, PriorityClass, PriorityMultiplier};
 use coppice_core::time::{Duration, Timestamp};
 use coppice_state::command::{
     AbortJob, ConfigureQuotaEntity, EvictNodes, JobMetadataUpdate, SetNodeDrain, SubmitJob,
@@ -294,7 +294,7 @@ fn resolve_ref(view: &StateView, reference: &QuotaEntityRef) -> Option<QuotaEnti
 /// Factored out because the ADR 0038 write path looks it up twice — once
 /// optimistically on the latest view, once on a view known to have caught up
 /// to a read barrier — and the two must be the same lookup.
-fn multiplier_for(view: &StateView, priority: i32) -> Option<PriorityMultiplier> {
+fn multiplier_for(view: &StateView, priority: PriorityClass) -> Option<PriorityMultiplier> {
     view.state()
         .policy
         .priority_multipliers
@@ -467,7 +467,7 @@ pub(crate) async fn submit_job_here<C: Consensus>(
     screen_leadership(consensus)?;
 
     // The entity reference and the priority multiplier, both off the latest
-    // view (ADR 0019: apply never sees the raw `priority: i32` in arithmetic,
+    // view (ADR 0019: apply never sees the raw `PriorityClass` in arithmetic,
     // and ADR 0045: the command carries the id a path names). A hit is final
     // and costs no round trip — the propose below is itself the leadership
     // check, so a replica that has lost leadership fails there with
@@ -1580,9 +1580,10 @@ mod tests {
     fn state_with_priorities(priorities: &[i32]) -> coppice_state::StateMachine {
         let mut policy = coppice_state::PolicyConfig::default();
         for priority in priorities {
-            policy
-                .priority_multipliers
-                .insert(*priority, coppice_core::quota::PriorityMultiplier::ONE);
+            policy.priority_multipliers.insert(
+                PriorityClass(*priority),
+                coppice_core::quota::PriorityMultiplier::ONE,
+            );
         }
         coppice_state::StateMachine {
             policy,
@@ -2087,7 +2088,7 @@ mod tests {
                 memory_bytes: 0,
                 disk_bytes: 0,
             },
-            priority: 0,
+            priority: PriorityClass(0),
             max_runtime_seconds: None,
             quota_entity: QuotaEntityRef::Id(coppice_core::id::QuotaEntityId::new()),
             retry: None,
@@ -2528,7 +2529,7 @@ mod tests {
     /// class may have been added by a policy update it has not applied yet.
     fn submit_at_an_unconfigured_priority() -> SubmitJobRequest {
         let mut req = submit_request(JobId::new());
-        req.priority = 5;
+        req.priority = PriorityClass(5);
         req
     }
 

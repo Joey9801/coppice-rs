@@ -2831,7 +2831,7 @@ mod tests {
                 entrypoint: None,
                 env: Default::default(),
                 requests: coppice_core::resource::Resources::ZERO,
-                priority: 0,
+                priority: coppice_core::quota::PriorityClass(0),
                 max_runtime: None,
                 quota_entity: coppice_core::id::QuotaEntityId::new(),
                 retry: Default::default(),

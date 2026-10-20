@@ -27,6 +27,7 @@ use coppice_core::allocation::AllocationState;
 use coppice_core::attempt::AttemptState;
 use coppice_core::id::{AllocationId, JobId, NodeId, QuotaEntityId};
 use coppice_core::job::Job;
+use coppice_core::quota::PriorityClass;
 use coppice_core::resource::Resources;
 use coppice_core::time::{Duration, Timestamp};
 use coppice_state::command::{Eviction, EvictionRule};
@@ -47,7 +48,7 @@ pub(super) struct Victim {
     pub(super) requested: Resources,
     pub(super) funded: Resources,
     /// `Job.priority`, the class the class rule compares.
-    pub(super) priority: i32,
+    pub(super) priority: PriorityClass,
     /// ADR 0021/0047's effective score, applied to the running job with the
     /// age weight of its class (`SchedulerConfig::age_weight`) and the
     /// pass's own `now`.

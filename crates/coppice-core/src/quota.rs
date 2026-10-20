@@ -25,6 +25,12 @@
 //! single per-tick step — and the property tests in
 //! `tests/quota_properties.rs` guard that any future fast path preserves it.
 
+use std::fmt;
+use std::num::ParseIntError;
+use std::str::FromStr;
+
+use serde::{Deserialize, Serialize};
+
 use crate::resource::Resources;
 use crate::time::{Duration, Timestamp};
 
@@ -225,9 +231,40 @@ pub struct CostWeights {
     pub per_disk_byte_second: u64,
 }
 
-/// Replicated priority multiplier, Q32.32. The user-facing `priority: i32` is
-/// mapped to a multiplier by a policy table outside this module; arithmetic
-/// only ever sees the resolved fixed-point value.
+/// A job's priority class: the small integer users choose on submit. It is
+/// the key into the replicated `priority_multipliers` table (which prices
+/// it, ADR 0019/0021) and the scheduler-side `age_weights` table (ADR 0047),
+/// and the value ADR 0044 §4's class rule compares. Carries no meaning on
+/// its own — a class the policy does not price is rejected at submit.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(transparent)]
+pub struct PriorityClass(pub i32);
+
+impl fmt::Display for PriorityClass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl From<i32> for PriorityClass {
+    fn from(class: i32) -> PriorityClass {
+        PriorityClass(class)
+    }
+}
+
+impl FromStr for PriorityClass {
+    type Err = ParseIntError;
+
+    fn from_str(s: &str) -> Result<PriorityClass, ParseIntError> {
+        s.parse().map(PriorityClass)
+    }
+}
+
+/// Replicated priority multiplier, Q32.32. The user-facing [`PriorityClass`]
+/// is mapped to a multiplier by a policy table outside this module;
+/// arithmetic only ever sees the resolved fixed-point value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PriorityMultiplier(pub u64);
 

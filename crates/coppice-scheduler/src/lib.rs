@@ -30,6 +30,7 @@
 use std::collections::BTreeMap;
 
 use coppice_core::id::{AllocationId, AttemptId, GroupId, JobId, NodeId};
+use coppice_core::quota::PriorityClass;
 use coppice_core::resource::Resources;
 use coppice_core::time::{Duration, Timestamp};
 use coppice_state::command::{AllocationSpec, CommitPlacements, Eviction, Placement};
@@ -67,7 +68,7 @@ pub struct SchedulerConfig {
     /// `priority_multipliers` table. A weight of zero makes a class that never
     /// ages (a backfill lane). An entry for a class the policy does not define
     /// is inert. Resolve through [`age_weight`](Self::age_weight).
-    pub age_weights: BTreeMap<i32, f64>,
+    pub age_weights: BTreeMap<PriorityClass, f64>,
     /// Minimum earliness by which a move to another node must improve an
     /// existing accrual's finite `projected_ready` bound before the pass
     /// will revoke and reseat it there (ADR 0027). An indefinite bound is
@@ -105,7 +106,7 @@ impl SchedulerConfig {
     /// The age weight of the class with `priority` index `priority`
     /// (ADR 0047): its [`age_weights`](Self::age_weights) override, or the
     /// default [`w_age`](Self::w_age).
-    pub fn age_weight(&self, priority: i32) -> f64 {
+    pub fn age_weight(&self, priority: PriorityClass) -> f64 {
         self.age_weights
             .get(&priority)
             .copied()

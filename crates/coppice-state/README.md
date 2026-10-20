@@ -13,9 +13,10 @@ the same sequence of committed commands, every replica *must* reach byte-equal
 state — so apply reads no wall clock, draws no randomness, makes no network
 call, and never iterates an unordered map. Every timestamp rides in the
 command (`*_at_us`, Unix µs), every id is minted by the proposer, and the
-`priority: i32` is pre-resolved to a fixed-point multiplier before it reaches
-apply. State is `BTreeMap` throughout and every record is `PartialEq`/`Eq`, so
-the determinism harness can assert replica equivalence structurally.
+job's `PriorityClass` is pre-resolved to a fixed-point multiplier before it
+reaches apply. State is `BTreeMap` throughout and every record is
+`PartialEq`/`Eq`, so the determinism harness can assert replica equivalence
+structurally.
 
 Commands commit *decisions, not computations*. A command that fails validation
 is not dropped: it was already appended to the log on every replica, so it

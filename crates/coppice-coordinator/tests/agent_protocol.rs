@@ -38,7 +38,7 @@ use coppice_core::attempt::{AttemptOutcome, AttemptState};
 use coppice_core::bytes::ByteSize;
 use coppice_core::id::{AllocationId, AttemptId, ClusterId, JobId, NodeId, QuotaEntityId};
 use coppice_core::job::{Job, JobState, RetryPolicy};
-use coppice_core::quota::{CostUnits, PriorityMultiplier};
+use coppice_core::quota::{CostUnits, PriorityClass, PriorityMultiplier};
 use coppice_core::resource::Resources;
 use coppice_core::time::Timestamp;
 use coppice_discovery::SeedConfig;
@@ -345,7 +345,7 @@ async fn submit_job(
                 entrypoint: None,
                 env: Default::default(),
                 requests: requested(),
-                priority: 0,
+                priority: PriorityClass(0),
                 max_runtime: None,
                 quota_entity: entity,
                 retry: RetryPolicy {
@@ -1864,7 +1864,7 @@ async fn run_bounded_to_running(max_runtime: coppice_core::time::Duration) -> Bo
                 entrypoint: None,
                 env: Default::default(),
                 requests: requested(),
-                priority: 0,
+                priority: PriorityClass(0),
                 max_runtime: Some(max_runtime),
                 quota_entity: entity,
                 retry: RetryPolicy {
@@ -2182,7 +2182,7 @@ async fn submit_classed(
                 entrypoint: None,
                 env: Default::default(),
                 requests,
-                priority,
+                priority: PriorityClass(priority),
                 max_runtime: None,
                 quota_entity: entity,
                 retry: RetryPolicy::default(),

@@ -1724,8 +1724,8 @@ mod tests {
     use coppice_core::id::{AllocationId, AttemptId, JobId, QuotaEntityId};
     use coppice_core::node::Node;
     use coppice_core::quota::{
-        ChargeInterval, ChargeRecord, CostUnits, PriorityMultiplier, Settlement, TrueUp,
-        FULL_REFUND_MILLI,
+        ChargeInterval, ChargeRecord, CostUnits, PriorityClass, PriorityMultiplier, Settlement,
+        TrueUp, FULL_REFUND_MILLI,
     };
     use coppice_state::{AllocationRecord, AttemptRecord, NodeRecord};
 
@@ -2286,7 +2286,7 @@ mod tests {
                 entrypoint: None,
                 env: Default::default(),
                 requests: Resources::ZERO,
-                priority: 0,
+                priority: PriorityClass(0),
                 max_runtime: None,
                 quota_entity: QuotaEntityId::new(),
                 retry: Default::default(),

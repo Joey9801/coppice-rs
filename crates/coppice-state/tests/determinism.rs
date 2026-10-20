@@ -27,7 +27,7 @@ use coppice_core::job::RetryPolicy;
 use coppice_core::metadata::JobMetadata;
 use coppice_core::node::Drain;
 use coppice_core::preemption::{NoticeSignal, PreemptionSpec};
-use coppice_core::quota::{CostUnits, PriorityMultiplier};
+use coppice_core::quota::{CostUnits, PriorityClass, PriorityMultiplier};
 use coppice_core::resource::Resources;
 use coppice_core::time::{Duration, Timestamp};
 use coppice_proto::convert::{state_from_records, state_to_records, StateRecords};
@@ -199,7 +199,7 @@ fn arb_job_chain(i: u64) -> impl Strategy<Value = Vec<Command>> {
                 // Classes vary so a preempting placement (below, in the
                 // global commands) can find outranked victims.
                 if let Command::SubmitJob(c) = &mut submit {
-                    c.job.priority = priority;
+                    c.job.priority = PriorityClass(priority);
                 }
                 let mut chain = vec![
                     submit,
