@@ -92,6 +92,18 @@ that the image reference still goes through the mirror.
   `kill -STOP`-ing dockerd inside the Colima VM for ~0.5 s on the `kill`
   event of a fast-rotating container, then `kill -CONT`.
 
+- **`an_undrain_mid_notice_leaves_the_notified_attempt_stopping`**
+  (issue #182) — the test undrains the node and then polls for the job to
+  read `Queued`. A job's state goes `Queued` in the attempt's terminal
+  apply, and because the node is open again the scheduler's next pass
+  places a fresh attempt straight away. So the `Queued` window could end
+  between two 50 ms polls, and the poll timed out even though the requeue
+  was correct. Fixed by treating "queued, or attempting with a newer
+  attempt" as requeued in `wait_requeued_free`, the same check the
+  priority-preemption victim already used. More generally, poll for a
+  transient state only when nothing can move the job past it. Otherwise
+  poll for a state that, once reached, stays reached.
+
 ## Filing a new flake
 
 If you've confirmed (via fresh dispatch, not a rerun) that a failure is a
