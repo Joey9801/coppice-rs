@@ -56,7 +56,9 @@ use serde::Deserialize;
 
 use coppice_core::entity_ref::{QuotaEntityPath, QuotaEntityRef};
 use coppice_core::id::{EnrollTokenId, QuotaEntityId};
-use coppice_core::quota::{CostUnits, CostWeights, PriorityMultiplier, MICRO_PER_COST_UNIT};
+use coppice_core::quota::{
+    CostUnits, CostWeights, PriorityClass, PriorityMultiplier, MICRO_PER_COST_UNIT,
+};
 use coppice_core::time::{Duration, Timestamp};
 use coppice_state::authz::{Binding, Role, Subject};
 use coppice_state::command::{
@@ -374,13 +376,13 @@ impl From<EnrollRoleSpec> for EnrollRole {
     }
 }
 
-/// One `[[priority_multiplier]]` entry: a user-facing `priority: i32` index and
+/// One `[[priority_multiplier]]` entry: a user-facing [`PriorityClass`] index and
 /// the human-form cost multiplier it maps to (`1.0` = 1×, `0.5` = half price).
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PriorityMultiplierSpec {
     /// The `priority` index a job declares.
-    pub index: i32,
+    pub index: PriorityClass,
     /// The cost multiplier for that priority, as a decimal (`0.25`..`4.0`…).
     pub multiplier: f64,
 }
@@ -712,7 +714,7 @@ impl FormationPolicy {
     }
 
     /// The replicated Q32.32 priority table this policy describes.
-    fn multiplier_table(&self) -> BTreeMap<i32, PriorityMultiplier> {
+    fn multiplier_table(&self) -> BTreeMap<PriorityClass, PriorityMultiplier> {
         self.priority_multipliers
             .iter()
             .map(|pm| {
@@ -1387,9 +1389,9 @@ quota = 1000000000000
     fn multiplier_table_is_exact_for_power_of_two_factors() {
         let policy = FormationPolicy::parse_toml(SAMPLE.as_bytes()).unwrap();
         let table = policy.multiplier_table();
-        assert_eq!(table[&-1], PriorityMultiplier(1 << 31)); // 0.5×
-        assert_eq!(table[&0], PriorityMultiplier::ONE); // 1.0×
-        assert_eq!(table[&2], PriorityMultiplier(4 << 32)); // 4.0×
+        assert_eq!(table[&PriorityClass(-1)], PriorityMultiplier(1 << 31)); // 0.5×
+        assert_eq!(table[&PriorityClass(0)], PriorityMultiplier::ONE); // 1.0×
+        assert_eq!(table[&PriorityClass(2)], PriorityMultiplier(4 << 32)); // 4.0×
     }
 
     #[test]
@@ -1475,7 +1477,7 @@ quota = 1000000000000
         state
             .policy
             .priority_multipliers
-            .insert(0, PriorityMultiplier(9 << 32));
+            .insert(PriorityClass(0), PriorityMultiplier(9 << 32));
         assert!(policy
             .commands(&state, Timestamp::now(), CHEAP_KDF)
             .expect("valid policy")

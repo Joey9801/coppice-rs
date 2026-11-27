@@ -12,7 +12,7 @@ use coppice_core::allocation::AllocationState;
 use coppice_core::bytes::ByteSize;
 use coppice_core::id::AllocationId;
 use coppice_core::job::Job;
-use coppice_core::quota::PriorityMultiplier;
+use coppice_core::quota::{PriorityClass, PriorityMultiplier};
 use coppice_core::resource::Resources;
 use coppice_core::time::{Duration, Timestamp};
 use coppice_state::command::SubmitJob;
@@ -183,7 +183,7 @@ fn build_state(s: &Scenario) -> StateMachine {
         ) else {
             unreachable!("submit_cmd_with builds a SubmitJob");
         };
-        submit.job.priority = job.priority;
+        submit.job.priority = PriorityClass(job.priority);
         apply_ok(&mut sm, Command::SubmitJob(submit));
         // Seeding stops at a node's first accrual: a second would break the
         // per-node ceiling, making the seeding command itself illegal. The
@@ -378,7 +378,7 @@ fn stale_proposal_is_rejected_then_a_fresh_one_applies() {
         command: vec!["run".into()],
         entrypoint: None,
         requests: cpu(4_000),
-        priority: 0,
+        priority: PriorityClass(0),
         max_runtime: Some(Duration::from_mins(10)),
         quota_entity: ROOT,
         retry: coppice_core::job::RetryPolicy::default(),

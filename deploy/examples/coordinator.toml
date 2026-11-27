@@ -117,6 +117,8 @@ audience = "COGNITO_APP_CLIENT_ID"
 # max_preempting_placements_per_cycle = 2
 # preemption_cooldown = "5m"
 # preemption_min_improvement = "1h"
+# [scheduler.age_weights]
+# -1 = 0.0
 
 [observability]
 log_level = "info"

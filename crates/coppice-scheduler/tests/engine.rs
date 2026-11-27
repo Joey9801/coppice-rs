@@ -1,24 +1,24 @@
 //! Behavioural tests for the `HeuristicScheduler` against real apply-built
 //! states: resource-fit filtering, best-fit choice, the accrual cap K,
 //! per-cycle work caps, emitted command shape, the strict-backfill boundary
-//! (ADR 0014), and the finite projected-ready protection rules and per-node
-//! accrual ceiling (ADR 0027).
+//! (ADR 0014), the finite projected-ready protection rules and per-node
+//! accrual ceiling (ADR 0027), and per-class age weights (ADR 0047).
 
 mod common;
 
 use common::*;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use coppice_core::allocation::AllocationState;
 use coppice_core::attempt::{AttemptOutcome, AttemptState};
 use coppice_core::bytes::ByteSize;
-use coppice_core::id::{AllocationId, NodeId};
+use coppice_core::id::{AllocationId, JobId, NodeId};
 use coppice_core::job::JobState;
-use coppice_core::quota::PriorityMultiplier;
+use coppice_core::quota::{CostUnits, PriorityClass, PriorityMultiplier};
 use coppice_core::resource::Resources;
 use coppice_core::time::{Duration, Timestamp};
-use coppice_scheduler::{HeuristicScheduler, PlacementProposal, Scheduler, SchedulerConfig};
+use coppice_scheduler::{score, HeuristicScheduler, PlacementProposal, Scheduler, SchedulerConfig};
 use coppice_state::command::RecordAttemptOutcome;
 use coppice_state::{Command, StateMachine};
 
@@ -44,7 +44,7 @@ fn submit_exact_runtime(
         command: vec!["run".into()],
         entrypoint: None,
         requests,
-        priority: 0,
+        priority: PriorityClass(0),
         max_runtime: Some(max_runtime),
         quota_entity: ROOT,
         retry: coppice_core::job::RetryPolicy::default(),
@@ -219,6 +219,86 @@ fn honours_the_effective_score_order_and_the_candidate_cap() {
     // jid(2) has the 5× multiplier ⇒ top of the score order ⇒ the sole
     // candidate seated.
     assert_eq!(proposal.placements[0].job, jid(2));
+}
+
+/// ADR 0047: a zero-weight (backfill) class never ages, so a fresh
+/// higher-class job outranks it however long it has queued — until that
+/// job's entity penalty exceeds the class ratio (2× against 1× here).
+#[test]
+fn a_zero_weight_class_yields_until_the_penalty_exceeds_the_class_ratio() {
+    const BACKFILL: u128 = 1;
+    const URGENT: u128 = 2;
+    const CHARGER: u128 = 9;
+    let entity = qid(0xB0);
+    let now = base_ts() + Duration::from_days(30);
+
+    // nid(1) has room for exactly one of the two 9-core candidates; nid(2)
+    // is filled by a running job that charges the urgent job's entity.
+    let mut sm = setup(cpu(10_000), 1);
+    apply_ok(&mut sm, configure_entity_cmd(entity, None));
+    apply_ok(&mut sm, register_node_cmd(nid(2), cpu(10_000), base_ts()));
+    // Class -1 at 1x, under-quota root entity, queued for 30 days.
+    submit_full(&mut sm, BACKFILL, cpu(9_000), -1, false, 1, Some(600));
+    // Class 0 at 2x, submitted just now; and the charging job, both on
+    // `entity`.
+    for (n, requests, multiplier) in [(URGENT, cpu(9_000), 2), (CHARGER, cpu(10_000), 1)] {
+        let Command::SubmitJob(mut c) = submit_cmd(
+            jid(n),
+            requests,
+            Some(600),
+            PriorityMultiplier::from_integer(multiplier),
+            now,
+        ) else {
+            unreachable!("submit_cmd builds a SubmitJob");
+        };
+        c.job.quota_entity = entity;
+        apply_ok(&mut sm, Command::SubmitJob(c));
+    }
+    run_on(&mut sm, CHARGER, nid(2), now);
+    let usage = sm.quota_entities[&entity].usage.usage.0;
+
+    // Re-quota the entity so its usage reads `usage / quota` over, and
+    // return the resulting penalty product at `now`.
+    let set_quota = |sm: &mut StateMachine, quota: u64| -> f64 {
+        let Command::ConfigureQuotaEntity(mut c) = configure_entity_cmd(entity, None) else {
+            unreachable!("configure_entity_cmd builds a ConfigureQuotaEntity");
+        };
+        c.quota = CostUnits(quota);
+        apply_ok(sm, Command::ConfigureQuotaEntity(c));
+        score::penalty_product(&sm.quota_entities, entity, &sm.policy, now)
+    };
+    let funded = |cfg: SchedulerConfig, sm: &StateMachine| -> Vec<JobId> {
+        schedule_with(sm, cfg, now)
+            .placements
+            .iter()
+            .filter(|p| p.expect_funded)
+            .map(|p| p.job)
+            .collect()
+    };
+    let backfill_lane = SchedulerConfig {
+        age_weights: BTreeMap::from([(PriorityClass(-1), 0.0)]),
+        ..SchedulerConfig::default()
+    };
+
+    // 1.3x over quota: penalty 1.69, below the 2:1 class ratio.
+    let p = set_quota(&mut sm, usage * 10 / 13);
+    assert!(p > 1.0 && p < 2.0, "penalty {p}");
+    assert_eq!(
+        funded(backfill_lane.clone(), &sm),
+        vec![jid(URGENT)],
+        "30 days of age buy a zero-weight class nothing"
+    );
+    // Without the override the backfill job's age crosses the class gap.
+    assert_eq!(funded(SchedulerConfig::default(), &sm), vec![jid(BACKFILL)]);
+
+    // 1.5x over quota: penalty 2.25, past the class ratio.
+    let p = set_quota(&mut sm, usage * 2 / 3);
+    assert!(p > 2.0, "penalty {p}");
+    assert_eq!(
+        funded(backfill_lane, &sm),
+        vec![jid(BACKFILL)],
+        "the penalty is the way through the lane"
+    );
 }
 
 #[test]

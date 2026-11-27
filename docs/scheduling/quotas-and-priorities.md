@@ -171,11 +171,23 @@ blocks work; it lowers the effective priority of the owner's queued jobs, so
 a quiet cluster is always fully usable. Queued jobs are ordered by:
 
 ```
-effective_score = base(job) / Π over ancestors a of penalty(usage_a / quota_a)
+effective_score = (m + w(class) · age / H) / P
 
+P          = Π over ancestors a of penalty(usage_a / quota_a)
 penalty(x) = 1    for x ≤ 1
            = x^p  for x > 1        (p = penalty_exponent_milli / 1000, default 2)
 ```
+
+`m` is the job's priority multiplier, `age` is time since submission, `H`
+is the decay half-life, and `w(class)` is a scheduler-side age weight per
+priority class ([ADR 0021](../decisions/0021-effective-score-ranking.md),
+[ADR 0047](../decisions/0047-per-class-age-weights-and-penalised-age.md)).
+Aging keeps any entity with a finite penalty moving toward service; a class
+whose weight is zero never ages and so stays behind every aging class until
+that class's work is over quota by more than the class ratio. Because the
+penalty divides the age credit too, it scales how long an over-quota entity
+waits, not just where it ranks: the exponent is a wait knob as well as a
+rank knob.
 
 The quadratic default is superlinear — sustained overuse cannot be linearly
 bought back with priority multipliers — while staying human-checkable: an

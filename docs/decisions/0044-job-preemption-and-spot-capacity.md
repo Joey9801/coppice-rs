@@ -1,5 +1,11 @@
 # 44. Job preemption, node draining, and spot capacity
 
+> **Amended by [ADR 0047](0047-per-class-age-weights-and-penalised-age.md).**
+> §4's score rule now compares ADR 0047's `effective_score`,
+> `(m + w(class) · age / H) / P`, with per-class age weights: a running
+> victim of a zero-weight class scores `m / P` however long it has run. The
+> text below is as accepted.
+
 - **Status:** Accepted
 - **Date:** 2026-09-24
 - **Builds on:** [ADR 0013](0013-job-attempt-allocation-state-machines.md)

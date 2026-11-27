@@ -14,7 +14,7 @@ use crate::time::Timestamp;
 
 use super::{
     AccrualView, AttemptOutcome, AttemptState, AttemptView, JobFilter, JobStateKind, NoticeSignal,
-    PreemptReason, QuotaEntityView, Resources, RetryPolicy,
+    PreemptReason, PriorityClass, QuotaEntityView, Resources, RetryPolicy,
 };
 
 /// Deserialize a float that may arrive as `null`, mapping `null` to
@@ -56,7 +56,7 @@ pub struct JobSummary {
     /// server cannot resolve the entity (never a fabricated path).
     pub quota_entity_path: String,
     /// Scheduling priority.
-    pub priority: i32,
+    pub priority: PriorityClass,
     /// When the job was submitted.
     pub submitted_at: Timestamp,
     /// The principal that submitted the job — `"anonymous"` for a submission
@@ -113,7 +113,7 @@ pub struct JobSpecView {
     /// Resources requested for scheduling and isolation.
     pub requests: Resources,
     /// Scheduling priority.
-    pub priority: i32,
+    pub priority: PriorityClass,
     /// Enforced runtime bound; `null` when unbounded.
     #[serde(rename = "max_runtime_seconds", with = "crate::time::seconds::option")]
     pub max_runtime: Option<Duration>,
@@ -593,7 +593,7 @@ pub struct SubmitJobRequest {
     pub requests: Resources,
     /// Mapped to a cost multiplier by the cluster's policy; a priority with
     /// no configured multiplier is rejected.
-    pub priority: i32,
+    pub priority: PriorityClass,
     /// Enforced runtime bound; absent = charged for the cluster's
     /// default runtime. Must be positive when present.
     #[serde(rename = "max_runtime_seconds", with = "crate::time::seconds::option")]
@@ -686,7 +686,7 @@ impl SubmitJobRequest {
             command: command.into_iter().map(Into::into).collect(),
             entrypoint: None,
             requests,
-            priority: 0,
+            priority: PriorityClass(0),
             max_runtime: None,
             quota_entity: quota_entity.into(),
             retry: None,
@@ -706,8 +706,8 @@ impl SubmitJobRequest {
     }
 
     /// Set the scheduling priority.
-    pub fn with_priority(mut self, priority: i32) -> SubmitJobRequest {
-        self.priority = priority;
+    pub fn with_priority(mut self, priority: impl Into<PriorityClass>) -> SubmitJobRequest {
+        self.priority = priority.into();
         self
     }
 
@@ -1101,7 +1101,7 @@ mod tests {
             image: "ubuntu:22.04".to_string(),
             quota_entity: entity,
             quota_entity_path: "acme/team-a".to_string(),
-            priority: 0,
+            priority: PriorityClass(0),
             submitted_at: Timestamp::UNIX_EPOCH,
             submitted_by: None,
             terminal_at: None,

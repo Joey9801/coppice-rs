@@ -9,7 +9,7 @@ use coppice_core::bytes::ByteSize;
 use coppice_core::id::{AllocationId, AttemptId, GroupId, JobId, NodeId, QuotaEntityId};
 use coppice_core::job::{Job, RetryPolicy};
 use coppice_core::node::Drain;
-use coppice_core::quota::{CostUnits, CostWeights, PriorityMultiplier};
+use coppice_core::quota::{CostUnits, CostWeights, PriorityClass, PriorityMultiplier};
 use coppice_core::resource::Resources;
 use coppice_core::time::{Duration, Timestamp};
 use coppice_state::authz::{Actor, Binding, Role, Subject};
@@ -206,7 +206,7 @@ pub fn submit_cmd_full(
             command: vec!["run".into()],
             entrypoint: None,
             requests,
-            priority: 0,
+            priority: PriorityClass(0),
             max_runtime: max_runtime_s.map(Duration::from_secs),
             quota_entity: ROOT,
             retry,

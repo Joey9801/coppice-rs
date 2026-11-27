@@ -1477,7 +1477,7 @@ mod tests {
         let zero = policy
             .priority_multipliers
             .iter()
-            .find(|pm| pm.index == 0)
+            .find(|pm| pm.index == coppice_core::quota::PriorityClass(0))
             .expect("priority 0");
         assert_eq!(zero.multiplier, 1.0);
 

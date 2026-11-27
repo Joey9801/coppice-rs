@@ -386,7 +386,7 @@ mod tests {
                     cpu_millis: 1_000,
                     ..Default::default()
                 },
-                priority: 0,
+                priority: coppice_core::quota::PriorityClass(0),
                 max_runtime: None,
                 quota_entity: team,
                 retry: Default::default(),

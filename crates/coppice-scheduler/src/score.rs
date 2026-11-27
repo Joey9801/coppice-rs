@@ -1,7 +1,8 @@
-//! The effective-score ranking formula (ADR 0021, resolving OD-13).
+//! The effective-score ranking formula (ADR 0021, resolving OD-13; amended
+//! by ADR 0047).
 //!
 //! ```text
-//! effective_score(j, now) = m(j) / P(j, now)  +  w_age · age(j, now) / H
+//! effective_score(j, now) = (m(j) + w(class(j)) · age(j, now) / H) / P(j, now)
 //! ```
 //!
 //! - `m(j)` — the job's Q32.32 priority multiplier as a real number. This is
@@ -13,16 +14,22 @@
 //! - `P(j, now)` — ADR 0005's penalty product over the job's quota-entity
 //!   path, computed on usage decayed to `now` with the exact integer decay
 //!   from `coppice_core::quota` (never reimplemented here).
-//! - the age term — additive, so the anti-starvation guarantee is independent
-//!   of the penalty: even an entity pinned at infinite penalty (zero quota,
-//!   nonzero usage) ages toward service, preserving ADR 0005's no-hard-limits
-//!   stance. `H` is the decay half-life derived from replicated policy, so
-//!   "priority buys a bounded head-start measured in half-lives".
+//! - the age credit — `w(class) · age / H`, where `w(class)` is the age weight
+//!   of the job's priority class (ADR 0047's per-class table, falling back to
+//!   the scheduler-wide `w_age`; see `SchedulerConfig::age_weight`). A weight
+//!   of zero makes a class that never ages. `H` is the decay half-life derived
+//!   from replicated policy, so within one entity "priority buys a bounded
+//!   head-start measured in half-lives".
+//! - the penalty divides the whole numerator (ADR 0047): an entity at penalty
+//!   `P` ages at `w / P` points per horizon. Aging survives any finite
+//!   penalty; an infinite penalty (zero quota, nonzero usage) scores zero,
+//!   which ranks last under contention but is not an admission rule: the
+//!   pass still seats a zero-scoring candidate that fits.
 //!
 //! Everything here is `f64` on ADR 0019's derived side of the line: scores
 //! order a proposal and are discarded; only the resulting placement decisions
-//! replicate. The evaluation shape is fixed (one quotient, one product walked
-//! in path order, one addition) — there is no accumulation over unordered
+//! replicate. The evaluation shape is fixed (one addition, one quotient, one
+//! product walked in path order) — there is no accumulation over unordered
 //! collections, so the result is a deterministic function of the inputs.
 
 use std::cmp::Ordering;
@@ -43,12 +50,18 @@ const Q32_SCALE: f64 = 4_294_967_296.0;
 /// (see `coppice-scheduler/README.md`).
 pub const DEFAULT_AGE_WEIGHT: f64 = 1.0;
 
-/// The ADR 0021 effective score. Pure; `now` is an argument, never a
-/// clock read.
+/// The ADR 0021 effective score, in ADR 0047's form:
+/// `(m + w_age · age / H) / P`. Pure; `now` is an argument, never a clock
+/// read.
 ///
-/// `penalty_product` comes from [`penalty_product`]; `age_horizon` from
-/// [`age_horizon`]. Guaranteed NaN-free: the penalty product lies in
-/// `[1, +∞]`, the multiplier is finite, and `m / +∞ == 0`.
+/// `w_age` is the age weight of *this job's* class, resolved by the caller
+/// (`SchedulerConfig::age_weight`). `penalty_product` comes from
+/// [`penalty_product`]; `age_horizon` from [`age_horizon`].
+///
+/// Guaranteed NaN-free: the numerator is finite and `>= 0` (a finite
+/// multiplier plus a finite, non-negative age credit — age is clamped at zero
+/// and the horizon at one microsecond), the penalty product lies in
+/// `[1, +∞]`, and `finite / +∞ == 0`.
 pub fn effective_score(
     multiplier: PriorityMultiplier,
     penalty_product: f64,
@@ -58,12 +71,11 @@ pub fn effective_score(
     w_age: f64,
 ) -> f64 {
     let m = multiplier.0 as f64 / Q32_SCALE;
-    let priority_term = m / penalty_product;
     // Clamped at zero: a submit stamped ahead of `now` by clock skew earns
     // no age, mirroring the decay clamp of ADR 0019.
     let age = (now - submitted_at).max(Duration::ZERO);
     let horizon = age_horizon.max(Duration::from_micros(1));
-    priority_term + w_age * (age.as_secs_f64() / horizon.as_secs_f64())
+    (m + w_age * (age.as_secs_f64() / horizon.as_secs_f64())) / penalty_product
 }
 
 /// The penalty product over a job's quota-entity path (ADR 0005).
@@ -224,20 +236,36 @@ mod tests {
     }
 
     #[test]
-    fn infinite_penalty_leaves_only_the_age_term() {
+    fn infinite_penalty_scores_zero_whatever_the_age() {
         let h = age_horizon(&DecayPolicy::DEFAULT);
-        let s = effective_score(
-            PriorityMultiplier::from_integer(10),
-            f64::INFINITY,
-            ts(),
-            ts() + half(h),
-            h,
-            1.0,
-        );
-        assert!(s.is_finite());
+        for (m, age) in [
+            (PriorityMultiplier::from_integer(10), half(h)),
+            (PriorityMultiplier::ONE, h.saturating_mul(1_000)),
+            (PriorityMultiplier::ONE, Duration::ZERO),
+        ] {
+            let s = effective_score(m, f64::INFINITY, ts(), ts() + age, h, 1.0);
+            assert_eq!(s, 0.0, "an infinite penalty ranks last, not NaN");
+        }
+    }
+
+    #[test]
+    fn zero_weight_scores_the_priority_term_at_any_age() {
+        let h = age_horizon(&DecayPolicy::DEFAULT);
+        let m = PriorityMultiplier::from_integer(3);
+        for age in [Duration::ZERO, h, h.saturating_mul(10_000)] {
+            let s = effective_score(m, 4.0, ts(), ts() + age, h, 0.0);
+            assert_eq!(s, 3.0 / 4.0, "a zero-weight class never ages");
+        }
+    }
+
+    #[test]
+    fn penalty_divides_the_age_credit() {
+        let h = age_horizon(&DecayPolicy::DEFAULT);
+        let m = PriorityMultiplier::from_integer(3);
+        let s = effective_score(m, 2.0, ts(), ts() + h, h, 1.0);
         assert!(
-            (s - 0.5).abs() < 1e-9,
-            "aging must survive an infinite penalty"
+            (s - (3.0 + 1.0) / 2.0).abs() < 1e-9,
+            "expected (m + 1) / P, got {s}"
         );
     }
 
@@ -313,7 +341,9 @@ mod tests {
     #[test]
     fn friday_evening_backlog_outranked_within_the_head_start() {
         // Same submitter (same penalty product): a later 3x job outranks the
-        // morning's 1x backlog while the age gap is under (Δm/P)·H.
+        // morning's 1x backlog while the age gap is under (Δm/w)·H. The
+        // penalty divides both scores alike, so the head start no longer
+        // depends on P (ADR 0047).
         let h = age_horizon(&DecayPolicy::DEFAULT);
         let p = 4.0; // the submitter is over quota; both jobs share the factor
         let backlog = effective_score(PriorityMultiplier::ONE, p, ts(), ts() + half(h), h, 1.0);

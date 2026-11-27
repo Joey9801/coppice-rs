@@ -29,9 +29,10 @@ use coppice_core::id::{
 use coppice_core::job::{Job, JobState};
 use coppice_core::node::Node;
 use coppice_core::quota::{
-    ChargeRecord, CostUnits, CostWeights, DecayPolicy, PriorityMultiplier, Settlement, UsageState,
-    DEFAULT_PENALTY_EXPONENT_MILLI, DEFAULT_PREEMPTIBLE_MULTIPLIER, DEFAULT_REFUND_FRACTION_MILLI,
-    DEFAULT_UNBOUNDED_CHARGE_INTERVAL_S, DEFAULT_UNBOUNDED_RUNTIME_MULTIPLIER,
+    ChargeRecord, CostUnits, CostWeights, DecayPolicy, PriorityClass, PriorityMultiplier,
+    Settlement, UsageState, DEFAULT_PENALTY_EXPONENT_MILLI, DEFAULT_PREEMPTIBLE_MULTIPLIER,
+    DEFAULT_REFUND_FRACTION_MILLI, DEFAULT_UNBOUNDED_CHARGE_INTERVAL_S,
+    DEFAULT_UNBOUNDED_RUNTIME_MULTIPLIER,
 };
 use coppice_core::time::{Duration, Timestamp};
 
@@ -814,10 +815,10 @@ pub struct PolicyConfig {
     pub cost_weights: CostWeights,
     pub decay: DecayPolicy,
     pub penalty_exponent_milli: u32,
-    /// Maps the user-facing `priority: i32` to a Q32.32 cost multiplier.
+    /// Maps the user-facing [`PriorityClass`] to a Q32.32 cost multiplier.
     ///
     /// The API resolves through this table at proposal time.
-    pub priority_multipliers: BTreeMap<i32, PriorityMultiplier>,
+    pub priority_multipliers: BTreeMap<PriorityClass, PriorityMultiplier>,
     /// K: at most this many jobs hold accruing allocations at once
     /// (ADR 0014, default 4).
     pub accrual_limit: u32,

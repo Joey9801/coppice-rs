@@ -14,7 +14,7 @@ use coppice_core::job::{Job, JobState, RetryPolicy};
 use coppice_core::metadata::JobMetadata;
 use coppice_core::node::{Drain, HostFacts};
 use coppice_core::preemption::{NoticeSignal, PreemptionSpec};
-use coppice_core::quota::{CostUnits, PriorityMultiplier};
+use coppice_core::quota::{CostUnits, PriorityClass, PriorityMultiplier};
 use coppice_core::resource::Resources;
 use coppice_core::time::{Duration, Timestamp};
 use coppice_proto::convert::{command_from_pb, command_to_pb, ConvertError};
@@ -47,7 +47,7 @@ fn job(n: u128) -> Job {
             memory: ByteSize::from_gib(1),
             disk: ByteSize::ZERO,
         },
-        priority: -2,
+        priority: PriorityClass(-2),
         max_runtime: Some(Duration::from_hours(1)),
         quota_entity: QuotaEntityId(Uuid::from_u128(0xEE)),
         retry: RetryPolicy::default(),
@@ -345,8 +345,8 @@ fn every_command() -> Vec<Command> {
         Command::UpdatePolicy(UpdatePolicy {
             policy: PolicyConfig {
                 priority_multipliers: BTreeMap::from([
-                    (-1, PriorityMultiplier::ONE),
-                    (3, PriorityMultiplier::from_integer(3)),
+                    (PriorityClass(-1), PriorityMultiplier::ONE),
+                    (PriorityClass(3), PriorityMultiplier::from_integer(3)),
                 ]),
                 ..PolicyConfig::default()
             },

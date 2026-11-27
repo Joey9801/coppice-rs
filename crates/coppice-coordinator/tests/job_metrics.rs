@@ -46,7 +46,7 @@ use coppice_core::attempt::AttemptState;
 use coppice_core::bytes::ByteSize;
 use coppice_core::id::{AllocationId, AttemptId, ClusterId, JobId, NodeId, QuotaEntityId};
 use coppice_core::job::{Job, RetryPolicy};
-use coppice_core::quota::{CostUnits, PriorityMultiplier};
+use coppice_core::quota::{CostUnits, PriorityClass, PriorityMultiplier};
 use coppice_core::resource::Resources;
 use coppice_core::time::{Duration as CoreDuration, Timestamp};
 use coppice_discovery::SeedConfig;
@@ -229,7 +229,7 @@ async fn submit_retrying_job(coord: &RunningCoordinator, job: JobId, entity: Quo
                 entrypoint: None,
                 env: Default::default(),
                 requests: requested(),
-                priority: 0,
+                priority: PriorityClass(0),
                 max_runtime: None,
                 quota_entity: entity,
                 retry: RetryPolicy {

@@ -14,8 +14,8 @@ use coppice_core::metadata::JobMetadata;
 use coppice_core::node::{Drain, HostFacts, Node};
 use coppice_core::preemption::{NoticeSignal, PreemptionSpec};
 use coppice_core::quota::{
-    ChargeInterval, ChargeRecord, CostUnits, CostWeights, DecayPolicy, PriorityMultiplier,
-    Settlement, TrueUp, UsageState,
+    ChargeInterval, ChargeRecord, CostUnits, CostWeights, DecayPolicy, PriorityClass,
+    PriorityMultiplier, Settlement, TrueUp, UsageState,
 };
 use coppice_core::resource::Resources;
 
@@ -231,7 +231,7 @@ impl From<&Job> for pb::Job {
                 .as_ref()
                 .map(|argv| pb::Entrypoint { argv: argv.clone() }),
             requests: Some((&job.requests).into()),
-            priority: job.priority,
+            priority: job.priority.0,
             max_runtime_us: job.max_runtime.map(|d| d.as_micros() as u64),
             quota_entity: Some(job.quota_entity.into()),
             retry: Some(job.retry.into()),
@@ -270,7 +270,7 @@ impl TryFrom<pb::Job> for Job {
             command: job.command,
             entrypoint,
             requests: req(job.requests, "Job.requests")?.try_into()?,
-            priority: job.priority,
+            priority: PriorityClass(job.priority),
             max_runtime: job
                 .max_runtime_us
                 .map(|us| positive_duration(us, "Job.max_runtime_us"))
@@ -994,12 +994,12 @@ impl TryFrom<pb::Settlement> for Settlement {
 
 /// Canonical form by construction: `BTreeMap` iteration is ascending by key.
 pub(crate) fn multipliers_to_pb(
-    multipliers: &BTreeMap<i32, PriorityMultiplier>,
+    multipliers: &BTreeMap<PriorityClass, PriorityMultiplier>,
 ) -> Vec<pb::PriorityMultiplierEntry> {
     multipliers
         .iter()
         .map(|(priority, multiplier)| pb::PriorityMultiplierEntry {
-            priority: *priority,
+            priority: priority.0,
             multiplier_q32_32: multiplier.0,
         })
         .collect()
@@ -1007,11 +1007,14 @@ pub(crate) fn multipliers_to_pb(
 
 pub(crate) fn multipliers_from_pb(
     entries: Vec<pb::PriorityMultiplierEntry>,
-) -> Result<BTreeMap<i32, PriorityMultiplier>, ConvertError> {
+) -> Result<BTreeMap<PriorityClass, PriorityMultiplier>, ConvertError> {
     let mut out = BTreeMap::new();
     for entry in entries {
         if out
-            .insert(entry.priority, PriorityMultiplier(entry.multiplier_q32_32))
+            .insert(
+                PriorityClass(entry.priority),
+                PriorityMultiplier(entry.multiplier_q32_32),
+            )
             .is_some()
         {
             return Err(ConvertError::DuplicateEntry(

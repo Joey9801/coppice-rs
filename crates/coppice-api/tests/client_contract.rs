@@ -30,6 +30,7 @@ use coppice_api::Consistency as ServerConsistency;
 use coppice_authn::{AuthMethod as ServerAuthMethod, AuthMode as ServerAuthMode};
 use coppice_core::id as core_id;
 use coppice_core::metadata as core_metadata;
+use coppice_core::quota::PriorityClass;
 use coppice_core::time::Timestamp as ServerTimestamp;
 
 use coppice_client as client;
@@ -260,7 +261,7 @@ fn job_read_models_round_trip_through_the_client() {
         image: "ubuntu:22.04".to_string(),
         quota_entity: qid(1),
         quota_entity_path: "acme/team-a".to_string(),
-        priority: 5,
+        priority: PriorityClass(5),
         submitted_at: ts(1_000_000),
         submitted_by: Some("alice@example.com".to_string()),
         terminal_at: Some(ts(9_000_000)),
@@ -287,7 +288,7 @@ fn job_read_models_round_trip_through_the_client() {
         command: vec!["sleep".to_string(), "60".to_string()],
         entrypoint: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
         requests: resources(2000, 4_000_000, 0),
-        priority: 3,
+        priority: PriorityClass(3),
         max_runtime_seconds: Some(3600),
         quota_entity: qid(1),
         quota_entity_path: "acme/team-a".to_string(),

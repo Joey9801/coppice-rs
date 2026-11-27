@@ -207,8 +207,9 @@ impl StateMachine {
     /// against the rule the placement names it under, which becomes its
     /// recorded reason. A `Priority` victim must pass the class rule — the
     /// score rule is the proposer's alone, as it depends on the
-    /// scheduler-local `w_age`, which is not replicated. A `Relocation`
-    /// victim must meet the relocation condition, spot room included.
+    /// scheduler-local `w_age` and `age_weights`, which are not replicated.
+    /// A `Relocation` victim must meet the relocation condition, spot room
+    /// included.
     ///
     /// `revoked` is the batch's revocation set: a revoked accrual on the node
     /// (the beneficiary's own, in a revoke-and-reseat) holds nothing once the

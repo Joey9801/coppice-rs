@@ -84,10 +84,10 @@ use coppice_client::{
     paths, AbortJobRequest, AttemptId, Client, FollowOptions, JobCursor, JobDetail, JobEnv,
     JobFilter, JobId, JobMetadata, JobPhase, ListJobsParams, ListJobsResponse, LogAvailability,
     LogEntry, LogOrder, LogSourceRecord, LogStreamName, LogsParams, NodeId, NoticeSignal,
-    PreemptReason, PreemptionRequest, QuotaEntityRef, ReplaceJobMetadataRequest, RequestsResource,
-    Resources, RetryPolicy, SubmitJobRequest, TimelineEvent, TimelineEventBody, TimelineParams,
-    Timestamp, UpdateJobMetadataRequest, UsageAvailability, UsageParams, UsagePoint,
-    UsageSourceRecord,
+    PreemptReason, PreemptionRequest, PriorityClass, QuotaEntityRef, ReplaceJobMetadataRequest,
+    RequestsResource, Resources, RetryPolicy, SubmitJobRequest, TimelineEvent, TimelineEventBody,
+    TimelineParams, Timestamp, UpdateJobMetadataRequest, UsageAvailability, UsageParams,
+    UsagePoint, UsageSourceRecord,
 };
 use coppice_core::bytes::ByteSize;
 
@@ -119,7 +119,7 @@ pub struct JobSpec {
     /// Priority multiplier index; resolved through the replicated multiplier
     /// table (`coppice dev` seeds `-2..=2`). Default 0.
     #[serde(default)]
-    pub priority: i32,
+    pub priority: PriorityClass,
     /// Enforced runtime bound. A humane duration string (`"1h"`, `"90s"`);
     /// whole seconds only, since the wire field is whole seconds. Absent = the
     /// policy default charge runtime.
@@ -1700,6 +1700,7 @@ mod tests {
     use coppice_core::entity_ref::QuotaEntityRef as CoreQuotaEntityRef;
     use coppice_core::id::{AttemptId as CoreAttemptId, JobId as CoreJobId};
     use coppice_core::metadata::JobMetadata as CoreMetadata;
+    use coppice_core::quota::PriorityClass as CorePriorityClass;
     use coppice_core::time::Timestamp as CoreTimestamp;
 
     use crate::testsupport::{error_body, leader_hint, spawn};
@@ -1776,7 +1777,7 @@ retry_user_errors = true
         assert_eq!(spec.image, "busybox:1.36");
         assert_eq!(spec.command, ["sh", "-c", "echo hi"]);
         assert!(spec.entrypoint.is_none());
-        assert_eq!(spec.priority, 0);
+        assert_eq!(spec.priority, PriorityClass(0));
         assert!(spec.max_runtime.is_none());
         assert!(spec.retry.is_none());
         assert_eq!(spec.resources.cpu_millis, 500);
@@ -1791,7 +1792,7 @@ retry_user_errors = true
             spec.entrypoint.as_deref(),
             Some(&["/bin/sh".to_string(), "-c".to_string()][..])
         );
-        assert_eq!(spec.priority, 2);
+        assert_eq!(spec.priority, PriorityClass(2));
         assert_eq!(spec.max_runtime, Some(Duration::from_secs(3600)));
         let retry = spec.retry.expect("retry present");
         assert_eq!(retry.max_retries, 5);
@@ -2162,7 +2163,7 @@ EMPTY = ""
         assert_eq!(request.requests.cpu_millis, 500);
         assert_eq!(request.requests.memory_bytes, 256 * 1024 * 1024);
         assert_eq!(request.requests.disk_bytes, 1024 * 1024 * 1024);
-        assert_eq!(request.priority, 2);
+        assert_eq!(request.priority, PriorityClass(2));
         let retry = request.retry.expect("retry present");
         assert_eq!(retry.max_retries, 5);
         assert!(retry.retry_user_errors);
@@ -2475,7 +2476,7 @@ EMPTY = ""
                 .parse()
                 .unwrap(),
             quota_entity_path: "acme/default".to_string(),
-            priority: 0,
+            priority: CorePriorityClass(0),
             submitted_at: CoreTimestamp::from_micros(1_000_000).unwrap(),
             submitted_by: None,
             terminal_at: None,
@@ -2872,7 +2873,7 @@ EMPTY = ""
                 entrypoint: None,
                 env: coppice_core::env::JobEnv::new(),
                 requests,
-                priority: 0,
+                priority: CorePriorityClass(0),
                 max_runtime_seconds: Some(3600),
                 quota_entity: "quota-00000000-0000-0000-0000-000000000001"
                     .parse()

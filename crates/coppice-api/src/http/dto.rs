@@ -36,7 +36,7 @@ use coppice_core::entity_ref::QuotaEntityRef;
 use coppice_core::env::JobEnv;
 use coppice_core::id::{AllocationId, AttemptId, ClusterId, JobId, NodeId, QuotaEntityId};
 use coppice_core::metadata::{self, JobMetadata};
-use coppice_core::quota::TrueUp;
+use coppice_core::quota::{PriorityClass, TrueUp};
 use coppice_core::time::Timestamp;
 
 /// `GET /healthz` (ADR 0041) — the whole body. Outside `/api/v1` and its
@@ -1041,7 +1041,7 @@ pub struct JobSummary {
     /// The entity's path (ADR 0045), derived at read time — `""` if the
     /// entity is (impossibly) absent from the tree, never a fabricated path.
     pub quota_entity_path: String,
-    pub priority: i32,
+    pub priority: PriorityClass,
     pub submitted_at: Timestamp,
     /// The principal that submitted the job (ADR 0023); `null` for a job
     /// with no actor on its submit command.
@@ -1570,7 +1570,7 @@ pub struct JobSpecView {
     /// Fixed at submission; there is no update route (`coppice_core::env`).
     pub env: JobEnv,
     pub requests: Resources,
-    pub priority: i32,
+    pub priority: PriorityClass,
     /// Enforced runtime bound in whole seconds; `null` when unbounded.
     pub max_runtime_seconds: Option<i64>,
     pub quota_entity: QuotaEntityId,
@@ -1850,7 +1850,7 @@ pub struct SubmitJobRequest {
     /// Resolved through the replicated multiplier table; a priority with no
     /// configured multiplier is invalid.
     #[serde(default)]
-    pub priority: i32,
+    pub priority: PriorityClass,
     /// Enforced runtime bound, in whole seconds; absent = charged the policy
     /// default runtime. Must be positive when present.
     #[serde(default)]
@@ -3195,7 +3195,7 @@ mod tests {
 
         assert_eq!(req.job, job);
         assert_eq!(req.quota_entity, QuotaEntityRef::Id(entity));
-        assert_eq!(req.priority, 0);
+        assert_eq!(req.priority, PriorityClass(0));
         assert_eq!(req.max_runtime_seconds, None);
         assert!(req.entrypoint.is_none());
         assert!(req.retry.is_none());
@@ -3618,7 +3618,7 @@ mod tests {
             image: "alpine:3".to_string(),
             quota_entity: entity,
             quota_entity_path: "acme/team-a".to_string(),
-            priority: 1,
+            priority: PriorityClass(1),
             submitted_at: ts(9_500_000),
             submitted_by: Some("user-42".to_string()),
             terminal_at: None,

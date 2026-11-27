@@ -1,8 +1,10 @@
-//! Property tests for the ADR 0021 effective-score formula
-//! (`coppice_scheduler::score`). The formula lives isolated so these
-//! properties pin its shape: monotone in priority, nondecreasing in age,
-//! penalty divides only the priority term, the deliberate aging crossover
-//! measured in half-lives, and bit-determinism (ADR 0019).
+//! Property tests for the ADR 0021 effective-score formula in ADR 0047's
+//! form, `(m + w · age / H) / P` (`coppice_scheduler::score`). The formula
+//! lives isolated so these properties pin its shape: monotone in priority,
+//! increasing in age at finite penalty, a zero weight that never ages, the
+//! penalty dividing the age credit as well as the priority term, the
+//! deliberate aging crossover measured in half-lives (independent of the
+//! shared penalty), and bit-determinism (ADR 0019).
 
 use coppice_core::id::QuotaEntityId;
 use coppice_core::quota::{CostUnits, DecayPolicy, PriorityMultiplier, UsageState};
@@ -46,9 +48,12 @@ proptest! {
         prop_assert!(hi > lo, "hi {hi} !> lo {lo}");
     }
 
-    /// Strictly increasing in age given `w_age > 0`. Ages differ by whole
-    /// horizons so the age-term increment (`w_age · gap`) clears the ULP of the
-    /// bounded priority term.
+    /// Strictly increasing in age given `w_age > 0` and a finite penalty (an
+    /// infinite one scores zero at every age). Ages differ by whole horizons
+    /// so the numerator's increment (`w_age · gap ≥ 0.1`) clears its ULP
+    /// (the numerator is at most 2¹² + 10⁴), and after the shared division
+    /// the score's increment (`w_age · gap / P ≥ 1e-7` at `P < 1e6`) still
+    /// clears the ULP of a score no larger than ~1.5·10⁴.
     #[test]
     fn score_strictly_increases_with_age(
         m in 0u64..(1u64 << 44),
@@ -71,7 +76,8 @@ proptest! {
     }
 
     /// At zero age the score is exactly the priority term `m / P` — the age
-    /// term is a clean additive zero, so composition is bit-exact.
+    /// credit is a clean additive zero in the numerator, so composition is
+    /// bit-exact.
     #[test]
     fn zero_age_score_is_exactly_the_priority_term(
         m in 0u64..u64::MAX,
@@ -83,8 +89,8 @@ proptest! {
         prop_assert_eq!(s, real(m) / penalty);
     }
 
-    /// A larger penalty product strictly lowers the score: it divides the
-    /// priority term only, leaving the age term untouched.
+    /// A larger penalty product strictly lowers the score, given a positive
+    /// numerator (here `m ≥ 1`).
     #[test]
     fn larger_penalty_strictly_lowers_the_score(
         m in (1u64 << 32)..(1u64 << 44),
@@ -100,8 +106,10 @@ proptest! {
     }
 
     /// Friday-evening: a later high-priority job outranks the morning's
-    /// low-priority backlog while the age gap stays under the head-start
-    /// `(Δm / (P · w_age)) · H` — priority buys a bounded lead, then aging wins.
+    /// low-priority backlog from the same entity while the age gap stays under
+    /// the head-start `(Δm / w_age) · H` — priority buys a bounded lead, then
+    /// aging wins. The shared penalty divides both scores alike, so the head
+    /// start is independent of `P` (ADR 0047).
     #[test]
     fn urgent_outranks_backlog_within_the_head_start(
         m_lo in (1u64 << 32)..(1u64 << 40),
@@ -113,11 +121,43 @@ proptest! {
         let m_hi = m_lo + dm;
         let now = ts(9_000_000_000_000_000);
         // The exact head-start, then a gap strictly inside it.
-        let head_start_us = (real(m_hi) - real(m_lo)) * H.as_micros() as f64 / (penalty * w_age);
+        let head_start_us = (real(m_hi) - real(m_lo)) * H.as_micros() as f64 / w_age;
         let gap = Duration::from_micros((head_start_us * frac) as i64);
         let backlog = effective_score(PriorityMultiplier(m_lo), penalty, now - gap, now, H, w_age);
         let urgent = effective_score(PriorityMultiplier(m_hi), penalty, now, now, H, w_age);
         prop_assert!(urgent > backlog, "urgent {urgent} !> backlog {backlog} at gap {gap}");
+    }
+
+    /// A zero-weight class never ages (ADR 0047): its score is bit-identical
+    /// to `m / P` at any age.
+    #[test]
+    fn zero_weight_score_is_exactly_the_priority_term(
+        m in 0u64..u64::MAX,
+        penalty in 1.0f64..1e9,
+        submitted_us in 0i64..2_000_000_000_000_000,
+        now_us in 0i64..2_000_000_000_000_000,
+    ) {
+        let s = effective_score(PriorityMultiplier(m), penalty, ts(submitted_us), ts(now_us), H, 0.0);
+        prop_assert_eq!(s.to_bits(), (real(m) / penalty).to_bits());
+    }
+
+    /// The penalty divides the age credit too (ADR 0047): of two jobs with
+    /// equal multiplier, age and weight, the one with the larger penalty
+    /// scores strictly lower — even at a zero multiplier, where the whole
+    /// numerator is age credit.
+    #[test]
+    fn larger_penalty_strictly_lowers_the_age_credit(
+        m in 0u64..(1u64 << 44),
+        penalty in 1.0f64..1_000_000.0,
+        extra in 0.5f64..1_000_000.0,
+        w_age in 0.1f64..10.0,
+        age_horizons in 1i64..1000,
+    ) {
+        let now = ts(5_000_000_000_000_000);
+        let submitted = now - H.saturating_mul(age_horizons);
+        let lo_p = effective_score(PriorityMultiplier(m), penalty, submitted, now, H, w_age);
+        let hi_p = effective_score(PriorityMultiplier(m), penalty + extra, submitted, now, H, w_age);
+        prop_assert!(lo_p > hi_p, "score at P {penalty} ({lo_p}) !> at P {} ({hi_p})", penalty + extra);
     }
 
     /// Bit-determinism: identical inputs yield bit-identical scores.
