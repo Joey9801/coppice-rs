@@ -60,7 +60,7 @@ its own definition of every wire type.
 
 ```toml
 [dependencies]
-coppice-client = "0.0.2"
+coppice-client = "0.0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
