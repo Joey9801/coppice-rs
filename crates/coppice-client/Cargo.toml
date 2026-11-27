@@ -78,11 +78,10 @@ tokio = { version = "1", default-features = false, features = ["time"] }
 # `dashmap` machinery — a client is not keyed, and an std clock is plenty.
 governor = { version = "0.10", default-features = false, features = ["std"] }
 
-# Declared locally: the workspace entry enables chrono's `serde`, which this
-# crate does not use (`Timestamp` has its own RFC 3339 µs impls), and chrono's
-# default features drag in the local-timezone machinery. `now` gives
-# `Utc::now()` without a timezone database.
-chrono = { version = "0.4.35", default-features = false, features = ["std", "now"] }
+# Declared locally: jiff's default features drag in the time zone database
+# machinery, which this crate does not use — `Timestamp` only ever speaks UTC,
+# and `std` alone gives `jiff::Timestamp::now()`.
+jiff = { version = "1", default-features = false, features = ["std"] }
 
 # Declared locally: the workspace entry adds `v4`, which no id here mints.
 # Typed ids are UUIDv7.

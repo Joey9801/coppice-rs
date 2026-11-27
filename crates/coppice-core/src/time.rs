@@ -1,12 +1,12 @@
 //! Instants and durations: the workspace's time vocabulary.
 //!
 //! Every point in time in the domain is a [`Timestamp`], every span between
-//! two of them a [`Duration`]. Both wrap a `chrono` type ([`DateTime<Utc>`]
-//! and [`TimeDelta`] respectively) and both are **quantised to whole
-//! microseconds**.
+//! two of them a [`Duration`]. `Timestamp` wraps a [`jiff::Timestamp`];
+//! `Duration` is a bare `i64` microsecond count that converts to and from
+//! [`SignedDuration`]. Both are **quantised to whole microseconds**.
 //!
 //! The quantisation is the reason these are newtypes rather than the bare
-//! chrono types. `DateTime<Utc>` carries nanoseconds, but two consumers
+//! jiff types. `jiff::Timestamp` carries nanoseconds, but two consumers
 //! downstream cannot tolerate a sub-microsecond value:
 //!
 //! - the **replicated state machine**, where quota decay divides timestamps
@@ -16,7 +16,7 @@
 //!   rounds it;
 //! - the **protobuf corpus**, which encodes instants as `int64` Unix
 //!   microseconds and durations as `int64` microseconds. A bare
-//!   `DateTime<Utc>` would silently lose its sub-microsecond tail on the way
+//!   `jiff::Timestamp` would silently lose its sub-microsecond tail on the way
 //!   out, so a value would not survive its own round trip.
 //!
 //! Both constructors truncate (floor, toward −∞) rather than round, so
@@ -24,25 +24,27 @@
 //! two instants, and quantising an already-quantised value is a no-op.
 //!
 //! Conversion to the wire is [`Timestamp::as_micros`] /
-//! [`Timestamp::from_micros`]; conversion to and from a bare chrono value is
-//! `From`/[`Timestamp::to_datetime`]. Nothing else needs to know the
+//! [`Timestamp::from_micros`]; conversion to and from a bare jiff value is
+//! `From`/[`Timestamp::to_jiff`]. Nothing else needs to know the
 //! representation.
 //!
 //! `Timestamp` is further bounded to instants with a four-digit RFC 3339
-//! year, `0001-01-01T00:00:00.000000Z..=9999-12-31T23:59:59.999999Z`
-//! ([`Timestamp::min_value`]/[`Timestamp::max_value`]) — narrower than
-//! `DateTime<Utc>`'s own ~±262 000-year range. `DateTime::MAX_UTC`/`MIN_UTC`
-//! render with a signed, five-digit extended year that RFC 3339 (and this
-//! type's own `Deserialize`) cannot parse back, so admitting them would let a
-//! `Timestamp` exist that fails its own wire round trip. Constructors that
-//! take trusted input (`from_datetime`, arithmetic) clamp into this range;
+//! year, `0001-01-01T00:00:00.000000Z..=9999-12-30T22:00:00.999999Z`
+//! ([`Timestamp::min_value`]/[`Timestamp::max_value`]). The lower bound is
+//! RFC 3339's: `jiff::Timestamp` reaches back to year −9999, which renders
+//! with a signed, extended year that RFC 3339 cannot spell. The upper bound
+//! is `jiff::Timestamp::MAX` truncated to whole microseconds — jiff stops
+//! ~26 hours short of the end of year 9999 so that any UTC offset can be
+//! applied to its maximum without leaving the civil calendar's range.
+//! Constructors that take trusted input (`from_jiff`, arithmetic) clamp into
+//! this range;
 //! [`Timestamp::from_micros`] and `Deserialize`, which take untrusted input,
 //! reject values outside it instead.
 
 use std::fmt;
 use std::ops::{Add, AddAssign, Neg, Sub, SubAssign};
 
-use chrono::{DateTime, TimeDelta, Utc};
+use jiff::SignedDuration;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Microseconds per second, the scale every conversion in this module works in.
@@ -51,16 +53,28 @@ const MICROS_PER_SECOND: i64 = 1_000_000;
 /// The earliest representable instant, `0001-01-01T00:00:00.000000Z`, in
 /// microseconds since the Unix epoch.
 ///
-/// `DateTime<Utc>` itself reaches back to `-262143-01-01`, but RFC 3339 (and
+/// `jiff::Timestamp` itself reaches back to year −9999, but RFC 3339 (and
 /// therefore the `/api/v1` wire, ADR 0031) only ever spells a four-digit
 /// year. Bounding `Timestamp` here means every instant this type can hold has
 /// a legal RFC 3339 rendering that its own `Deserialize` can parse back. It
-/// is also the range of protobuf's well-known `Timestamp`.
+/// is also the lower bound of protobuf's well-known `Timestamp`.
 const MIN_MICROS: i64 = -62_135_596_800_000_000;
 
-/// The latest representable instant, `9999-12-31T23:59:59.999999Z`, in
-/// microseconds since the Unix epoch — see [`MIN_MICROS`].
-const MAX_MICROS: i64 = 253_402_300_799_999_999;
+/// The latest representable instant, `9999-12-30T22:00:00.999999Z`, in
+/// microseconds since the Unix epoch: `jiff::Timestamp::MAX` truncated to
+/// whole microseconds, so every value in range is a valid `jiff::Timestamp`.
+const MAX_MICROS: i64 = 253_402_207_200_999_999;
+
+/// Microseconds since the Unix epoch, truncated toward −∞.
+///
+/// Not `jiff::Timestamp::as_microsecond`, which truncates toward zero — the
+/// wrong direction before the epoch, where it would round an instant *up* and
+/// break the order-preserving floor the module docs promise. jiff's whole
+/// range (~±10 000 years) fits `i64` microseconds, so this is total.
+fn floor_micros(timestamp: jiff::Timestamp) -> i64 {
+    i64::try_from(timestamp.as_nanosecond().div_euclid(1_000))
+        .expect("jiff's range fits in i64 microseconds")
+}
 
 /// A point in time, to microsecond precision, as Unix time.
 ///
@@ -72,11 +86,11 @@ const MAX_MICROS: i64 = 253_402_300_799_999_999;
 /// Serde renders it as an RFC 3339 / ISO 8601 string (`"2026-07-16T09:30:00Z"`),
 /// which is what the `/api/v1` surface puts on the wire (ADR 0031).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Timestamp(DateTime<Utc>);
+pub struct Timestamp(jiff::Timestamp);
 
 impl Timestamp {
     /// The Unix epoch, 1970-01-01T00:00:00Z.
-    pub const UNIX_EPOCH: Timestamp = Timestamp(DateTime::UNIX_EPOCH);
+    pub const UNIX_EPOCH: Timestamp = Timestamp(jiff::Timestamp::UNIX_EPOCH);
 
     /// The current wall-clock time, truncated to microseconds.
     ///
@@ -87,7 +101,7 @@ impl Timestamp {
     /// during apply is a divergence bug (ADR 0019). Apply reads the timestamp
     /// the command carries.
     pub fn now() -> Timestamp {
-        Timestamp::from_datetime(Utc::now())
+        Timestamp::from_jiff(jiff::Timestamp::now())
     }
 
     /// The instant `micros` microseconds after the Unix epoch.
@@ -102,90 +116,76 @@ impl Timestamp {
         if !(MIN_MICROS..=MAX_MICROS).contains(&micros) {
             return None;
         }
-        DateTime::from_timestamp_micros(micros).map(Timestamp)
+        jiff::Timestamp::from_microsecond(micros)
+            .ok()
+            .map(Timestamp)
     }
 
     /// Microseconds since the Unix epoch — the protobuf encoding.
     pub fn as_micros(self) -> i64 {
-        // Infallible in the other direction: the value came from a
-        // `DateTime`, so it is inside the range `from_micros` accepts.
-        self.0.timestamp_micros()
+        // Exact: the value is already whole microseconds, so the direction
+        // `as_microsecond` truncates in never matters here.
+        self.0.as_microsecond()
     }
 
-    /// Truncate a `DateTime<Utc>` to microsecond precision, clamping into the
-    /// representable range.
+    /// Truncate a `jiff::Timestamp` to microsecond precision, clamping into
+    /// the representable range.
     ///
-    /// `DateTime<Utc>` reaches roughly ±262 000 years — comfortably wider
-    /// than this type's range — so an extreme input (most
-    /// notably `DateTime::MAX_UTC`/`MIN_UTC`) is clamped down to
-    /// [`Timestamp::max_value`]/[`Timestamp::min_value`] rather than
-    /// rejected: this constructor is infallible, so it has no way to report
-    /// "out of range" other than silently picking the nearest legal instant.
-    pub fn from_datetime(datetime: DateTime<Utc>) -> Timestamp {
-        // `timestamp_subsec_nanos` is always in [0, 2e9) and the sub-µs
-        // remainder is at most 999, so this subtraction cannot leave
-        // `DateTime`'s own range — and `timestamp_micros` is total over that
-        // range (~±262 000 years, inside `i64` µs). Clamp on the microsecond
-        // count, not the `DateTime`, so the clamp can't reintroduce a sub-µs
-        // tail.
-        let sub_micro_nanos = (datetime.timestamp_subsec_nanos() % 1_000) as i64;
-        let truncated = datetime - TimeDelta::nanoseconds(sub_micro_nanos);
-        let micros = truncated.timestamp_micros().clamp(MIN_MICROS, MAX_MICROS);
-        Timestamp(
-            DateTime::from_timestamp_micros(micros)
-                .expect("micros is clamped into the representable range"),
-        )
+    /// `jiff::Timestamp` reaches back to year −9999 — well before this type's
+    /// range — so an early input (most notably `jiff::Timestamp::MIN`) is
+    /// clamped to [`Timestamp::min_value`] rather than rejected: this
+    /// constructor is infallible, so it has no way to report "out of range"
+    /// other than silently picking the nearest legal instant. The upper end
+    /// never clamps in practice, since `jiff::Timestamp::MAX` truncates
+    /// exactly to [`Timestamp::max_value`].
+    pub fn from_jiff(timestamp: jiff::Timestamp) -> Timestamp {
+        // Clamp on the microsecond count, not the `jiff::Timestamp`, so the
+        // clamp can't reintroduce a sub-µs tail.
+        let micros = floor_micros(timestamp).clamp(MIN_MICROS, MAX_MICROS);
+        Timestamp::from_micros(micros).expect("micros is clamped into the representable range")
     }
 
     /// The underlying instant, for formatting and calendar arithmetic.
-    pub fn to_datetime(self) -> DateTime<Utc> {
+    pub fn to_jiff(self) -> jiff::Timestamp {
         self.0
     }
 
     /// RFC 3339 with a `Z` offset and microsecond precision — the `/api/v1`
     /// rendering, and what `Display` produces.
     pub fn to_rfc3339(self) -> String {
-        self.0.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+        // jiff's `Display` honours the formatter's precision for the
+        // fractional second, and always renders a `Z` offset.
+        format!("{:.6}", self.0)
     }
 
-    /// The latest representable instant, `9999-12-31T23:59:59.999999Z`.
+    /// The latest representable instant, `9999-12-30T22:00:00.999999Z`.
     ///
-    /// This is *not* `DateTime::MAX_UTC` — that instant's year does not fit
-    /// RFC 3339's four-digit year, so it has no legal wire rendering this
-    /// type's own `Deserialize` (or the `/api/v1` surface's, ADR 0031) can
-    /// parse back. The bound here is chosen instead so every `Timestamp`,
-    /// including this one, satisfies the type's invariant: whole
-    /// microseconds *and* a representable wire form. Saturating and
-    /// deserializing must both be able to land on it, or either would fail
-    /// its own round trip.
+    /// This is `jiff::Timestamp::MAX` truncated to whole microseconds, so
+    /// every `Timestamp`, including this one, satisfies the type's
+    /// invariant: whole microseconds *and* a representable wire form that
+    /// this type's own `Deserialize` (and the `/api/v1` surface's, ADR 0031)
+    /// can parse back. Saturating and deserializing must both be able to land
+    /// on it, or either would fail its own round trip.
     pub fn max_value() -> Timestamp {
-        Timestamp(
-            DateTime::from_timestamp_micros(MAX_MICROS)
-                .expect("MAX_MICROS is a valid DateTime by construction"),
-        )
+        Timestamp::from_micros(MAX_MICROS).expect("MAX_MICROS is in range by construction")
     }
 
     /// The earliest representable instant, `0001-01-01T00:00:00.000000Z` —
     /// see [`Timestamp::max_value`].
     pub fn min_value() -> Timestamp {
-        Timestamp(
-            DateTime::from_timestamp_micros(MIN_MICROS)
-                .expect("MIN_MICROS is a valid DateTime by construction"),
-        )
+        Timestamp::from_micros(MIN_MICROS).expect("MIN_MICROS is in range by construction")
     }
 
     /// `self + delta`, saturating at the representable range rather than
     /// panicking.
     pub fn saturating_add(self, delta: Duration) -> Timestamp {
-        match self.0.checked_add_signed(delta.to_time_delta()) {
-            // `checked_add_signed` only guards against overflowing
-            // `DateTime`'s own (much wider) range, so a result inside that
-            // range can still fall outside this type's narrower bounds —
-            // clamp it there too.
-            Some(datetime) => Timestamp::from_datetime(datetime),
-            None if delta.is_positive() => Timestamp::max_value(),
-            None => Timestamp::min_value(),
-        }
+        // Both sides are whole microseconds, so the sum is computed exactly
+        // in `i64` µs and clamped there — no sub-µs tail can appear.
+        let micros = self
+            .as_micros()
+            .saturating_add(delta.as_micros())
+            .clamp(MIN_MICROS, MAX_MICROS);
+        Timestamp::from_micros(micros).expect("micros is clamped into the representable range")
     }
 
     /// `self - delta`, saturating at the representable range.
@@ -200,11 +200,10 @@ impl Timestamp {
     /// on the result, not this. The full representable range is only
     /// ~10 000 years wide (four-digit years, [`Timestamp::min_value`] to
     /// [`Timestamp::max_value`]), well inside what `i64` microseconds holds,
-    /// so this does not saturate in practice — [`Duration::from`]`(TimeDelta)`
-    /// is used regardless, since it is the correct total conversion either
-    /// way.
+    /// so this does not saturate in practice; it saturates regardless rather
+    /// than trusting that arithmetic.
     pub fn duration_since(self, earlier: Timestamp) -> Duration {
-        Duration::from(self.0.signed_duration_since(earlier.0))
+        Duration::from_micros(self.as_micros().saturating_sub(earlier.as_micros()))
     }
 }
 
@@ -214,14 +213,14 @@ impl fmt::Display for Timestamp {
     }
 }
 
-impl From<DateTime<Utc>> for Timestamp {
-    fn from(datetime: DateTime<Utc>) -> Timestamp {
-        Timestamp::from_datetime(datetime)
+impl From<jiff::Timestamp> for Timestamp {
+    fn from(timestamp: jiff::Timestamp) -> Timestamp {
+        Timestamp::from_jiff(timestamp)
     }
 }
 
-impl From<Timestamp> for DateTime<Utc> {
-    fn from(timestamp: Timestamp) -> DateTime<Utc> {
+impl From<Timestamp> for jiff::Timestamp {
+    fn from(timestamp: Timestamp) -> jiff::Timestamp {
         timestamp.0
     }
 }
@@ -271,25 +270,26 @@ impl Serialize for Timestamp {
 impl<'de> Deserialize<'de> for Timestamp {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Timestamp, D::Error> {
         let raw = String::deserialize(deserializer)?;
-        let datetime = DateTime::parse_from_rfc3339(&raw)
-            .map_err(|e| serde::de::Error::custom(format!("invalid RFC 3339 timestamp: {e}")))?
-            .with_timezone(&Utc);
+        // jiff parses the Temporal ISO 8601 format, a superset of RFC 3339,
+        // and normalises any UTC offset away.
+        let timestamp: jiff::Timestamp = raw
+            .parse()
+            .map_err(|e| serde::de::Error::custom(format!("invalid RFC 3339 timestamp: {e}")))?;
         // Reject rather than clamp: this input is untrusted, and silently
         // pinning a wildly out-of-range instant to a bound would hide the
-        // corruption from the caller. `chrono` happily parses instants past
-        // either bound (a negative offset can push `9999-12-31T23:59:59` past
-        // the end of that year, and years before `0001` parse too), so the
-        // range check has to run after parsing rather than relying on the
-        // format itself to reject them. `Timestamp::from_datetime` clamps
-        // instead of reporting failure, so this checks the parsed
-        // `DateTime`'s own (wider) micros, not the constructor's output.
-        if !(MIN_MICROS..=MAX_MICROS).contains(&datetime.timestamp_micros()) {
+        // corruption from the caller. jiff happily parses instants before the
+        // lower bound (years back to −9999 parse), so the range check has to
+        // run after parsing rather than relying on the format itself to
+        // reject them. `Timestamp::from_jiff` clamps instead of reporting
+        // failure, so this checks the parsed instant's own (wider) micros,
+        // not the constructor's output.
+        if !(MIN_MICROS..=MAX_MICROS).contains(&floor_micros(timestamp)) {
             return Err(serde::de::Error::custom(format!(
                 "timestamp outside the representable range \
-                 0001-01-01T00:00:00Z..=9999-12-31T23:59:59.999999Z: {raw}"
+                 0001-01-01T00:00:00Z..=9999-12-30T22:00:00.999999Z: {raw}"
             )));
         }
-        Ok(Timestamp::from_datetime(datetime))
+        Ok(Timestamp::from_jiff(timestamp))
     }
 }
 
@@ -305,9 +305,9 @@ impl<'de> Deserialize<'de> for Timestamp {
 /// The range is exactly `i64` microseconds — the protobuf encoding's range —
 /// so every `Duration` survives a wire round trip unchanged, and
 /// [`as_micros`](Duration::as_micros) is total and exact. That is narrower
-/// than `TimeDelta`, which reaches ~±292 000 *years* and whose own `MAX`
-/// therefore has no `i64` microsecond representation at all; conversions in
-/// from `TimeDelta` clamp. All arithmetic saturates at the bounds.
+/// than [`SignedDuration`], which reaches ~±292 *billion* years and whose own
+/// `MAX` therefore has no `i64` microsecond representation at all;
+/// conversions in from `SignedDuration` clamp. All arithmetic saturates at the bounds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct Duration(i64);
 
@@ -384,10 +384,11 @@ impl Duration {
         self.0 as f64 / MICROS_PER_SECOND as f64
     }
 
-    /// The equivalent `TimeDelta`, for calendar arithmetic. Always exact —
-    /// `TimeDelta`'s range strictly contains this one.
-    pub fn to_time_delta(self) -> TimeDelta {
-        TimeDelta::microseconds(self.0)
+    /// The equivalent [`SignedDuration`], for arithmetic on bare jiff
+    /// values. Always exact — `SignedDuration`'s range strictly contains this
+    /// one.
+    pub const fn to_signed_duration(self) -> SignedDuration {
+        SignedDuration::from_micros(self.0)
     }
 
     /// The equivalent `std::time::Duration`, or `None` if negative — the
@@ -439,26 +440,27 @@ impl Duration {
 
 impl fmt::Display for Duration {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // ISO 8601 duration form ("PT1H30M"), which is what `TimeDelta`'s own
-        // `Display` produces.
-        fmt::Display::fmt(&self.to_time_delta(), f)
+        // ISO 8601 duration form ("PT1H30M"), which is what
+        // `SignedDuration`'s own (non-alternate) `Display` produces.
+        fmt::Display::fmt(&self.to_signed_duration(), f)
     }
 }
 
-impl From<Duration> for TimeDelta {
-    fn from(duration: Duration) -> TimeDelta {
-        duration.to_time_delta()
+impl From<Duration> for SignedDuration {
+    fn from(duration: Duration) -> SignedDuration {
+        duration.to_signed_duration()
     }
 }
 
-impl From<TimeDelta> for Duration {
-    /// Clamps: `TimeDelta` reaches ~±292 000 years, this type ~±292 000
-    /// years' worth of *microseconds*, which is ~1 000× narrower.
-    fn from(delta: TimeDelta) -> Duration {
-        match delta.num_microseconds() {
-            Some(micros) => Duration(micros),
-            None if delta > TimeDelta::zero() => Duration::MAX,
-            None => Duration::MIN,
+impl From<SignedDuration> for Duration {
+    /// Truncates toward zero to whole microseconds, and clamps:
+    /// `SignedDuration` reaches ~±292 billion years, this type only
+    /// ~±292 000.
+    fn from(delta: SignedDuration) -> Duration {
+        match i64::try_from(delta.as_micros()) {
+            Ok(micros) => Duration(micros),
+            Err(_) if delta.is_positive() => Duration::MAX,
+            Err(_) => Duration::MIN,
         }
     }
 }
@@ -517,28 +519,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn from_datetime_truncates_toward_negative_infinity() {
+    fn from_jiff_truncates_toward_negative_infinity() {
         // 1.5 µs past the epoch truncates down to 1 µs, not up to 2.
-        let datetime = DateTime::UNIX_EPOCH + TimeDelta::nanoseconds(1_500);
-        assert_eq!(Timestamp::from_datetime(datetime).as_micros(), 1);
+        let instant = jiff::Timestamp::from_nanosecond(1_500).expect("in range");
+        assert_eq!(Timestamp::from_jiff(instant).as_micros(), 1);
 
         // ...and 1.5 µs *before* the epoch truncates to -2 µs, staying
         // order-preserving across the sign boundary.
-        let datetime = DateTime::UNIX_EPOCH - TimeDelta::nanoseconds(1_500);
-        assert_eq!(Timestamp::from_datetime(datetime).as_micros(), -2);
+        let instant = jiff::Timestamp::from_nanosecond(-1_500).expect("in range");
+        assert_eq!(Timestamp::from_jiff(instant).as_micros(), -2);
     }
 
     #[test]
     fn truncation_is_idempotent() {
-        let datetime = DateTime::UNIX_EPOCH + TimeDelta::nanoseconds(1_999);
-        let once = Timestamp::from_datetime(datetime);
-        assert_eq!(Timestamp::from_datetime(once.to_datetime()), once);
+        let instant = jiff::Timestamp::from_nanosecond(1_999).expect("in range");
+        let once = Timestamp::from_jiff(instant);
+        assert_eq!(Timestamp::from_jiff(once.to_jiff()), once);
     }
 
     #[test]
     fn now_carries_no_sub_microsecond_tail() {
         let now = Timestamp::now();
-        assert_eq!(now.to_datetime().timestamp_subsec_nanos() % 1_000, 0);
+        assert_eq!(now.to_jiff().subsec_nanosecond() % 1_000, 0);
     }
 
     #[test]
@@ -552,7 +554,7 @@ mod tests {
     #[test]
     fn from_micros_rejects_out_of_range_values() {
         // One µs past either bound is already outside the four-digit-year
-        // range, well before `i64`'s own or `DateTime`'s own limits.
+        // range, well before `i64`'s own or jiff's own limits.
         assert_eq!(Timestamp::from_micros(MAX_MICROS + 1), None);
         assert_eq!(Timestamp::from_micros(MIN_MICROS - 1), None);
         assert_eq!(Timestamp::from_micros(i64::MAX), None);
@@ -583,15 +585,15 @@ mod tests {
     #[test]
     fn saturated_timestamps_are_whole_microseconds() {
         // The saturation bound is a value the type hands to callers, so it owes
-        // them the same invariant as any other `Timestamp`. `DateTime::MAX_UTC`
+        // them the same invariant as any other `Timestamp`. `jiff::Timestamp::MAX`
         // does not: its nanosecond tail would not survive the wire, so a
         // saturated instant would stop comparing equal to its round trip.
-        assert_ne!(DateTime::<Utc>::MAX_UTC.timestamp_subsec_nanos() % 1_000, 0);
+        assert_ne!(jiff::Timestamp::MAX.subsec_nanosecond() % 1_000, 0);
 
         for extreme in [Timestamp::max_value(), Timestamp::min_value()] {
-            assert_eq!(extreme.to_datetime().timestamp_subsec_nanos() % 1_000, 0);
+            assert_eq!(extreme.to_jiff().subsec_nanosecond() % 1_000, 0);
             assert_eq!(Timestamp::from_micros(extreme.as_micros()), Some(extreme));
-            assert_eq!(Timestamp::from_datetime(extreme.to_datetime()), extreme);
+            assert_eq!(Timestamp::from_jiff(extreme.to_jiff()), extreme);
         }
     }
 
@@ -601,7 +603,7 @@ mod tests {
         assert_eq!(Timestamp::min_value().as_micros(), MIN_MICROS);
         assert_eq!(
             Timestamp::max_value().to_rfc3339(),
-            "9999-12-31T23:59:59.999999Z"
+            "9999-12-30T22:00:00.999999Z"
         );
         assert_eq!(
             Timestamp::min_value().to_rfc3339(),
@@ -621,13 +623,13 @@ mod tests {
     }
 
     #[test]
-    fn from_datetime_clamps_the_extreme_chrono_bounds() {
+    fn from_jiff_clamps_the_extreme_jiff_bounds() {
         assert_eq!(
-            Timestamp::from_datetime(DateTime::<Utc>::MAX_UTC),
+            Timestamp::from_jiff(jiff::Timestamp::MAX),
             Timestamp::max_value()
         );
         assert_eq!(
-            Timestamp::from_datetime(DateTime::<Utc>::MIN_UTC),
+            Timestamp::from_jiff(jiff::Timestamp::MIN),
             Timestamp::min_value()
         );
     }
@@ -654,20 +656,21 @@ mod tests {
 
     #[test]
     fn deserialize_rejects_instants_outside_the_four_digit_year_range() {
-        // Parses fine in chrono (a negative offset pushes past the last
-        // instant of 9999; year 0 is a legal proleptic-Gregorian year), but
-        // both land outside this type's range.
-        assert!(serde_json::from_str::<Timestamp>("\"9999-12-31T23:59:59-01:00\"").is_err());
+        // Year 0 is a legal proleptic-Gregorian year that jiff parses fine,
+        // but it lands before this type's range.
         assert!(serde_json::from_str::<Timestamp>("\"0000-06-01T00:00:00Z\"").is_err());
-        // The extended-year rendering of `DateTime::MAX_UTC` that motivated
-        // this bound in the first place.
+        // Past `jiff::Timestamp::MAX`: still a four-digit year, but not an
+        // instant jiff (or this type) can hold.
+        assert!(serde_json::from_str::<Timestamp>("\"9999-12-31T00:00:00Z\"").is_err());
+        assert!(serde_json::from_str::<Timestamp>("\"9999-12-31T23:59:59-01:00\"").is_err());
+        // An extended-year rendering, which RFC 3339 cannot spell.
         assert!(serde_json::from_str::<Timestamp>("\"+262142-12-31T23:59:59.999999Z\"").is_err());
     }
 
     #[test]
     fn deserialize_still_truncates_an_in_range_sub_microsecond_tail() {
         let timestamp: Timestamp =
-            serde_json::from_str("\"9999-12-31T23:59:59.999999999Z\"").expect("in range");
+            serde_json::from_str("\"9999-12-30T22:00:00.999999999Z\"").expect("in range");
         assert_eq!(timestamp, Timestamp::max_value());
     }
 
@@ -691,12 +694,12 @@ mod tests {
 
     #[test]
     fn every_duration_survives_the_wire_encoding() {
-        // The bound that motivates `i64` µs storage: `TimeDelta`'s own range
-        // is ~1000x wider than `i64` µs, so `TimeDelta::MAX` has no µs form.
-        // Nothing may construct a `Duration` that cannot be encoded.
-        assert_eq!(TimeDelta::MAX.num_microseconds(), None);
-        assert_eq!(Duration::from(TimeDelta::MAX), Duration::MAX);
-        assert_eq!(Duration::from(TimeDelta::MIN), Duration::MIN);
+        // The bound that motivates `i64` µs storage: `SignedDuration`'s own
+        // range is ~10⁶x wider than `i64` µs, so `SignedDuration::MAX` has no
+        // µs form. Nothing may construct a `Duration` that cannot be encoded.
+        assert!(i64::try_from(SignedDuration::MAX.as_micros()).is_err());
+        assert_eq!(Duration::from(SignedDuration::MAX), Duration::MAX);
+        assert_eq!(Duration::from(SignedDuration::MIN), Duration::MIN);
         for duration in [Duration::MAX, Duration::MIN, Duration::ZERO] {
             assert_eq!(Duration::from_micros(duration.as_micros()), duration);
         }
@@ -706,9 +709,9 @@ mod tests {
     fn every_timestamp_survives_the_wire_encoding() {
         // The representable range is strictly inside `i64` µs, so `as_micros`
         // is total — including at the extremes, where a naive impl overflows.
-        // `MAX_UTC`/`MIN_UTC` clamp down to those extremes via `from_datetime`.
-        for datetime in [DateTime::<Utc>::MAX_UTC, DateTime::<Utc>::MIN_UTC] {
-            let timestamp = Timestamp::from_datetime(datetime);
+        // jiff's own `MAX`/`MIN` clamp to those extremes via `from_jiff`.
+        for instant in [jiff::Timestamp::MAX, jiff::Timestamp::MIN] {
+            let timestamp = Timestamp::from_jiff(instant);
             assert_eq!(
                 Timestamp::from_micros(timestamp.as_micros()),
                 Some(timestamp)
@@ -735,6 +738,19 @@ mod tests {
             Some(std::time::Duration::from_secs(2))
         );
         assert_eq!(Duration::from_secs(-1).to_std(), None);
+    }
+
+    #[test]
+    fn duration_displays_as_iso_8601() {
+        assert_eq!(Duration::from_mins(90).to_string(), "PT1H30M");
+        assert_eq!(Duration::from_micros(-1_500_000).to_string(), "-PT1.5S");
+    }
+
+    #[test]
+    fn duration_round_trips_through_signed_duration() {
+        for duration in [Duration::MAX, Duration::MIN, Duration::from_micros(-1)] {
+            assert_eq!(Duration::from(duration.to_signed_duration()), duration);
+        }
     }
 
     #[test]
