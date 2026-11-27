@@ -2,7 +2,7 @@
 //!
 //! Every size in the domain is a [`ByteSize`] — memory, disk, segment
 //! thresholds, chunk widths. It wraps [`byte_unit::Byte`], and exists for the
-//! same reason [`Timestamp`](crate::time::Timestamp) wraps `DateTime<Utc>`: a
+//! same reason [`Timestamp`](crate::time::Timestamp) wraps `jiff::Timestamp`: a
 //! good general-purpose type still needs this workspace's specific semantics
 //! pinned on top of it.
 //!

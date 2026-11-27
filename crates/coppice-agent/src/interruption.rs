@@ -66,11 +66,13 @@ pub fn parse_instance_action(body: &str) -> Result<Interruption, String> {
         "hibernate" => InstanceAction::Hibernate,
         other => return Err(format!("unknown instance action {other:?}")),
     };
-    let deadline = chrono::DateTime::parse_from_rfc3339(&body.time)
+    let deadline: jiff::Timestamp = body
+        .time
+        .parse()
         .map_err(|e| format!("instance-action time {:?}: {e}", body.time))?;
     Ok(Interruption {
         action,
-        deadline: Timestamp::from_datetime(deadline.with_timezone(&chrono::Utc)),
+        deadline: Timestamp::from_jiff(deadline),
     })
 }
 
@@ -260,7 +262,7 @@ impl FakeImds {
     pub fn set_action(&self, action: &str, deadline: Timestamp) {
         let body = serde_json::json!({
             "action": action,
-            "time": deadline.to_datetime().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            "time": deadline.to_jiff().strftime("%Y-%m-%dT%H:%M:%SZ").to_string(),
         })
         .to_string();
         *self.action.lock().unwrap_or_else(|e| e.into_inner()) = Some(body);
@@ -290,11 +292,7 @@ mod tests {
         assert_eq!(notice.action, InstanceAction::Terminate);
         assert_eq!(
             notice.deadline,
-            Timestamp::from_datetime(
-                chrono::DateTime::parse_from_rfc3339("2026-10-12T08:22:00Z")
-                    .unwrap()
-                    .with_timezone(&chrono::Utc)
-            )
+            Timestamp::from_jiff("2026-10-12T08:22:00Z".parse().unwrap())
         );
         for (spelled, action) in [
             ("stop", InstanceAction::Stop),

@@ -7,8 +7,6 @@
 //! without a daemon. Classification proper (evidence → outcome) stays *above*
 //! the trait (ADR 0013); this module only produces the evidence.
 
-use chrono::{DateTime, Utc};
-
 use coppice_core::time::{Duration, Timestamp};
 
 use crate::executor::{ExitCause, ExitInfo, StartError};
@@ -25,8 +23,7 @@ pub(crate) fn parse_docker_time(s: &str) -> Option<Timestamp> {
     if s.is_empty() {
         return None;
     }
-    let datetime = DateTime::parse_from_rfc3339(s).ok()?;
-    let timestamp = Timestamp::from_datetime(datetime.with_timezone(&Utc));
+    let timestamp = Timestamp::from_jiff(s.parse::<jiff::Timestamp>().ok()?);
     // The zero sentinel (0001-01-01T00:00:00Z) and any pre-epoch instant mean
     // "unset" — never usable evidence.
     if timestamp < Timestamp::UNIX_EPOCH {

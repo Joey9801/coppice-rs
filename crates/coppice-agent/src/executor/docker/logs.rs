@@ -570,12 +570,8 @@ mod tests {
     /// `<RFC3339Nano> <text>\n` payload bollard's `NewlineLogOutputDecoder`
     /// demuxes into one [`LogOutput`].
     fn frame_chunk(secs: i64, stream_type: u8, text: &str) -> Vec<u8> {
-        let dt = chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0).unwrap();
-        let line = format!(
-            "{} {}\n",
-            dt.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
-            text
-        );
+        let instant = jiff::Timestamp::from_second(secs).unwrap();
+        let line = format!("{instant:.9} {text}\n");
         let payload = line.as_bytes();
         let mut stdcopy = Vec::with_capacity(8 + payload.len());
         stdcopy.push(stream_type);

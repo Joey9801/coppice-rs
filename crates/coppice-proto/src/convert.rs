@@ -74,7 +74,7 @@ fn req<T>(field: Option<T>, name: &'static str) -> Result<T, ConvertError> {
 /// Decode an `int64` Unix-microseconds field into a [`Timestamp`].
 ///
 /// The wire type is wider than the domain type: `i64` µs reaches ~±292 000
-/// years, `DateTime<Utc>` only ~±262 000. The gap is unreachable by any
+/// years, the domain type only years 0001–9999. The gap is unreachable by any
 /// honest producer, but it is reachable by a corrupt record or a hostile
 /// peer, so it is rejected here rather than saturated — a timestamp from the
 /// year 300 000 is a decoding failure, not a very old job.

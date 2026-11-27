@@ -2128,7 +2128,7 @@ fn timestamp_serializes_identically_and_cross_decodes() {
     // representable range to a four-digit RFC 3339 year (issue #152), so
     // `max_value()`/`min_value()` are legal fixtures now: every instant
     // either type can hold has a rendering the other's parser accepts.
-    // `9999-12-31T23:59:59.999999Z` / `0001-01-01T00:00:00.000000Z` are
+    // `9999-12-30T22:00:00.999999Z` / `0001-01-01T00:00:00.000000Z` are
     // those bounds, spelled as literals so a change to either type's range
     // constant shows up here as a mismatch rather than silently tracking it.
     let micros = [
@@ -2137,7 +2137,7 @@ fn timestamp_serializes_identically_and_cross_decodes() {
         -1,
         9_500_000,
         1_700_000_000_000_000,
-        253_402_300_799_999_999, // 9999-12-31T23:59:59.999999Z
+        253_402_207_200_999_999, // 9999-12-30T22:00:00.999999Z
         -62_135_596_800_000_000, // 0001-01-01T00:00:00.000000Z
     ];
     for us in micros {
@@ -2158,11 +2158,11 @@ fn timestamp_serializes_identically_and_cross_decodes() {
     // that.
     assert_eq!(
         ServerTimestamp::max_value().as_micros(),
-        253_402_300_799_999_999
+        253_402_207_200_999_999
     );
     assert_eq!(
         client::Timestamp::max_value().as_micros(),
-        253_402_300_799_999_999
+        253_402_207_200_999_999
     );
     assert_eq!(
         ServerTimestamp::min_value().as_micros(),
@@ -2182,8 +2182,8 @@ fn timestamp_serializes_identically_and_cross_decodes() {
     );
 
     // One microsecond beyond either bound is rejected by both sides.
-    assert!(ServerTimestamp::from_micros(253_402_300_799_999_999 + 1).is_none());
-    assert!(client::Timestamp::from_micros(253_402_300_799_999_999 + 1).is_none());
+    assert!(ServerTimestamp::from_micros(253_402_207_200_999_999 + 1).is_none());
+    assert!(client::Timestamp::from_micros(253_402_207_200_999_999 + 1).is_none());
     assert!(ServerTimestamp::from_micros(-62_135_596_800_000_000 - 1).is_none());
     assert!(client::Timestamp::from_micros(-62_135_596_800_000_000 - 1).is_none());
 
